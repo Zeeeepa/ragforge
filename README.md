@@ -41,46 +41,69 @@ Instead of manually building RAG infrastructure for each domain (code search, do
 - ✅ MCP server integration
 - ✅ Complete documentation
 
-## Quick Example
+## Quick Start
 
-```yaml
-# ragforge.config.yaml (excerpt)
-name: code-rag
-entities:
-  - name: Scope
-    searchable_fields:
-      - { name: signature, type: string }
-      - { name: type,       type: string }
-      - { name: file,       type: string }
-    vector_indexes:
-      - name: scopeEmbeddings                  # Source code semantic search
-        field: embedding
-        source_field: source
-        model: gemini-embedding-001
-        dimension: 768
-      - name: scopeSignatureEmbeddings         # Signature-only semantic search
-        field: signatureEmbedding
-        source_field: signature
-        model: gemini-embedding-001
-        dimension: 512
-    relationships:
-      - type: CONSUMES
-        direction: outgoing
-        target: Scope
-        filters:
-          - { name: whereConsumesScope,    direction: outgoing, parameter: scopeName }
-          - { name: whereConsumedByScope, direction: incoming, parameter: scopeName }
+**No manual configuration needed!** RagForge introspects your Neo4j database and generates everything:
+
+### 1. Setup credentials
+
+Create a `.env` file with your Neo4j credentials:
+
+```env
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=your-password
+NEO4J_DATABASE=neo4j
 ```
 
-```bash
-# 1. Build RagForge CLI once from the monorepo
-npm run build --workspace @ragforge/cli
+Or pass them as CLI arguments (see CLI README for details).
 
-# 2. Generate a ready-to-use client (introspects Neo4j if --schema not provided)
-node packages/cli/dist/index.js generate \
-  --config ./ragforge.config.yaml \
-  --out ./generated \
-  --force
+### 2. Install and introspect
+
+```bash
+# Install CLI
+npm install -g @luciformresearch/ragforge-cli
+
+# Introspect your database (reads credentials from .env or CLI args)
+ragforge introspect --project my-rag --out ./my-rag-project
+
+# This auto-generates ragforge.config.yaml by analyzing your Neo4j schema:
+# ✅ Detects your domain (code, e-commerce, legal, etc.)
+# ✅ Identifies entities and relationships
+# ✅ Suggests searchable fields
+# ✅ Finds working examples from your data
+```
+
+**Then customize the generated config** (optional):
+
+```yaml
+# ragforge.config.yaml (auto-generated, then you can customize)
+name: my-rag
+entities:
+  - name: Document
+    searchable_fields:
+      - { name: title, type: string }
+      - { name: category, type: string }
+    vector_indexes:
+      - name: documentEmbeddings
+        field: embedding
+        source_field: content
+        model: gemini-embedding-001
+        dimension: 768
+    relationships:
+      - type: REFERENCES
+        direction: outgoing
+        target: Document
+        filters:
+          - { name: whereReferences, direction: outgoing }
+```
+
+**Generate your type-safe client:**
+
+```bash
+ragforge generate \
+  --config ./my-rag-project/ragforge.config.yaml \
+  --out ./my-rag-project/generated
 ```
 
 Generated artefacts (all derived from the YAML):
