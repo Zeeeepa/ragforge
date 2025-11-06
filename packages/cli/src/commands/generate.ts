@@ -14,11 +14,13 @@ import {
   TypeGenerator,
   CodeGenerator,
   SchemaIntrospector,
+  ConfigGenerator,
   type RagForgeConfig,
   type GraphSchema,
   type VectorIndexConfig,
   type EntityConfig
 } from '@luciformresearch/ragforge-core';
+import YAML from 'yaml';
 import { ensureEnvLoaded, getEnv } from '../utils/env.js';
 import { prepareOutputDirectory, persistGeneratedArtifacts, writeGeneratedEnv, type ConnectionEnv } from '../utils/io.js';
 import { ensureGeminiKey, validateGeminiSchema } from '../utils/gemini.js';
@@ -29,13 +31,13 @@ export interface GenerateOptions {
   schemaPath?: string;
   outDir: string;
   force: boolean;
+  rewriteConfig: boolean;
   uri?: string;
   username?: string;
   password?: string;
   database?: string;
   rootDir: string;
   geminiKey?: string;
-  preserveEmbeddingsConfig: boolean;
   autoDetectFields: boolean;
 }
 
@@ -52,7 +54,7 @@ Options:
   --password <password>   Neo4j password (used when --schema is absent)
   --database <name>       Optional Neo4j database
   --force                 Recreate files managed by the generator even if they exist
-  --reset-embeddings-config  Ignore preserved loader and always rewrite embeddings/load-config.ts
+  --rewrite-config        Regenerate ragforge.config.yaml from the current schema before emitting code
   --auto-detect-fields    Ask the LLM to refine display/query/embedding fields before generation
   -h, --help              Show this message
 
@@ -63,8 +65,11 @@ Common flows:
   ragforge generate --schema ./schema.json --config ./ragforge.config.yaml --out ./generated
       Use a saved schema snapshot (no live Neo4j connection needed).
 
-  ragforge generate --config ./ragforge.config.yaml --force --reset-embeddings-config
+  ragforge generate --config ./ragforge.config.yaml --force
       Force-overwrite any managed files, including the embeddings loader/scripts.
+
+  ragforge generate --config ./ragforge.config.yaml --rewrite-config
+      Reapply the heuristic config generator to refresh ragforge.config.yaml before codegen.
 
   ragforge generate --config ./ragforge.config.yaml --auto-detect-fields
       Run the LLM field detector (needs GEMINI_API_KEY and Neo4j creds) before writing files.
@@ -77,7 +82,7 @@ export function parseGenerateOptions(args: string[]): GenerateOptions {
 
   const opts: Partial<GenerateOptions> = {
     force: false,
-    preserveEmbeddingsConfig: true,
+    rewriteConfig: false,
     autoDetectFields: false
   };
 
@@ -108,8 +113,8 @@ export function parseGenerateOptions(args: string[]): GenerateOptions {
       case '--force':
         opts.force = true;
         break;
-      case '--reset-embeddings-config':
-        opts.preserveEmbeddingsConfig = false;
+      case '--rewrite-config':
+        opts.rewriteConfig = true;
         break;
       case '--auto-detect-fields':
         opts.autoDetectFields = true;
@@ -133,13 +138,13 @@ export function parseGenerateOptions(args: string[]): GenerateOptions {
     schemaPath,
     outDir,
     force: opts.force ?? false,
+    rewriteConfig: opts.rewriteConfig ?? false,
     uri: opts.uri,
     username: opts.username,
     password: opts.password,
     database: opts.database,
     rootDir,
     geminiKey,
-    preserveEmbeddingsConfig: opts.preserveEmbeddingsConfig ?? false,
     autoDetectFields: opts.autoDetectFields ?? false
   };
 }
@@ -209,6 +214,16 @@ export async function runGenerate(options: GenerateOptions): Promise<void> {
   validateGeminiSchema(schema);
   console.log(`✅  Using schema with ${schema.nodes.length} node types`);
 
+  if (options.rewriteConfig) {
+    console.log('🧠  Rewriting ragforge.config.yaml from current schema...');
+    const projectName = config.name || path.basename(path.dirname(options.configPath)) || 'ragforge-project';
+    const regenerated = ConfigGenerator.generate(schema, projectName);
+    const yamlContent = YAML.stringify(regenerated, { indent: 2 });
+    await fs.writeFile(options.configPath, yamlContent, 'utf-8');
+    config = regenerated;
+    console.log(`📝  Updated ${options.configPath}`);
+  }
+
   // Auto-detect field mappings if requested
   if (options.autoDetectFields) {
     const conn = connection ?? resolveConnection(options, config);
@@ -253,24 +268,13 @@ export async function runGenerate(options: GenerateOptions): Promise<void> {
   const typesContent = TypeGenerator.generate(schema, config);
   const generated = CodeGenerator.generate(config, schema);
 
-  let preservedEmbeddingsConfig: string | undefined;
-  if (options.preserveEmbeddingsConfig) {
-    try {
-      preservedEmbeddingsConfig = await fs.readFile(path.join(options.outDir, 'embeddings', 'load-config.ts'), 'utf-8');
-    } catch {
-      preservedEmbeddingsConfig = undefined;
-    }
-  }
   await prepareOutputDirectory(options.outDir, options.force);
   await persistGeneratedArtifacts(
     options.outDir,
     generated,
     typesContent,
     options.rootDir,
-    config.name,
-    options.preserveEmbeddingsConfig,
-    preservedEmbeddingsConfig,
-    options.force
+    config.name
   );
 
   console.log(`\n✨  Generation complete. Artifacts available in ${options.outDir}`);

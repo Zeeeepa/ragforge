@@ -41,7 +41,6 @@ export interface InitOptions {
   force: boolean;
   rootDir: string;
   geminiKey?: string;
-  preserveEmbeddingsConfig: boolean;
 }
 
 export function printInitHelp(): void {
@@ -56,14 +55,13 @@ Options:
   --project <name>        Project name used for generated artifacts
   --out <dir>             Output directory (default: ./ragforge-<project>)
   --force                 Recreate the entire project tree even if files already exist
-  --reset-embeddings-config  Always rewrite generated/embeddings/load-config.ts
   -h, --help              Show this help
 
 Examples:
   ragforge init --uri bolt://localhost:7687 --username neo4j --password secret \\
                 --project my-rag --out ./ragforge-my-rag
 
-  ragforge init --project demo --out ./ragforge-demo --force --reset-embeddings-config
+  ragforge init --project demo --out ./ragforge-demo --force
       Useful when re-initializing a playground directory and you want fresh templates.
 `);
 }
@@ -72,8 +70,7 @@ export async function parseInitOptions(args: string[]): Promise<InitOptions> {
   const rootDir = ensureEnvLoaded(import.meta.url);
 
   const options: Partial<InitOptions> = {
-    force: false,
-    preserveEmbeddingsConfig: true
+    force: false
   };
 
   for (let i = 0; i < args.length; i += 1) {
@@ -100,9 +97,6 @@ export async function parseInitOptions(args: string[]): Promise<InitOptions> {
         break;
       case '--force':
         options.force = true;
-        break;
-      case '--reset-embeddings-config':
-        options.preserveEmbeddingsConfig = false;
         break;
       case '-h':
       case '--help':
@@ -148,8 +142,7 @@ export async function parseInitOptions(args: string[]): Promise<InitOptions> {
     outDir: naming.outputDir,
     force: options.force ?? false,
     rootDir,
-    geminiKey,
-    preserveEmbeddingsConfig: options.preserveEmbeddingsConfig ?? false
+    geminiKey
   };
 }
 
@@ -171,15 +164,6 @@ export async function runInit(options: InitOptions): Promise<void> {
 
   const outputDir = path.resolve(options.outDir);
   const generatedDir = path.join(outputDir, 'generated');
-
-  let preservedEmbeddingsConfig: string | undefined;
-  if (options.preserveEmbeddingsConfig) {
-    try {
-      preservedEmbeddingsConfig = await fs.readFile(path.join(generatedDir, 'embeddings', 'load-config.ts'), 'utf-8');
-    } catch {
-      preservedEmbeddingsConfig = undefined;
-    }
-  }
 
   await prepareOutputDirectory(outputDir, options.force);
 
@@ -211,10 +195,7 @@ export async function runInit(options: InitOptions): Promise<void> {
     generated,
     typesContent,
     options.rootDir,
-    options.project,
-    options.preserveEmbeddingsConfig,
-    preservedEmbeddingsConfig,
-    options.force
+    options.project
   );
   console.log(`📦  Generated client written to ${generatedDir}`);
   await writeGeneratedEnv(generatedDir, {

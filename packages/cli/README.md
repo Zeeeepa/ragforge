@@ -146,8 +146,8 @@ ragforge generate \
   --out ./generated \
   [--schema ./schema.json] \
   [--force] \
-  [--auto-detect-fields] \
-  [--reset-embeddings-config]
+  [--rewrite-config] \
+  [--auto-detect-fields]
 ```
 
 **Options:**
@@ -155,12 +155,12 @@ ragforge generate \
 - `--out <dir>` - Output directory
 - `--schema <path>` - Path to schema.json (optional, will introspect if not provided)
 - `--force` - Overwrite existing files
+- `--rewrite-config` - Regenerate ragforge.config.yaml from the live schema before emitting code
 - `--auto-detect-fields` - **🤖 Use LLM to intelligently detect searchable fields**
   - Analyzes your actual data in Neo4j
   - Suggests which fields are best for filtering
   - Detects field types and patterns
   - Requires `GEMINI_API_KEY` environment variable
-- `--reset-embeddings-config` - Overwrite customized embedding loader
 
 **Generates:**
 - `client.ts` - Type-safe RAG client

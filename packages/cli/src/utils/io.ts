@@ -47,10 +47,7 @@ export async function persistGeneratedArtifacts(
   generated: GeneratedCode,
   typesContent: string,
   rootDir: string,
-  projectName: string,
-  preserveEmbeddingsConfig: boolean,
-  preservedEmbeddingsConfig: string | undefined,
-  forceRewrite: boolean
+  projectName: string
 ): Promise<void> {
   const queriesDir = path.join(outDir, 'queries');
   await fs.mkdir(queriesDir, { recursive: true });
@@ -79,20 +76,7 @@ export async function persistGeneratedArtifacts(
     await fs.mkdir(embeddingsDir, { recursive: true });
 
     const loaderPath = path.join(embeddingsDir, 'load-config.ts');
-
-    const shouldPreserve = preserveEmbeddingsConfig && !forceRewrite;
-
-    if (shouldPreserve && preservedEmbeddingsConfig) {
-      await writeFileIfChanged(loaderPath, preservedEmbeddingsConfig);
-      console.log('ℹ️  Preserved embeddings/load-config.ts from existing project (use --reset-embeddings-config to regenerate).');
-    } else if (shouldPreserve) {
-      await writeFileIfMissing(loaderPath, generated.embeddings.loader, 'embeddings/load-config.ts');
-    } else {
-      await writeFileIfChanged(loaderPath, generated.embeddings.loader);
-      if (preserveEmbeddingsConfig && forceRewrite) {
-        console.log('⚠️  Overwriting embeddings/load-config.ts because --force was supplied.');
-      }
-    }
+    await writeFileIfChanged(loaderPath, generated.embeddings.loader);
 
     // Clean up legacy files
     const legacyFiles = [
@@ -302,7 +286,6 @@ async function writeGeneratedPackageJson(
       start: 'tsx ./client.ts',
       regen: 'node ../../ragforge/packages/cli/dist/index.js generate --config ../ragforge.config.yaml --out . --force',
       'regen:auto': 'node ../../ragforge/packages/cli/dist/index.js generate --config ../ragforge.config.yaml --out . --force --auto-detect-fields',
-      'regen:reset': 'node ../../ragforge/packages/cli/dist/index.js generate --config ../ragforge.config.yaml --out . --force --reset-embeddings-config',
       'rebuild:agent': 'tsx ./scripts/rebuild-agent.ts',
       'embeddings:index': 'tsx ./scripts/create-vector-indexes.ts',
       'embeddings:generate': 'tsx ./scripts/generate-embeddings.ts',
@@ -575,17 +558,4 @@ Version History:
 async function ensureLogsDirectory(outDir: string): Promise<void> {
   const logsDir = path.join(outDir, 'logs');
   await fs.mkdir(logsDir, { recursive: true });
-}
-
-async function writeFileIfMissing(filePath: string, content: string, label: string): Promise<void> {
-  try {
-    await fs.access(filePath);
-    console.log(`ℹ️  Skipping ${label} (already exists). Delete the file to regenerate defaults.`);
-  } catch (error: any) {
-    if (error.code === 'ENOENT') {
-      await writeFileIfChanged(filePath, content);
-    } else {
-      throw error;
-    }
-  }
 }

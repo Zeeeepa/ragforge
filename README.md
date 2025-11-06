@@ -212,7 +212,7 @@ What land in `ragforge-my-project/generated/`:
 > **Tips**
 > - CLI reads Neo4j credentials from `.env` (`NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`). Override at runtime with `--uri/--username/--password`.
 > - `GEMINI_API_KEY` must be set to run embedding scripts (Gemini is the provider currently wired).
-> - Use `--reset-embeddings-config` if you want to overwrite a customised loader.
+> - Use `--rewrite-config` to regenerate `ragforge.config.yaml` from the active schema before emitting TypeScript.
 
 ```typescript
 // Example: wire the generated client into the iterative agent template
