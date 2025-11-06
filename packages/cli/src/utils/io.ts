@@ -77,25 +77,29 @@ export async function persistGeneratedArtifacts(
     const embeddingsDir = path.join(outDir, 'embeddings');
     await fs.mkdir(embeddingsDir, { recursive: true });
 
-    const loaderPath = path.join(embeddingsDir, 'load-config.js');
-    const typesPath = path.join(embeddingsDir, 'load-config.d.ts');
+    const loaderPath = path.join(embeddingsDir, 'load-config.ts');
 
     if (preserveEmbeddingsConfig && preservedEmbeddingsConfig) {
       await writeFileIfChanged(loaderPath, preservedEmbeddingsConfig);
     } else if (preserveEmbeddingsConfig) {
-      await writeFileIfMissing(loaderPath, generated.embeddings.loaderModule, 'embeddings/load-config.js');
+      await writeFileIfMissing(loaderPath, generated.embeddings.loader, 'embeddings/load-config.ts');
     } else {
-      await writeFileIfChanged(loaderPath, generated.embeddings.loaderModule);
+      await writeFileIfChanged(loaderPath, generated.embeddings.loader);
     }
 
-    await writeFileIfChanged(typesPath, generated.embeddings.loaderTypes);
-
-    const legacyConfigPath = path.join(embeddingsDir, 'config.js');
-    try {
-      await fs.unlink(legacyConfigPath);
-    } catch (error: any) {
-      if (error?.code !== 'ENOENT') {
-        throw error;
+    // Clean up legacy files
+    const legacyFiles = [
+      path.join(embeddingsDir, 'config.js'),
+      path.join(embeddingsDir, 'load-config.js'),
+      path.join(embeddingsDir, 'load-config.d.ts')
+    ];
+    for (const legacyPath of legacyFiles) {
+      try {
+        await fs.unlink(legacyPath);
+      } catch (error: any) {
+        if (error?.code !== 'ENOENT') {
+          throw error;
+        }
       }
     }
     await writeFileIfChanged(path.join(scriptsDir, 'create-vector-indexes.js'), generated.embeddings.createIndexesScript);
@@ -105,8 +109,11 @@ export async function persistGeneratedArtifacts(
   // Write rebuild-agent script
   await writeFileIfChanged(path.join(scriptsDir, 'rebuild-agent.ts'), generated.rebuildAgentScript);
 
-  await copyRuntimePackage(rootDir, outDir);
-  await writeGeneratedPackageJson(outDir, projectName);
+  const isDevelopmentMode = await checkIfDevelopmentMode(rootDir);
+  if (isDevelopmentMode) {
+    await copyRuntimePackage(rootDir, outDir);
+  }
+  await writeGeneratedPackageJson(outDir, projectName, isDevelopmentMode);
   await writeGeneratedTsconfig(outDir);
   await writeExampleScripts(outDir, generated, projectName);
   await writeGitIgnore(outDir);
@@ -165,6 +172,25 @@ export async function writeGeneratedEnv(outDir: string, connection: ConnectionEn
   await writeFileIfChanged(envPath, envLines.join('\n') + '\n');
 }
 
+async function checkIfDevelopmentMode(rootDir: string): Promise<boolean> {
+  // Check if we're in a development environment (monorepo with packages/runtime)
+  const candidates = [
+    path.join(rootDir, 'packages/runtime'),
+    path.join(rootDir, 'ragforge/packages/runtime')
+  ];
+
+  for (const candidate of candidates) {
+    try {
+      await fs.access(candidate);
+      return true;
+    } catch {
+      continue;
+    }
+  }
+
+  return false;
+}
+
 async function copyRuntimePackage(rootDir: string, targetDir: string): Promise<void> {
   const candidates = [
     path.join(rootDir, 'packages/runtime'),
@@ -209,29 +235,35 @@ async function copyRuntimePackage(rootDir: string, targetDir: string): Promise<v
   await relaxRuntimePackageMetadata(runtimeDest);
 }
 
-async function writeGeneratedPackageJson(outDir: string, projectName: string): Promise<void> {
+async function writeGeneratedPackageJson(outDir: string, projectName: string, isDevelopmentMode: boolean): Promise<void> {
   const safeName = projectName
     .toLowerCase()
     .replace(/[^a-z0-9-]/g, '-')
     .replace(/--+/g, '-')
     .replace(/^-|-$/g, '') || 'ragforge-client';
 
-  const pkg = {
+  const pkg: any = {
     name: safeName,
     private: true,
     type: 'module',
     version: '0.0.1',
     dependencies: {
-      '@luciformresearch/ragforge-runtime': 'file:./packages/runtime',
+      '@luciformresearch/ragforge-runtime': isDevelopmentMode ? 'file:./packages/runtime' : '^0.1.2',
       '@google/genai': '^1.28.0',
       'dotenv': '^16.3.1',
       'tsx': '^4.20.0',
       'js-yaml': '^4.1.0'
-    },
-    devDependencies: {
+    }
+  };
+
+  // Only add devDependencies in development mode
+  if (isDevelopmentMode) {
+    pkg.devDependencies = {
       '@luciformresearch/codeparsers': 'file:../../packages/codeparsers'
-    },
-    scripts: {
+    };
+  }
+
+  pkg.scripts = {
       build: 'echo "Nothing to build"',
       start: 'tsx ./client.ts',
       regen: 'node ../../ragforge/packages/cli/dist/index.js generate --config ../ragforge.config.yaml --out . --force',
@@ -242,10 +274,24 @@ async function writeGeneratedPackageJson(outDir: string, projectName: string): P
       'embeddings:generate': 'node ./scripts/generate-embeddings.js',
       'examples:basic': 'tsx ./examples/basic-query.ts',
       'examples:semantic': 'tsx ./examples/semantic-search.ts'
-    }
-  };
+    };
 
   await writeFileIfChanged(path.join(outDir, 'package.json'), JSON.stringify(pkg, null, 2) + '\n');
+
+  // Auto-install dependencies in production mode
+  if (!isDevelopmentMode) {
+    console.log('📦  Installing dependencies...');
+    const { exec } = await import('child_process');
+    const { promisify } = await import('util');
+    const execPromise = promisify(exec);
+
+    try {
+      await execPromise('npm install', { cwd: outDir });
+      console.log('✅  Dependencies installed successfully');
+    } catch (error) {
+      console.warn('⚠️  Failed to auto-install dependencies. Run `npm install` manually in the output directory.');
+    }
+  }
 }
 
 async function relaxRuntimePackageMetadata(runtimeDir: string): Promise<void> {

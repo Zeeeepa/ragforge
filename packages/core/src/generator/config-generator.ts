@@ -5,6 +5,10 @@
  * This is the "magic" that makes RagForge easy to use
  */
 
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { GraphSchema, NodeSchema, PropertySchema } from '../types/schema.js';
 import {
   RagForgeConfig,
@@ -13,6 +17,32 @@ import {
   EmbeddingsConfig,
   EmbeddingEntityConfig
 } from '../types/config.js';
+
+const TEMPLATE_DIR = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '../../templates'
+);
+
+const TEMPLATE_CACHE = new Map<string, string>();
+
+function loadTemplate(relativePath: string): string {
+  const fullPath = path.join(TEMPLATE_DIR, relativePath);
+  const cached = TEMPLATE_CACHE.get(fullPath);
+  if (cached) {
+    return cached;
+  }
+
+  let content: string;
+  try {
+    content = readFileSync(fullPath, 'utf-8');
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to load template "${relativePath}" from ${fullPath}: ${message}`);
+  }
+
+  TEMPLATE_CACHE.set(fullPath, content);
+  return content;
+}
 
 export interface DomainPattern {
   name: string;
@@ -243,7 +273,7 @@ export class ConfigGenerator {
 
     // Pick most relevant nodes (sorted by count, exclude very small nodes)
     const relevantNodes = schema.nodes
-      .filter(n => (n.count || 0) > 10) // At least 10 nodes
+      .filter(n => (n.count || 0) > 2) // At least 3 nodes (allow small test databases)
       .sort((a, b) => (b.count || 0) - (a.count || 0))
       .slice(0, 5); // Top 5 nodes
 
@@ -520,271 +550,24 @@ export class ConfigGenerator {
       return undefined;
     }
 
-    const loaderModule = [
-      "import fs from 'fs';",
-      "import path from 'path';",
-      "import { fileURLToPath } from 'url';",
-      "import yaml from 'js-yaml';",
-      "",
-      "const __filename = fileURLToPath(import.meta.url);",
-      "const __dirname = path.dirname(__filename);",
-      "const PROJECT_ROOT = path.resolve(__dirname, '..');",
-      "const YAML_PATH = path.resolve(PROJECT_ROOT, '../ragforge.config.yaml');",
-      "",
-      "function transformPipeline(pipeline) {",
-      "  if (!pipeline) {",
-      "    return undefined;",
-      "  }",
-      "",
-      "  return {",
-      "    name: pipeline.name,",
-      "    source: pipeline.source,",
-      "    targetProperty: pipeline.target_property ?? pipeline.targetProperty ?? 'embedding',",
-      "    model: pipeline.model,",
-      "    dimension: pipeline.dimension,",
-      "    similarity: pipeline.similarity,",
-      "    preprocessors: pipeline.preprocessors,",
-      "    includeFields: pipeline.include_fields,",
-      "    includeRelationships: pipeline.include_relationships",
-      "      ? pipeline.include_relationships.map(rel => ({",
-      "          type: rel.type,",
-          "          direction: rel.direction,",
-          "          fields: rel.fields,",
-          "          depth: rel.depth,",
-          "          maxItems: rel.max_items ?? rel.maxItems",
-          "        }))",
-          "      : undefined,",
-      "    batchSize: pipeline.batch_size ?? pipeline.batchSize,",
-      "    concurrency: pipeline.concurrency,",
-      "    throttleMs: pipeline.throttle_ms ?? pipeline.throttleMs,",
-      "    maxRetries: pipeline.max_retries ?? pipeline.maxRetries,",
-      "    retryDelayMs: pipeline.retry_delay_ms ?? pipeline.retryDelayMs",
-      "  };",
-      "}",
-      "",
-      "function transformEmbeddingsConfig(raw) {",
-      "  if (!raw) {",
-      "    throw new Error('Embeddings configuration missing from ragforge.config.yaml');",
-      "  }",
-      "",
-      "  const entities = Array.isArray(raw.entities)",
-      "    ? raw.entities.map(entity => ({",
-      "        entity: entity.entity,",
-      "        pipelines: Array.isArray(entity.pipelines)",
-      "          ? entity.pipelines",
-      "              .map(transformPipeline)",
-      "              .filter(Boolean)",
-      "          : []",
-      "      }))",
-      "    : [];",
-      "",
-      "  return {",
-      "    provider: raw.provider,",
-      "    defaults: raw.defaults ? { ...raw.defaults } : undefined,",
-      "    entities",
-      "  };",
-      "}",
-      "",
-      "export function loadEmbeddingsConfig() {",
-      "  const yamlContent = fs.readFileSync(YAML_PATH, 'utf-8');",
-      "  const config = yaml.load(yamlContent) ?? {};",
-      "  return transformEmbeddingsConfig(config.embeddings);",
-      "}",
-      "",
-      "export const EMBEDDINGS_CONFIG = loadEmbeddingsConfig();",
-      ""
-    ].join('\\n');
-
-    const loaderTypes = [
-      "export interface EmbeddingPipelineConfig {",
-      "  name: string;",
-      "  source: string;",
-      "  targetProperty: string;",
-      "  model?: string;",
-      "  dimension?: number;",
-      "  similarity?: 'cosine' | 'dot' | 'euclidean';",
-      "  preprocessors?: string[];",
-      "  includeFields?: string[];",
-      "  includeRelationships?: Array<{",
-      "    type: string;",
-      "    direction: 'outgoing' | 'incoming' | 'both';",
-      "    fields?: string[];",
-      "    depth?: number;",
-      "    maxItems?: number;",
-      "  }>;",
-      "  batchSize?: number;",
-      "  concurrency?: number;",
-      "  throttleMs?: number;",
-      "  maxRetries?: number;",
-      "  retryDelayMs?: number;",
-      "}",
-      "",
-      "export interface EmbeddingEntityConfig {",
-      "  entity: string;",
-      "  pipelines: EmbeddingPipelineConfig[];",
-      "}",
-      "",
-      "export interface EmbeddingsConfig {",
-      "  provider: string;",
-      "  defaults?: {",
-      "    model?: string;",
-      "    dimension?: number;",
-      "    similarity?: 'cosine' | 'dot' | 'euclidean';",
-      "  };",
-      "  entities: EmbeddingEntityConfig[];",
-      "}",
-      "",
-      "export declare function loadEmbeddingsConfig(): EmbeddingsConfig;",
-      "export declare const EMBEDDINGS_CONFIG: EmbeddingsConfig;",
-      ""
-    ].join('\\n');
-
+    const loader = loadTemplate('embeddings/load-config.ts');
     const createIndexesScript = this.generateCreateIndexesScript();
     const generateEmbeddingsScript = this.generateGenerateEmbeddingsScript();
 
     return {
-      loaderModule,
-      loaderTypes,
+      loader,
       createIndexesScript,
       generateEmbeddingsScript
     };
   }
+
  
   private static generateCreateIndexesScript(): string {
-    const lines = [
-      "import dotenv from 'dotenv';",
-      "import path from 'path';",
-      "import { fileURLToPath } from 'url';",
-      "import { Neo4jClient } from '@luciformresearch/ragforge-runtime';",
-      "",
-      "import { EMBEDDINGS_CONFIG } from '../embeddings/load-config.js';",
-      "",
-      "const __dirname = path.dirname(fileURLToPath(import.meta.url));",
-      "dotenv.config({ path: path.resolve(__dirname, '../.env') });",
-      "",
-      "async function main() {",
-      "  const client = new Neo4jClient({",
-      "    uri: process.env.NEO4J_URI || 'bolt://localhost:7687',",
-      "    username: process.env.NEO4J_USERNAME || 'neo4j',",
-      "    password: process.env.NEO4J_PASSWORD || '',",
-      "    database: process.env.NEO4J_DATABASE",
-      "  });",
-      "",
-      "  try {",
-      "    for (const entity of EMBEDDINGS_CONFIG.entities) {",
-      "      for (const pipeline of entity.pipelines) {",
-      "        const dimension = pipeline.dimension ?? EMBEDDINGS_CONFIG.defaults?.dimension ?? 768;",
-      "        const similarity = pipeline.similarity ?? EMBEDDINGS_CONFIG.defaults?.similarity ?? 'cosine';",
-      "",
-      "        console.log(`Creating vector index ${pipeline.name} for ${entity.entity}.${pipeline.targetProperty}`);",
-      "        await client.run(`DROP INDEX ${pipeline.name} IF EXISTS`);",
-      "        await client.run(",
-      "          `CREATE VECTOR INDEX ${pipeline.name} IF NOT EXISTS` +",
-      "          ` FOR (n:\\`${entity.entity}\\`)` +",
-      "          ` ON n.\\`${pipeline.targetProperty}\\`` +",
-      "          ` OPTIONS { indexConfig: { \\`vector.dimensions\\`: $dimension, \\`vector.similarity_function\\`: $similarity } }`,",
-      "          { dimension, similarity }",
-      "        );",
-      "      }",
-      "    }",
-      "",
-      "    console.log('✅ Vector indexes created successfully');",
-      "  } catch (error) {",
-      "    console.error('❌ Failed to create vector indexes', error);",
-      "    process.exitCode = 1;",
-      "  } finally {",
-      "    await client.close();",
-      "  }",
-      "}",
-      "",
-      "main();",
-      ""
-    ];
-
-    return lines.join('\\n');
+    return loadTemplate('scripts/create-vector-indexes.js');
   }
 
-  private static generateGenerateEmbeddingsScript(): string {
-    const lines = [
-      "import dotenv from 'dotenv';",
-      "import path from 'path';",
-      "import { fileURLToPath } from 'url';",
-      "import {",
-      "  Neo4jClient,",
-      "  GeminiEmbeddingProvider,",
-      "  runEmbeddingPipelines",
-      "} from '@luciformresearch/ragforge-runtime';",
-      "",
-      "import { EMBEDDINGS_CONFIG } from '../embeddings/load-config.js';",
-      "",
-      "const __dirname = path.dirname(fileURLToPath(import.meta.url));",
-      "dotenv.config({ path: path.resolve(__dirname, '../.env') });",
-      "",
-      "async function main() {",
-      "  const apiKey = process.env.GEMINI_API_KEY;",
-      "  if (!apiKey) {",
-      "    throw new Error('GEMINI_API_KEY is required to generate embeddings.');",
-      "  }",
-      "",
-      "  const client = new Neo4jClient({",
-      "    uri: process.env.NEO4J_URI || 'bolt://localhost:7687',",
-      "    username: process.env.NEO4J_USERNAME || 'neo4j',",
-      "    password: process.env.NEO4J_PASSWORD || '',",
-      "    database: process.env.NEO4J_DATABASE",
-      "  });",
-      "",
-      "  const defaults = EMBEDDINGS_CONFIG.defaults ?? {};",
-      "  const providerCache = new Map();",
-      "",
-      "  const getProvider = (model, dimension) => {",
-      "    const resolvedModel = model ?? defaults.model;",
-      "    const resolvedDimension = dimension ?? defaults.dimension;",
-      "    const cacheKey = `${resolvedModel ?? 'default'}::${resolvedDimension ?? 'none'}`;",
-      "",
-      "    if (providerCache.has(cacheKey)) {",
-      "      return providerCache.get(cacheKey);",
-      "    }",
-      "",
-      "    const provider = new GeminiEmbeddingProvider({",
-      "      apiKey,",
-      "      model: resolvedModel,",
-      "      dimension: resolvedDimension",
-      "    });",
-      "",
-      "    providerCache.set(cacheKey, provider);",
-      "    return provider;",
-      "  };",
-      "",
-      "  try {",
-      "    for (const entity of EMBEDDINGS_CONFIG.entities) {",
-      "      console.log(`🔄 Generating embeddings for ${entity.entity}`);",
-      "      for (const pipeline of entity.pipelines) {",
-      "        const provider = getProvider(pipeline.model, pipeline.dimension);",
-      "        await runEmbeddingPipelines({",
-      "          neo4j: client,",
-      "          entity: {",
-      "            entity: entity.entity,",
-      "            pipelines: [pipeline]",
-      "          },",
-      "          provider,",
-      "          defaults: EMBEDDINGS_CONFIG.defaults",
-      "        });",
-      "      }",
-      "    }",
-      "",
-      "    console.log('✅ Embeddings generated successfully');",
-      "  } catch (error) {",
-      "    console.error('❌ Failed to generate embeddings', error);",
-      "    process.exitCode = 1;",
-      "  } finally {",
-      "    await client.close();",
-      "  }",
-      "}",
-      "",
-      "main();",
-      ""
-    ];
 
-    return lines.join('\\n');
+  private static generateGenerateEmbeddingsScript(): string {
+    return loadTemplate('scripts/generate-embeddings.js');
   }
 }

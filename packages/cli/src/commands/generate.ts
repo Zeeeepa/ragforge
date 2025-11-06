@@ -32,7 +32,7 @@ export interface GenerateOptions {
   password?: string;
   database?: string;
   rootDir: string;
-  geminiKey: string;
+  geminiKey?: string;
   preserveEmbeddingsConfig: boolean;
   autoDetectFields: boolean;
 }
@@ -50,7 +50,7 @@ Options:
   --password <password>   Neo4j password (used when --schema is absent)
   --database <name>       Optional Neo4j database
   --force                 Overwrite output directory when not empty
-  --reset-embeddings-config     Regenerate generated/embeddings/load-config.js even if it exists
+  --reset-embeddings-config     Regenerate generated/embeddings/load-config.ts even if it exists
   --auto-detect-fields    Use LLM to auto-detect optimal field mappings (display_name_field, unique_field, etc.)
   -h, --help              Show this message
 `);
@@ -58,7 +58,7 @@ Options:
 
 export function parseGenerateOptions(args: string[]): GenerateOptions {
   const rootDir = ensureEnvLoaded(import.meta.url);
-  const geminiKey = ensureGeminiKey(getEnv(['GEMINI_API_KEY']));
+  const geminiKey = getEnv(['GEMINI_API_KEY'], true); // Only from local .env
 
   const opts: Partial<GenerateOptions> = {
     force: false,
@@ -201,6 +201,10 @@ export async function runGenerate(options: GenerateOptions): Promise<void> {
       throw new Error('--auto-detect-fields requires Neo4j connection. Pass --uri/--username/--password or use .env file.');
     }
 
+    if (!options.geminiKey) {
+      throw new Error('--auto-detect-fields requires GEMINI_API_KEY. Add it to your .env file or set it in your environment.');
+    }
+
     const detector = new FieldDetector(conn.uri, conn.username, conn.password, options.geminiKey);
 
     try {
@@ -234,7 +238,7 @@ export async function runGenerate(options: GenerateOptions): Promise<void> {
   let preservedEmbeddingsConfig: string | undefined;
   if (options.preserveEmbeddingsConfig) {
     try {
-      preservedEmbeddingsConfig = await fs.readFile(path.join(options.outDir, 'embeddings', 'load-config.js'), 'utf-8');
+      preservedEmbeddingsConfig = await fs.readFile(path.join(options.outDir, 'embeddings', 'load-config.ts'), 'utf-8');
     } catch {
       preservedEmbeddingsConfig = undefined;
     }

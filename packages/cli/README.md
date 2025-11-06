@@ -167,7 +167,7 @@ ragforge generate \
 - `types.ts` - TypeScript types
 - `queries/*.ts` - Entity-specific query builders
 - `scripts/*.js` - Embedding management scripts
-- `embeddings/load-config.js` - Runtime config loader
+- `embeddings/load-config.ts` - Runtime config loader
 - `docs/client-reference.md` - API documentation
 - `agent.ts` - MCP agent template
 - `packages/runtime/` - Standalone runtime copy
@@ -357,7 +357,7 @@ my-rag-project/
 │   │   └── rebuild-agent.ts            # Rebuild MCP agent docs
 │   │
 │   ├── embeddings/                # Embedding configuration
-│   │   └── load-config.js        # Runtime config loader
+│   │   └── load-config.ts        # Runtime config loader
 │   │
 │   ├── docs/                      # Generated documentation
 │   │   ├── client-reference.md   # Complete API reference

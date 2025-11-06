@@ -4,7 +4,7 @@ import { fileURLToPath } from 'url';
 import { Neo4jClient } from '@luciformresearch/ragforge-runtime';
 import neo4j from 'neo4j-driver';
 
-import { EMBEDDINGS_CONFIG } from '../embeddings/load-config.js';
+import { EMBEDDINGS_CONFIG } from '../embeddings/load-config.ts';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.resolve(__dirname, '../.env') });

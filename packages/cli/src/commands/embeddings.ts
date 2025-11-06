@@ -61,7 +61,7 @@ export async function parseEmbeddingsOptions(args: string[]): Promise<EmbeddingO
   const envUser = getEnv(['NEO4J_USERNAME', 'NEO4J_USER']);
   const envPass = getEnv(['NEO4J_PASSWORD', 'NEO4J_PASS']);
   const envDatabase = getEnv(['NEO4J_DATABASE']);
-  const geminiKey = ensureGeminiKey(getEnv(['GEMINI_API_KEY']));
+  const geminiKey = ensureGeminiKey(getEnv(['GEMINI_API_KEY'], true)); // Only from local .env
 
   const finalUri = uri || envUri;
   const finalUsername = username || envUser;

@@ -53,8 +53,7 @@ export interface GeneratedCode {
     markdown: string;            // Complete markdown for developers
   };
   embeddings?: {
-    loaderModule: string;
-    loaderTypes: string;
+    loader: string;
     createIndexesScript: string;
     generateEmbeddingsScript: string;
   };
@@ -370,7 +369,7 @@ export class CodeGenerator {
     lines.push(`import type { RuntimeConfig } from '@luciformresearch/ragforge-runtime';`);
 
     if (hasEmbeddings) {
-      lines.push(`import { EMBEDDINGS_CONFIG } from './embeddings/load-config.js';`);
+      lines.push(`import { EMBEDDINGS_CONFIG } from './embeddings/load-config.ts';`);
     }
 
     // Import query builders
@@ -1403,131 +1402,12 @@ export class CodeGenerator {
       return undefined;
     }
 
-    const loaderModule = [
-      "import fs from 'fs';",
-      "import path from 'path';",
-      "import { fileURLToPath } from 'url';",
-      "import yaml from 'js-yaml';",
-      "",
-      "const __filename = fileURLToPath(import.meta.url);",
-      "const __dirname = path.dirname(__filename);",
-      "const PROJECT_ROOT = path.resolve(__dirname, '..');",
-      "const YAML_PATH = path.resolve(PROJECT_ROOT, '../ragforge.config.yaml');",
-      "",
-      "function transformPipeline(pipeline) {",
-      "  if (!pipeline) {",
-      "    return undefined;",
-      "  }",
-      "",
-      "  return {",
-      "    name: pipeline.name,",
-      "    source: pipeline.source,",
-      "    targetProperty: pipeline.target_property ?? pipeline.targetProperty ?? 'embedding',",
-      "    model: pipeline.model,",
-      "    dimension: pipeline.dimension,",
-      "    similarity: pipeline.similarity,",
-      "    preprocessors: pipeline.preprocessors,",
-      "    includeFields: pipeline.include_fields,",
-      "    includeRelationships: pipeline.include_relationships",
-      "      ? pipeline.include_relationships.map(rel => ({",
-      "          type: rel.type,",
-      "          direction: rel.direction,",
-      "          fields: rel.fields,",
-      "          depth: rel.depth,",
-      "          maxItems: rel.max_items ?? rel.maxItems",
-      "        }))",
-      "      : undefined,",
-      "    batchSize: pipeline.batch_size ?? pipeline.batchSize,",
-      "    concurrency: pipeline.concurrency,",
-      "    throttleMs: pipeline.throttle_ms ?? pipeline.throttleMs,",
-      "    maxRetries: pipeline.max_retries ?? pipeline.maxRetries,",
-      "    retryDelayMs: pipeline.retry_delay_ms ?? pipeline.retryDelayMs",
-      "  };",
-      "}",
-      "",
-      "function transformEmbeddingsConfig(raw) {",
-      "  if (!raw) {",
-      "    throw new Error('Embeddings configuration missing from ragforge.config.yaml');",
-      "  }",
-      "",
-      "  const entities = Array.isArray(raw.entities)",
-      "    ? raw.entities.map(entity => ({",
-      "        entity: entity.entity,",
-      "        pipelines: Array.isArray(entity.pipelines)",
-      "          ? entity.pipelines",
-      "              .map(transformPipeline)",
-      "              .filter(Boolean)",
-      "          : []",
-      "      }))",
-      "    : [];",
-      "",
-      "  return {",
-      "    provider: raw.provider,",
-      "    defaults: raw.defaults ? { ...raw.defaults } : undefined,",
-      "    entities",
-      "  };",
-      "}",
-      "",
-      "export function loadEmbeddingsConfig() {",
-      "  const yamlContent = fs.readFileSync(YAML_PATH, 'utf-8');",
-      "  const config = yaml.load(yamlContent) ?? {};",
-      "  return transformEmbeddingsConfig(config.embeddings);",
-      "}",
-      "",
-      "export const EMBEDDINGS_CONFIG = loadEmbeddingsConfig();",
-      ""
-    ].join('\\n');
-
-    const loaderTypes = [
-      "export interface EmbeddingPipelineConfig {",
-      "  name: string;",
-      "  source: string;",
-      "  targetProperty: string;",
-      "  model?: string;",
-      "  dimension?: number;",
-      "  similarity?: 'cosine' | 'dot' | 'euclidean';",
-      "  preprocessors?: string[];",
-      "  includeFields?: string[];",
-      "  includeRelationships?: Array<{",
-      "    type: string;",
-      "    direction: 'outgoing' | 'incoming' | 'both';",
-      "    fields?: string[];",
-      "    depth?: number;",
-      "    maxItems?: number;",
-      "  }>;",
-      "  batchSize?: number;",
-      "  concurrency?: number;",
-      "  throttleMs?: number;",
-      "  maxRetries?: number;",
-      "  retryDelayMs?: number;",
-      "}",
-      "",
-      "export interface EmbeddingEntityConfig {",
-      "  entity: string;",
-      "  pipelines: EmbeddingPipelineConfig[];",
-      "}",
-      "",
-      "export interface EmbeddingsConfig {",
-      "  provider: string;",
-      "  defaults?: {",
-      "    model?: string;",
-      "    dimension?: number;",
-      "    similarity?: 'cosine' | 'dot' | 'euclidean';",
-      "  };",
-      "  entities: EmbeddingEntityConfig[];",
-      "}",
-      "",
-      "export declare function loadEmbeddingsConfig(): EmbeddingsConfig;",
-      "export declare const EMBEDDINGS_CONFIG: EmbeddingsConfig;",
-      ""
-    ].join('\\n');
-
+    const loader = loadTemplate('embeddings/load-config.ts');
     const createIndexesScript = this.generateCreateIndexesScript();
     const generateEmbeddingsScript = this.generateGenerateEmbeddingsScript();
 
     return {
-      loaderModule,
-      loaderTypes,
+      loader,
       createIndexesScript,
       generateEmbeddingsScript
     };

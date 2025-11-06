@@ -1,6 +1,6 @@
 {
   "name": "@luciformresearch/ragforge-core",
-  "version": "0.1.2",
+  "version": "0.1.6",
   "description": "Core library for RagForge - YAML config parsing, Neo4j schema introspection, and TypeScript code generation for domain-specific RAG frameworks.",
   "license": "LRSL-1.1 (See LICENSE file for more information)",
   "author": "Lucie Defraiteur <luciedefraiteur@luciformresearch.com>",
@@ -34,7 +34,8 @@
     "clean": "rm -rf dist",
     "build:esm": "tsc -p tsconfig.esm.json",
     "build:types": "tsc -p tsconfig.types.json",
-    "build": "npm run clean && npm run build:esm && npm run build:types",
+    "copy:templates": "cp -r templates dist/",
+    "build": "npm run clean && npm run build:esm && npm run build:types && npm run copy:templates",
     "prepublishOnly": "npm run build",
     "dev": "tsc --watch",
     "test": "vitest run",

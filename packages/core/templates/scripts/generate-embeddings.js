@@ -7,7 +7,7 @@ import {
   runEmbeddingPipelines
 } from '@luciformresearch/ragforge-runtime';
 
-import { EMBEDDINGS_CONFIG } from '../embeddings/load-config.js';
+import { EMBEDDINGS_CONFIG } from '../embeddings/load-config.ts';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.resolve(__dirname, '../.env') });

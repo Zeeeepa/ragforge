@@ -40,7 +40,7 @@ export interface InitOptions {
   outDir: string;
   force: boolean;
   rootDir: string;
-  geminiKey: string;
+  geminiKey?: string;
   preserveEmbeddingsConfig: boolean;
 }
 
@@ -56,7 +56,7 @@ Options:
   --project <name>        Project name used for generated artifacts
   --out <dir>             Output directory (default: ./ragforge-<project>)
   --force                 Overwrite existing output directory
-  --reset-embeddings-config     Regenerate generated/embeddings/load-config.js even if it exists
+  --reset-embeddings-config     Regenerate generated/embeddings/load-config.ts even if it exists
   -h, --help              Show this help
 `);
 }
@@ -112,7 +112,7 @@ export async function parseInitOptions(args: string[]): Promise<InitOptions> {
   const envPass = getEnv(['NEO4J_PASSWORD', 'NEO4J_PASS']);
   const envDatabase = getEnv(['NEO4J_DATABASE']);
   const envProject = getEnv(['RAGFORGE_PROJECT']);
-  const geminiKey = ensureGeminiKey(getEnv(['GEMINI_API_KEY']));
+  const geminiKey = getEnv(['GEMINI_API_KEY'], true); // Only from local .env
 
   const uri = options.uri || envUri;
   const username = options.username || envUser;
@@ -168,7 +168,7 @@ export async function runInit(options: InitOptions): Promise<void> {
   let preservedEmbeddingsConfig: string | undefined;
   if (options.preserveEmbeddingsConfig) {
     try {
-      preservedEmbeddingsConfig = await fs.readFile(path.join(generatedDir, 'embeddings', 'load-config.js'), 'utf-8');
+      preservedEmbeddingsConfig = await fs.readFile(path.join(generatedDir, 'embeddings', 'load-config.ts'), 'utf-8');
     } catch {
       preservedEmbeddingsConfig = undefined;
     }
