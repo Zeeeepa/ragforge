@@ -12,6 +12,7 @@ interface FieldMappings {
   unique_field: string;
   query_field: string;
   example_display_fields: string[];
+  embedding_fields?: string[];
 }
 
 interface SampleNode {
@@ -108,26 +109,16 @@ export class FieldDetector {
     const embeddingFields = new Set<string>();
 
     if (entity.vector_index) {
-      // Skip the embedding vector field
       embeddingFields.add(entity.vector_index.field);
-
-      // Skip the source field used for embeddings
       if (entity.vector_index.source_field) {
-        embeddingFields.add(entity.vector_index.source_field);
-        // Also skip embedding_{source_field} pattern (created by embedding pipeline)
         embeddingFields.add(`embedding_${entity.vector_index.source_field}`);
       }
     }
 
     if (entity.vector_indexes) {
       entity.vector_indexes.forEach(idx => {
-        // Skip the embedding vector field
         embeddingFields.add(idx.field);
-
-        // Skip the source field used for embeddings
         if (idx.source_field) {
-          embeddingFields.add(idx.source_field);
-          // Also skip embedding_{source_field} pattern (created by embedding pipeline)
           embeddingFields.add(`embedding_${idx.source_field}`);
         }
       });
@@ -195,6 +186,12 @@ For EACH entity above, analyze the samples and determine the best field for each
    - DO NOT include long text fields (like "source", "content", "body", "description")
    - If no good candidates, omit the <example_display_fields> tag
 
+5. **embedding_fields**: Up to 3 textual fields that should power semantic vector search
+   - Prefer long descriptive text (content, description, docstring, notes, summary, source code)
+   - Titles/names are valid if they are the most descriptive text available
+   - Avoid purely numeric or categorical fields
+   - Order from highest to lowest priority
+
 Return ONLY valid XML in this exact format (no markdown, no explanation):
 <entities>
   <entity name="EntityName1">
@@ -205,6 +202,10 @@ Return ONLY valid XML in this exact format (no markdown, no explanation):
       <field>field1</field>
       <field>field2</field>
     </example_display_fields>
+    <embedding_fields>
+      <field>field1</field>
+      <field>field2</field>
+    </embedding_fields>
   </entity>
   <entity name="EntityName2">
     <display_name_field>fieldName</display_name_field>
@@ -277,6 +278,15 @@ Return ONLY valid XML in this exact format (no markdown, no explanation):
           }
         }
 
+        if (entityData.embedding_fields?.field) {
+          const fields = entityData.embedding_fields.field;
+          if (Array.isArray(fields)) {
+            mappings.embedding_fields = fields;
+          } else {
+            mappings.embedding_fields = [fields];
+          }
+        }
+
         mappingsMap.set(entityName, mappings);
       }
 
@@ -291,11 +301,16 @@ Return ONLY valid XML in this exact format (no markdown, no explanation):
    * Get default field mappings as fallback
    */
   private getDefaultMappings(entity: EntityConfig): FieldMappings {
+    const defaultEmbeddingFields =
+      entity.vector_indexes?.map(idx => idx.source_field) ??
+      (entity.vector_index ? [entity.vector_index.source_field] : []);
+
     return {
       display_name_field: entity.display_name_field || 'name',
       unique_field: entity.unique_field || 'uuid',
       query_field: entity.query_field || 'name',
-      example_display_fields: entity.example_display_fields || []
+      example_display_fields: entity.example_display_fields || [],
+      embedding_fields: defaultEmbeddingFields
     };
   }
 }

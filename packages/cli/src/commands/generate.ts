@@ -15,7 +15,9 @@ import {
   CodeGenerator,
   SchemaIntrospector,
   type RagForgeConfig,
-  type GraphSchema
+  type GraphSchema,
+  type VectorIndexConfig,
+  type EntityConfig
 } from '@luciformresearch/ragforge-core';
 import { ensureEnvLoaded, getEnv } from '../utils/env.js';
 import { prepareOutputDirectory, persistGeneratedArtifacts, writeGeneratedEnv, type ConnectionEnv } from '../utils/io.js';
@@ -216,12 +218,15 @@ export async function runGenerate(options: GenerateOptions): Promise<void> {
         entities: config.entities.map(entity => {
           const detected = mappings.get(entity.name);
           if (detected) {
+            const mergedVectorIndexes = mergeVectorIndexes(entity, detected.embedding_fields || []);
             return {
               ...entity,
               display_name_field: detected.display_name_field,
               unique_field: detected.unique_field,
               query_field: detected.query_field,
-              example_display_fields: detected.example_display_fields
+              example_display_fields: detected.example_display_fields,
+              vector_index: mergedVectorIndexes[0],
+              vector_indexes: mergedVectorIndexes.length ? mergedVectorIndexes : undefined
             };
           }
           return entity;
@@ -266,4 +271,54 @@ export async function runGenerate(options: GenerateOptions): Promise<void> {
   } else {
     console.log('   - Neo4j env: skipped (credentials not available)');
   }
+}
+
+function mergeVectorIndexes(entity: EntityConfig, embeddingFields: string[]): VectorIndexConfig[] {
+  const baseIndexes: VectorIndexConfig[] = [];
+  if (entity.vector_indexes && entity.vector_indexes.length > 0) {
+    baseIndexes.push(...entity.vector_indexes);
+  } else if (entity.vector_index) {
+    baseIndexes.push(entity.vector_index);
+  }
+
+  const bySource = new Map<string, VectorIndexConfig>();
+  for (const idx of baseIndexes) {
+    if (idx?.source_field) {
+      bySource.set(idx.source_field, idx);
+    }
+  }
+
+  for (const field of embeddingFields) {
+    const trimmed = field?.trim();
+    if (!trimmed || bySource.has(trimmed)) {
+      continue;
+    }
+    bySource.set(trimmed, createVectorIndexFromField(entity.name, trimmed));
+  }
+
+  return Array.from(bySource.values());
+}
+
+function createVectorIndexFromField(entityName: string, field: string): VectorIndexConfig {
+  const entitySlug = slugifyIdentifier(entityName);
+  const fieldSlug = slugifyIdentifier(field) || 'field';
+
+  return {
+    name: `${entitySlug}_${fieldSlug}_embeddings`,
+    field: `embedding_${fieldSlug}`,
+    source_field: field,
+    dimension: 768,
+    similarity: 'cosine',
+    provider: 'gemini',
+    model: 'gemini-embedding-001'
+  };
+}
+
+function slugifyIdentifier(value: string): string {
+  return value
+    .trim()
+    .replace(/[^a-zA-Z0-9]+/g, '_')
+    .replace(/_{2,}/g, '_')
+    .replace(/^_|_$/g, '')
+    .toLowerCase();
 }

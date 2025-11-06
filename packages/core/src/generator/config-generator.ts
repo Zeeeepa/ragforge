@@ -15,7 +15,8 @@ import {
   EntityConfig,
   RerankingStrategy,
   EmbeddingsConfig,
-  EmbeddingEntityConfig
+  EmbeddingEntityConfig,
+  VectorIndexConfig
 } from '../types/config.js';
 
 const TEMPLATE_DIR = path.resolve(
@@ -299,20 +300,8 @@ export class ConfigGenerator {
         description: this.generateFieldDescription(p, node.label)
       }));
 
-    // Detect if this entity should have vector search
-    const hasTextContent = node.properties.some(p =>
-      ['description', 'content', 'text', 'summary', 'signature', 'source'].includes(p.name)
-    );
-
-    const vectorIndex = hasTextContent ? {
-      name: `${node.label.toLowerCase()}Embeddings`,
-      field: 'embedding',
-      source_field: 'source',
-      dimension: 768,
-      similarity: 'cosine' as const,
-      provider: 'gemini' as const,
-      model: 'gemini-embedding-001'
-    } : undefined;
+    const vectorIndexes = this.detectVectorIndexes(node, schema, domain);
+    const vectorIndex = vectorIndexes[0];
 
     // Find relationships for this node
     const relationships = schema.relationships
@@ -332,7 +321,7 @@ export class ConfigGenerator {
       description: `${node.label} entity (${node.count} nodes)`,
       searchable_fields: searchableFields,
       vector_index: vectorIndex,
-      vector_indexes: vectorIndex ? [vectorIndex] : undefined,
+      vector_indexes: vectorIndexes.length ? vectorIndexes : undefined,
       relationships: relationships.length > 0 ? relationships : undefined
     };
   }
@@ -569,5 +558,165 @@ export class ConfigGenerator {
 
   private static generateGenerateEmbeddingsScript(): string {
     return loadTemplate('scripts/generate-embeddings.ts');
+  }
+
+  private static detectVectorIndexes(
+    node: NodeSchema,
+    schema: GraphSchema,
+    domain: DomainPattern
+  ): VectorIndexConfig[] {
+    const candidates: Array<{
+      prop: PropertySchema;
+      score: number;
+      example?: string;
+    }> = [];
+
+    for (const prop of node.properties) {
+      if (!this.isTextualProperty(prop)) {
+        continue;
+      }
+
+      const score = this.scoreEmbeddingCandidate(node, prop, schema, domain);
+      if (score <= 0) {
+        continue;
+      }
+
+      candidates.push({
+        prop,
+        score,
+        example: this.getFieldExample(schema, node.label, prop.name)
+      });
+    }
+
+    if (candidates.length === 0) {
+      return [];
+    }
+
+    candidates.sort((a, b) => b.score - a.score);
+
+    const MIN_SCORE = 1.2;
+    const selected = candidates.filter(c => c.score >= MIN_SCORE).slice(0, 3);
+
+    if (selected.length === 0) {
+      selected.push(candidates[0]);
+    }
+
+    const usedFields = new Set<string>();
+
+    return selected.map((candidate, index) => {
+      const normalizedEntity = this.slugify(node.label);
+      const normalizedProp = this.slugify(candidate.prop.name) || `field${index + 1}`;
+      const targetFieldBase = `embedding_${normalizedProp}`;
+      const targetField = this.ensureUniqueFieldName(targetFieldBase, usedFields);
+      usedFields.add(targetField);
+
+      return {
+        name: `${normalizedEntity}_${normalizedProp}_embeddings`,
+        field: targetField,
+        source_field: candidate.prop.name,
+        dimension: 768,
+        similarity: 'cosine',
+        provider: 'gemini',
+        model: 'gemini-embedding-001',
+        example_query: candidate.example
+      };
+    });
+  }
+
+  private static ensureUniqueFieldName(base: string, existing: Set<string>): string {
+    if (!existing.has(base)) {
+      return base;
+    }
+
+    let counter = 1;
+    let candidate = `${base}_${counter}`;
+    while (existing.has(candidate)) {
+      counter += 1;
+      candidate = `${base}_${counter}`;
+    }
+
+    return candidate;
+  }
+
+  private static isTextualProperty(prop: PropertySchema): boolean {
+    if (prop.type === 'String') return true;
+    if (prop.type === 'List') return true;
+    return false;
+  }
+
+  private static scoreEmbeddingCandidate(
+    node: NodeSchema,
+    prop: PropertySchema,
+    schema: GraphSchema,
+    domain: DomainPattern
+  ): number {
+    const name = prop.name.toLowerCase();
+    let score = 0;
+
+    const longTextKeywords = ['content', 'description', 'summary', 'text', 'body', 'source', 'docstring', 'notes', 'message'];
+    const nameKeywords = ['name', 'title', 'headline', 'label', 'subject'];
+
+    if (longTextKeywords.some(keyword => name.includes(keyword))) {
+      score += 3;
+    }
+
+    if (nameKeywords.some(keyword => name.includes(keyword))) {
+      score += 1.5;
+    }
+
+    if (domain.name === 'code') {
+      const codeKeywords = ['source', 'signature', 'doc', 'documentation', 'comment', 'body'];
+      if (codeKeywords.some(keyword => name.includes(keyword))) {
+        score += 2;
+      }
+    }
+
+    const examples = this.getFieldExamples(schema, node.label, prop.name);
+    if (examples.length > 0) {
+      const textExamples = examples.filter(value => typeof value === 'string') as string[];
+      if (textExamples.length > 0) {
+        const avgLength = textExamples.reduce((sum, value) => sum + value.length, 0) / textExamples.length;
+        if (avgLength > 400) score += 3;
+        else if (avgLength > 200) score += 2;
+        else if (avgLength > 80) score += 1;
+        else if (avgLength > 20) score += 0.5;
+
+        const containsLetters = textExamples.some(value => /[A-Za-z]/.test(value));
+        if (!containsLetters) {
+          score -= 2;
+        }
+
+        const mostlyNumeric = textExamples.every(value => /^[\d\s._\-/:]+$/.test(value));
+        if (mostlyNumeric) {
+          score -= 2;
+        }
+      }
+    } else if (longTextKeywords.some(keyword => name.includes(keyword))) {
+      score += 1; // no examples but strong signal from name
+    }
+
+    return score;
+  }
+
+  private static getFieldExamples(schema: GraphSchema, entityLabel: string, fieldName: string): string[] {
+    if (!schema.fieldExamples) {
+      return [];
+    }
+
+    const key = `${entityLabel}.${fieldName}`;
+    return schema.fieldExamples[key] || [];
+  }
+
+  private static getFieldExample(schema: GraphSchema, entityLabel: string, fieldName: string): string | undefined {
+    const examples = this.getFieldExamples(schema, entityLabel, fieldName);
+    return examples.find(value => typeof value === 'string' && value.trim().length > 0);
+  }
+
+  private static slugify(value: string): string {
+    return value
+      .replace(/[^a-zA-Z0-9]+/g, '_')
+      .replace(/_{2,}/g, '_')
+      .replace(/^_|_$/g, '')
+      .toLowerCase();
   }
 }
