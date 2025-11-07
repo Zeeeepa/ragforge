@@ -46,6 +46,7 @@ export interface InitOptions {
   rootDir: string;
   geminiKey?: string;
   autoDetectFields: boolean;
+  dev: boolean;  // Use local runtime package via file: dependency
 }
 
 export function printInitHelp(): void {
@@ -66,6 +67,7 @@ Options:
   --project <name>        Project name (default: current directory name)
   --out <dir>             Output directory (default: ./generated)
   --auto-detect-fields    Use LLM to detect best fields (needs GEMINI_API_KEY)
+  --dev                   Use local runtime package for development
   --force                 Overwrite existing files
   -h, --help              Show this help
 
@@ -89,7 +91,8 @@ export async function parseInitOptions(args: string[]): Promise<InitOptions> {
 
   const options: Partial<InitOptions> = {
     force: false,
-    autoDetectFields: false
+    autoDetectFields: false,
+    dev: false
   };
 
   for (let i = 0; i < args.length; i += 1) {
@@ -119,6 +122,9 @@ export async function parseInitOptions(args: string[]): Promise<InitOptions> {
         break;
       case '--auto-detect-fields':
         options.autoDetectFields = true;
+        break;
+      case '--dev':
+        options.dev = true;
         break;
       case '-h':
       case '--help':
@@ -173,7 +179,8 @@ export async function parseInitOptions(args: string[]): Promise<InitOptions> {
     force: options.force ?? false,
     rootDir,
     geminiKey,
-    autoDetectFields: options.autoDetectFields ?? false
+    autoDetectFields: options.autoDetectFields ?? false,
+    dev: options.dev ?? false
   };
 }
 
@@ -354,12 +361,22 @@ export async function runInit(options: InitOptions): Promise<void> {
   const typesContent = TypeGenerator.generate(schema, config);
   const generated = CodeGenerator.generate(config, schema);
 
+  // Calculate ragforge root for dev mode
+  let ragforgeRoot: string | undefined;
+  if (options.dev) {
+    // Get the CLI dist/esm directory from import.meta.url
+    const distEsmDir = path.dirname(path.dirname(new URL(import.meta.url).pathname));
+    // Go up 4 levels: dist/esm -> dist -> cli -> packages -> ragforge
+    ragforgeRoot = path.resolve(distEsmDir, '../../../..');
+  }
+
   await persistGeneratedArtifacts(
     finalOutputDir,
     generated,
     typesContent,
-    options.rootDir,
-    projectName
+    ragforgeRoot,
+    projectName,
+    options.dev
   );
   console.log(`📦  Generated client written to ${finalOutputDir}`);
   await writeGeneratedEnv(finalOutputDir, {

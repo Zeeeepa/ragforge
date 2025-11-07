@@ -46,8 +46,9 @@ export async function persistGeneratedArtifacts(
   outDir: string,
   generated: GeneratedCode,
   typesContent: string,
-  rootDir: string,
-  projectName: string
+  rootDir: string | undefined,
+  projectName: string,
+  dev: boolean = false
 ): Promise<void> {
   const queriesDir = path.join(outDir, 'queries');
   await fs.mkdir(queriesDir, { recursive: true });
@@ -122,11 +123,9 @@ export async function persistGeneratedArtifacts(
   // Write rebuild-agent script
   await writeFileIfChanged(path.join(scriptsDir, 'rebuild-agent.ts'), generated.rebuildAgentScript);
 
-  const isDevelopmentMode = await checkIfDevelopmentMode(rootDir);
-  if (isDevelopmentMode) {
-    await copyRuntimePackage(rootDir, outDir);
-  }
-  await writeGeneratedPackageJson(outDir, projectName, isDevelopmentMode, generated);
+  // In dev mode, use file: dependency instead of copying runtime
+  // No longer copy runtime package, just use file: in package.json
+  await writeGeneratedPackageJson(outDir, projectName, dev, generated, rootDir);
   await writeGeneratedTsconfig(outDir);
   await writeExampleScripts(outDir, generated, projectName);
   await writeGitIgnore(outDir);
@@ -251,8 +250,9 @@ async function copyRuntimePackage(rootDir: string, targetDir: string): Promise<v
 async function writeGeneratedPackageJson(
   outDir: string,
   projectName: string,
-  isDevelopmentMode: boolean,
-  generated: GeneratedCode
+  dev: boolean,
+  generated: GeneratedCode,
+  rootDir: string | undefined
 ): Promise<void> {
   const safeName = projectName
     .toLowerCase()
@@ -260,13 +260,21 @@ async function writeGeneratedPackageJson(
     .replace(/--+/g, '-')
     .replace(/^-|-$/g, '') || 'ragforge-client';
 
+  // Calculate relative path to runtime package when in dev mode
+  let runtimeDependency = '^0.1.2';
+  if (dev && rootDir) {
+    const runtimePath = path.join(rootDir, 'packages/runtime');
+    const relativePath = path.relative(outDir, runtimePath);
+    runtimeDependency = `file:${relativePath}`;
+  }
+
   const pkg: any = {
     name: safeName,
     private: true,
     type: 'module',
     version: '0.0.1',
     dependencies: {
-      '@luciformresearch/ragforge-runtime': isDevelopmentMode ? 'file:./packages/runtime' : '^0.1.2',
+      '@luciformresearch/ragforge-runtime': runtimeDependency,
       '@google/genai': '^1.28.0',
       'dotenv': '^16.3.1',
       'tsx': '^4.20.0',
@@ -275,7 +283,7 @@ async function writeGeneratedPackageJson(
   };
 
   // Only add devDependencies in development mode
-  if (isDevelopmentMode) {
+  if (dev) {
     pkg.devDependencies = {
       '@luciformresearch/codeparsers': 'file:../../packages/codeparsers'
     };
@@ -302,7 +310,7 @@ async function writeGeneratedPackageJson(
   await writeFileIfChanged(path.join(outDir, 'package.json'), JSON.stringify(pkg, null, 2) + '\n');
 
   // Auto-install dependencies in production mode
-  if (!isDevelopmentMode) {
+  if (!dev) {
     console.log('📦  Installing dependencies...');
     const { exec } = await import('child_process');
     const { promisify } = await import('util');

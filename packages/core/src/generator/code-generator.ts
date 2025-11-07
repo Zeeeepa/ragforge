@@ -521,6 +521,13 @@ export class CodeGenerator {
       const fileName = entity.name.toLowerCase();
       lines.push(`import { ${entity.name}Query } from './queries/${fileName}.js';`);
     }
+    lines.push(``);
+
+    // Import mutation builders
+    for (const entity of config.entities) {
+      const fileName = entity.name.toLowerCase();
+      lines.push(`import { ${entity.name}Mutations } from './mutations/${fileName}.js';`);
+    }
 
     lines.push(``);
 
@@ -609,6 +616,27 @@ export class CodeGenerator {
       lines.push(``);
     }
 
+    // Generate mutation method for each entity
+    for (const entity of config.entities) {
+      const uniqueField = entity.unique_field || 'uuid';
+      const displayNameField = entity.display_name_field || 'name';
+
+      lines.push(`  /**`);
+      lines.push(`   * Perform mutations (create, update, delete) on ${entity.name} entities`);
+      if (entity.description) {
+        lines.push(`   * ${entity.description}`);
+      }
+      lines.push(`   */`);
+      lines.push(`  ${this.camelCase(entity.name)}Mutations(): ${entity.name}Mutations {`);
+      lines.push(`    return new ${entity.name}Mutations(this.neo4jClient, {`);
+      lines.push(`      name: '${entity.name}',`);
+      lines.push(`      uniqueField: '${uniqueField}',`);
+      lines.push(`      displayNameField: '${displayNameField}'`);
+      lines.push(`    });`);
+      lines.push(`  }`);
+      lines.push(``);
+    }
+
     // Add getEntityContext method
     lines.push(`  /**`);
     lines.push(`   * Get entity context for LLM reranker`);
@@ -678,6 +706,13 @@ export class CodeGenerator {
     for (const entity of config.entities) {
       const fileName = entity.name.toLowerCase();
       lines.push(`export { ${entity.name}Query } from './queries/${fileName}.js';`);
+    }
+    lines.push(``);
+
+    // Export mutation builders
+    for (const entity of config.entities) {
+      const fileName = entity.name.toLowerCase();
+      lines.push(`export { ${entity.name}Mutations } from './mutations/${fileName}.js';`);
     }
     lines.push(``);
 
@@ -1922,6 +1957,34 @@ export class CodeGenerator {
       exampleNum++;
     }
 
+    // Generate mutation examples
+    // Find entities with relationships for mutation examples
+    const entitiesWithRelationships = config.entities.filter(e =>
+      e.relationships && e.relationships.length > 0
+    );
+
+    if (entitiesWithRelationships.length > 0) {
+      const mainEntity = entitiesWithRelationships[0];
+      const relatedEntities = (mainEntity.relationships || [])
+        .map(rel => config.entities.find(e => e.name === rel.target))
+        .filter((e): e is typeof config.entities[number] => e !== undefined);
+
+      // CRUD example
+      examples.set(`${String(exampleNum).padStart(2, '0')}-mutations-crud`, this.generateCrudExample(
+        mainEntity,
+        relatedEntities[0]
+      ));
+      exampleNum++;
+
+      // Batch mutations example
+      if (relatedEntities.length >= 2) {
+        examples.set(`${String(exampleNum).padStart(2, '0')}-batch-mutations`, this.generateBatchMutationsExample(
+          config.entities
+        ));
+        exampleNum++;
+      }
+    }
+
     // Extract summaries from generated examples (just the function body code)
     for (const [filename, code] of examples.entries()) {
       const summary = this.extractExampleSummary(filename, code);
@@ -2444,6 +2507,182 @@ ${relCalls}
       'stopping, criteria, iterative, quality',
       bodyCode,
       'return allResults;'
+    );
+  }
+
+  /**
+   * Generate CRUD mutations example
+   */
+  private static generateCrudExample(
+    mainEntity: EntityConfig,
+    relatedEntity?: EntityConfig
+  ): string {
+    const mainEntityMethod = this.camelCase(mainEntity.name);
+    const mainEntityCreate = `${mainEntity.name}Create`;
+    const mainEntityUpdate = `${mainEntity.name}Update`;
+    const uniqueField = mainEntity.unique_field || 'uuid';
+
+    let relatedEntityCreate = '';
+    let relatedEntityMethod = '';
+    let relationshipType = '';
+    let addRelationshipMethod = '';
+    let removeRelationshipMethod = '';
+
+    if (relatedEntity && mainEntity.relationships && mainEntity.relationships.length > 0) {
+      const rel = mainEntity.relationships[0];
+      relatedEntityMethod = this.camelCase(relatedEntity.name);
+      relatedEntityCreate = `${relatedEntity.name}Create`;
+      relationshipType = rel.type;
+      addRelationshipMethod = this.camelCase(`add_${rel.type}`);
+      removeRelationshipMethod = this.camelCase(`remove_${rel.type}`);
+    }
+
+    // Get sample fields from the entity (excluding unique field)
+    const mainFields = mainEntity.searchable_fields
+      .filter(f => f.name !== uniqueField)
+      .slice(0, 3)
+      .map(f => f.name);
+    const relatedUniqueField = relatedEntity ? (relatedEntity.unique_field || 'uuid') : uniqueField;
+    const relatedFields = relatedEntity ?
+      relatedEntity.searchable_fields
+        .filter(f => f.name !== relatedUniqueField)
+        .slice(0, 2)
+        .map(f => f.name) : [];
+
+    const bodyCode = `  console.log('📚 Testing CRUD mutations\\n');
+
+  // 1. Create a new ${relatedEntity ? relatedEntity.name.toLowerCase() : 'entity'}
+  console.log('1️⃣ Creating a new ${relatedEntity ? relatedEntity.name.toLowerCase() : 'entity'}...');
+  const new${relatedEntity ? relatedEntity.name : 'Entity'}: ${relatedEntityCreate || 'any'} = {
+    ${uniqueField}: '${relatedEntity ? relatedEntity.name.toLowerCase() : 'entity'}-test-001',${relatedFields.map((f, i) => `\n    ${f}: 'Sample ${f} ${i + 1}'`).join(',')}
+  };
+
+  const created${relatedEntity ? relatedEntity.name : 'Entity'} = await rag.${relatedEntityMethod}Mutations().create(new${relatedEntity ? relatedEntity.name : 'Entity'});
+  console.log('✅ ${relatedEntity ? relatedEntity.name : 'Entity'} created:', created${relatedEntity ? relatedEntity.name : 'Entity'});
+  console.log();
+
+  // 2. Create a new ${mainEntity.name.toLowerCase()}
+  console.log('2️⃣ Creating a new ${mainEntity.name.toLowerCase()}...');
+  const new${mainEntity.name}: ${mainEntityCreate} = {
+    ${uniqueField}: '${mainEntity.name.toLowerCase()}-test-001',${mainFields.map((f, i) => `\n    ${f}: 'Sample ${f} ${i + 1}'`).join(',')}
+  };
+
+  const created${mainEntity.name} = await rag.${mainEntityMethod}Mutations().create(new${mainEntity.name});
+  console.log('✅ ${mainEntity.name} created:', created${mainEntity.name});
+  console.log();
+
+  ${relatedEntity && relationshipType ? `// 3. Add relationship: ${mainEntity.name} ${relationshipType} ${relatedEntity.name}
+  console.log('3️⃣ Linking ${mainEntity.name.toLowerCase()} to ${relatedEntity.name.toLowerCase()}...');
+  await rag.${mainEntityMethod}Mutations().${addRelationshipMethod}('${mainEntity.name.toLowerCase()}-test-001', '${relatedEntity.name.toLowerCase()}-test-001');
+  console.log('✅ Relationship added: ${mainEntity.name} ${relationshipType} ${relatedEntity.name}');
+  console.log();
+
+  // 4. Update the ${mainEntity.name.toLowerCase()}
+  console.log('4️⃣ Updating ${mainEntity.name.toLowerCase()}...');` : `// 3. Update the ${mainEntity.name.toLowerCase()}
+  console.log('3️⃣ Updating ${mainEntity.name.toLowerCase()}...');`}
+  const ${mainEntityMethod}Update: ${mainEntityUpdate} = {
+    ${mainFields[1]}: 'Updated ${mainFields[1]}'
+  };
+
+  const updated${mainEntity.name} = await rag.${mainEntityMethod}Mutations().update('${mainEntity.name.toLowerCase()}-test-001', ${mainEntityMethod}Update);
+  console.log('✅ ${mainEntity.name} updated:', updated${mainEntity.name});
+  console.log();
+
+  ${relatedEntity && relationshipType ? `// 5. Remove the relationship
+  console.log('5️⃣ Removing ${mainEntity.name.toLowerCase()}-${relatedEntity.name.toLowerCase()} relationship...');
+  await rag.${mainEntityMethod}Mutations().${removeRelationshipMethod}('${mainEntity.name.toLowerCase()}-test-001', '${relatedEntity.name.toLowerCase()}-test-001');
+  console.log('✅ Relationship removed');
+  console.log();
+
+  // 6. Delete the ${mainEntity.name.toLowerCase()}
+  console.log('6️⃣ Deleting the ${mainEntity.name.toLowerCase()}...');` : `// 4. Delete the ${mainEntity.name.toLowerCase()}
+  console.log('4️⃣ Deleting the ${mainEntity.name.toLowerCase()}...');`}
+  await rag.${mainEntityMethod}Mutations().delete('${mainEntity.name.toLowerCase()}-test-001');
+  console.log('✅ ${mainEntity.name} deleted');
+  console.log();
+
+  ${relatedEntity ? `// ${relatedEntity && relationshipType ? '7' : '5'}. Delete the ${relatedEntity.name.toLowerCase()}
+  console.log('${relatedEntity && relationshipType ? '7' : '5'}️⃣ Deleting the ${relatedEntity.name.toLowerCase()}...');
+  await rag.${relatedEntityMethod}Mutations().delete('${relatedEntity.name.toLowerCase()}-test-001');
+  console.log('✅ ${relatedEntity.name} deleted');
+  console.log();` : ''}
+
+  console.log('✨ All CRUD operations completed successfully!');`;
+
+    return this.generateExampleWrapper(
+      'CRUD operations with mutations',
+      `Create, update, and delete ${mainEntity.name} entities${relatedEntity ? ` with ${relationshipType} relationships` : ''}`,
+      'mutation, crud, create, update, delete, relationships',
+      'crud, mutations, create, update, delete',
+      bodyCode,
+      ''
+    );
+  }
+
+  /**
+   * Generate batch mutations example
+   */
+  private static generateBatchMutationsExample(entities: EntityConfig[]): string {
+    const firstThreeEntities = entities.slice(0, 3);
+    const uniqueField = firstThreeEntities[0].unique_field || 'uuid';
+
+    const createBatchSections = firstThreeEntities.map((entity, idx) => {
+      const entityMethod = this.camelCase(entity.name);
+      const entityCreate = `${entity.name}Create`;
+      const entityUniqueField = entity.unique_field || 'uuid';
+      const fields = entity.searchable_fields
+        .filter(f => f.name !== entityUniqueField)
+        .slice(0, 2);
+
+      return `  // ${idx + 1}. Create multiple ${entity.name} entities in batch
+  console.log('${idx + 1}️⃣ Creating multiple ${entity.name.toLowerCase()} entities in batch...');
+  const new${entity.name}s: ${entityCreate}[] = [
+    {
+      ${uniqueField}: '${entity.name.toLowerCase()}-batch-001',${fields.map((f, i) => `\n      ${f.name}: 'Sample ${entity.name} 1 ${f.name}'`).join(',')}
+    },
+    {
+      ${uniqueField}: '${entity.name.toLowerCase()}-batch-002',${fields.map((f, i) => `\n      ${f.name}: 'Sample ${entity.name} 2 ${f.name}'`).join(',')}
+    },
+    {
+      ${uniqueField}: '${entity.name.toLowerCase()}-batch-003',${fields.map((f, i) => `\n      ${f.name}: 'Sample ${entity.name} 3 ${f.name}'`).join(',')}
+    }
+  ];
+
+  const created${entity.name}s = await rag.${entityMethod}Mutations().createBatch(new${entity.name}s);
+  console.log(\`✅ Created \${created${entity.name}s.length} ${entity.name.toLowerCase()} entities\`);
+  created${entity.name}s.forEach(item => {
+    console.log(\`   - \${item.${entity.display_name_field || fields[0].name}}\`);
+  });
+  console.log();`;
+    }).join('\n\n');
+
+    const cleanupSections = firstThreeEntities.map((entity, idx) => {
+      const entityMethod = this.camelCase(entity.name);
+      return `    for (const item of created${entity.name}s) {
+      await rag.${entityMethod}Mutations().delete(item.${uniqueField});
+    }
+    console.log('   ✅ Deleted all ${entity.name.toLowerCase()} entities');`;
+    }).join('\n\n');
+
+    const bodyCode = `  console.log('📦 Testing batch mutations\\n');
+
+${createBatchSections}
+
+  // ${firstThreeEntities.length + 1}. Cleanup - delete everything
+  console.log('${firstThreeEntities.length + 1}️⃣ Cleaning up...');
+
+${cleanupSections}
+  console.log();
+
+  console.log('✨ Batch operations completed successfully!');`;
+
+    return this.generateExampleWrapper(
+      'Batch mutations',
+      'Create multiple entities in a single transaction for better performance',
+      'mutation, batch, createBatch, performance, transaction',
+      'batch, mutations, createBatch',
+      bodyCode,
+      ''
     );
   }
 
