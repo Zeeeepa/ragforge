@@ -26,7 +26,8 @@ import type {
   ExpandOperation,
   SemanticOperation,
   LLMRerankOperation,
-  FilterOperation
+  FilterOperation,
+  ClientFilterOperation
 } from './operations.js';
 import type { EntityContext } from '../types/entity-context.js';
 
@@ -153,6 +154,65 @@ export class QueryBuilder<T = any> {
   }
 
   /**
+   * Filter by field matching any value in array (batch query)
+   * Completely generic - works with any field type
+   * @param field - Field name to filter on
+   * @param values - Array of values to match
+   */
+  whereIn(field: string, values: any[]): this {
+    // Add WHERE IN filter
+    this.filters = { ...this.filters, [field]: { $in: values } };
+
+    // Merge with last operation if it's also a filter
+    const lastOp = this.operations[this.operations.length - 1];
+    if (lastOp && lastOp.type === 'filter') {
+      lastOp.config.filters = { ...lastOp.config.filters, [field]: { $in: values } };
+    } else {
+      this.operations.push({
+        type: 'filter',
+        config: { filters: { [field]: { $in: values } } }
+      });
+    }
+
+    return this;
+  }
+
+  /**
+   * Filter by regex pattern on a field
+   * Uses Neo4j's =~ operator for server-side regex matching
+   *
+   * @example
+   * // Find all async functions
+   * query.wherePattern('source', /async\s+function/)
+   *
+   * // Find all handle* functions
+   * query.wherePattern('name', /^handle/)
+   *
+   * // Find all try-catch blocks
+   * query.wherePattern('source', /try\s*{[\s\S]*catch/)
+   */
+  wherePattern(fieldName: string, pattern: RegExp | string): this {
+    const regexString = pattern instanceof RegExp ? pattern.source : pattern;
+
+    // Store as special filter with __pattern suffix
+    const filter = { [`${fieldName}__pattern`]: regexString };
+    this.filters = { ...this.filters, ...filter };
+
+    // Merge with last operation if it's also a filter
+    const lastOp = this.operations[this.operations.length - 1];
+    if (lastOp && lastOp.type === 'filter') {
+      lastOp.config.filters = { ...lastOp.config.filters, ...filter };
+    } else {
+      this.operations.push({
+        type: 'filter',
+        config: { filters: filter }
+      });
+    }
+
+    return this;
+  }
+
+  /**
    * Semantic search by text
    *
    * Can be chained multiple times to refine results progressively.
@@ -208,6 +268,32 @@ export class QueryBuilder<T = any> {
 
     // Keep legacy behavior
     this.expansions.push({ relType, options });
+    return this;
+  }
+
+  /**
+   * Client-side filtering of results using a predicate function
+   * Applied after query execution, useful for complex logic or regex on already-fetched results
+   *
+   * @example
+   * // Filter by name pattern (client-side regex)
+   * query.limit(100)
+   *      .filter(r => /^handle/.test(r.entity.name))
+   *
+   * // Filter by custom logic
+   * query.limit(50)
+   *      .filter(r => r.score > 0.8 && r.entity.type === 'function')
+   *
+   * // Combine server + client filtering
+   * query.where({ type: 'function' })  // Server-side
+   *      .limit(100)
+   *      .filter(r => /async/.test(r.entity.source))  // Client-side
+   */
+  filter(predicate: (result: SearchResult<T>) => boolean): this {
+    this.operations.push({
+      type: 'clientFilter',
+      config: { predicate }
+    });
     return this;
   }
 
@@ -621,6 +707,11 @@ export class QueryBuilder<T = any> {
           currentResults = await this.executeFilter(currentResults, operation);
           break;
 
+        case 'clientFilter':
+          // Client-side filtering using predicate function
+          currentResults = currentResults.filter(operation.config.predicate);
+          break;
+
         default:
           console.warn(`Unknown operation type: ${(operation as any).type}`);
       }
@@ -806,26 +897,21 @@ export class QueryBuilder<T = any> {
     }
 
     let relationshipPattern = '';
+    let pathPattern = '';
     switch (direction) {
       case 'outgoing':
         relationshipPattern = `-[:${relType}*1..${depth}]->`;
+        pathPattern = `(n)-[rels:${relType}*1..${depth}]->(related)`;
         break;
       case 'incoming':
         relationshipPattern = `<-[:${relType}*1..${depth}]-`;
+        pathPattern = `(n)<-[rels:${relType}*1..${depth}]-(related)`;
         break;
       case 'both':
         relationshipPattern = `-[:${relType}*1..${depth}]-`;
+        pathPattern = `(n)-[rels:${relType}*1..${depth}]-(related)`;
         break;
     }
-
-    // Build config-driven enrichment
-    const enrichmentClause = this.buildEnrichmentClause();
-    const enrichmentReturn = this.buildEnrichmentReturn();
-
-    // Fix: Handle case when enrichmentReturn is just "n" (no additional fields)
-    const additionalFields = enrichmentReturn.startsWith('n, ')
-      ? ', ' + enrichmentReturn.substring(3)
-      : '';
 
     // Build WHERE clause for additional filters
     const params: Record<string, any> = { uuids };
@@ -839,53 +925,63 @@ export class QueryBuilder<T = any> {
 
       if (whereConditions.length > 0) {
         // Replace 'n.' with 'related.' in the conditions
-        filterWhereClause = '\nWHERE ' + whereConditions.join(' AND ').replace(/\bn\./g, 'related.');
+        filterWhereClause = '\nAND ' + whereConditions.join(' AND ').replace(/\bn\./g, 'related.');
       }
     }
 
+    // New approach: Fetch related entities grouped by source
     const cypher = `
       MATCH (n:\`${this.entityType}\`)
       WHERE n.uuid IN $uuids
-      MATCH (n)${relationshipPattern}(related:\`${this.entityType}\`)${filterWhereClause}
-      ${enrichmentClause.replace(/\(n\)/g, '(related)')}
-      WITH related AS n${additionalFields}
-      RETURN DISTINCT ${enrichmentReturn}
+      MATCH path = ${pathPattern}${filterWhereClause}
+      RETURN n.uuid as sourceUuid,
+             related,
+             type(rels[0]) as relationshipType,
+             length(path) as pathDepth
+      ORDER BY n.uuid, pathDepth
     `;
 
     const result = await this.client.run(cypher, params);
-    const relatedResults = this.parseResults(result.records);
 
-    // Preserve scores from original results
-    const originalScoreMap = new Map(
-      currentResults.map(r => [(r.entity as any).uuid, r.score])
-    );
+    // Group related entities by source UUID
+    const relatedBySource = new Map<string, any[]>();
+    for (const record of result.records) {
+      const sourceUuid = record.get('sourceUuid');
+      const relatedNode = record.get('related');
+      const relationshipType = record.get('relationshipType');
+      const pathDepth = record.get('pathDepth');
 
-    // Apply scores to related results
-    const scoredRelatedResults = relatedResults.map(r => ({
-      ...r,
-      score: originalScoreMap.get((r.entity as any).uuid) || r.score
-    }));
-
-    // UNION: Return current results + related results (deduplicated by uuid)
-    const resultMap = new Map<string, SearchResult<T>>();
-
-    // Add current results first (preserve original scores)
-    for (const r of currentResults) {
-      const uuid = (r.entity as any).uuid;
-      if (uuid) {
-        resultMap.set(uuid, r);
+      if (!relatedBySource.has(sourceUuid)) {
+        relatedBySource.set(sourceUuid, []);
       }
+
+      // Parse related entity properties
+      const relatedEntity: any = {};
+      const props = relatedNode.properties;
+      for (const key in props) {
+        relatedEntity[key] = props[key];
+      }
+
+      relatedBySource.get(sourceUuid)!.push({
+        entity: relatedEntity,
+        relationshipType,
+        depth: pathDepth
+      });
     }
 
-    // Add related results (don't override if already exists)
-    for (const r of scoredRelatedResults) {
-      const uuid = (r.entity as any).uuid;
-      if (uuid && !resultMap.has(uuid)) {
-        resultMap.set(uuid, r);
-      }
-    }
+    // Enrich current results with context.related
+    return currentResults.map(result => {
+      const uuid = (result.entity as any).uuid;
+      const related = relatedBySource.get(uuid) || [];
 
-    return Array.from(resultMap.values());
+      return {
+        ...result,
+        context: {
+          ...(result.context || {}),
+          related
+        }
+      };
+    });
   }
 
   /**
@@ -992,6 +1088,15 @@ export class QueryBuilder<T = any> {
     }
 
     const { userQuestion, llmProvider, options } = operation.config;
+
+    // Ensure entityContext is provided for LLM reranking
+    if (!this.entityContext) {
+      throw new Error(
+        `EntityContext is required for LLM reranking but was not provided. ` +
+        `Please provide an EntityContext when creating the QueryBuilder. ` +
+        `If using generated code, ensure you have regenerated with 'ragforge generate'.`
+      );
+    }
 
     // Create reranker with entity context
     const reranker = new LLMReranker(llmProvider, options, this.entityContext);
@@ -1135,6 +1240,15 @@ export class QueryBuilder<T = any> {
     }
 
     const { userQuestion, llmProvider, options } = operation.config;
+
+    // Ensure entityContext is provided for LLM reranking
+    if (!this.entityContext) {
+      throw new Error(
+        `EntityContext is required for LLM reranking but was not provided. ` +
+        `Please provide an EntityContext when creating the QueryBuilder. ` +
+        `If using generated code, ensure you have regenerated with 'ragforge generate'.`
+      );
+    }
 
     try {
       // Create reranker
@@ -1362,6 +1476,15 @@ export class QueryBuilder<T = any> {
 
     for (const [field, value] of Object.entries(this.filters)) {
       if (value === null || value === undefined) {
+        continue;
+      }
+
+      // Check if this is a regex pattern filter
+      if (field.endsWith('__pattern')) {
+        const actualFieldName = field.replace('__pattern', '');
+        const paramName = `${actualFieldName}_pattern`;
+        conditions.push(`n.${actualFieldName} =~ $${paramName}`);
+        params[paramName] = value as string;
         continue;
       }
 
@@ -1678,6 +1801,15 @@ export class QueryBuilder<T = any> {
     }
 
     const { userQuestion, llmProvider, options } = this.llmRerankConfig;
+
+    // Ensure entityContext is provided for LLM reranking
+    if (!this.entityContext) {
+      throw new Error(
+        `EntityContext is required for LLM reranking but was not provided. ` +
+        `Please provide an EntityContext when creating the QueryBuilder. ` +
+        `If using generated code, ensure you have regenerated with 'ragforge generate'.`
+      );
+    }
 
     try {
       // Create reranker with entity context

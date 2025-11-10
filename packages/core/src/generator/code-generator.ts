@@ -47,6 +47,9 @@ export interface GeneratedCode {
   index: string;                 // index.ts exports
   agent: string;                 // iterative agent wrapper
   configLoader: string;          // Generic config loader for scripts
+  entityContexts: string;        // EntityContext definitions for all entities
+  patterns: string;              // Common query patterns for better DX
+  quickstart: string;            // QUICKSTART.md guide for developers
   agentDocumentation: {
     markdown: string;            // Simplified markdown for agent prompt
     module: string;              // TypeScript module exporting agent documentation string
@@ -133,6 +136,15 @@ export class CodeGenerator {
     // Generate index exports
     const index = this.generateIndex(config);
 
+    // Generate entity contexts module
+    const entityContexts = this.generateEntityContextsModule(config, schema);
+
+    // Generate common patterns module
+    const patterns = this.generatePatternsModule(config, schema);
+
+    // Generate quickstart guide
+    const quickstart = this.generateQuickstart(config, schema);
+
     // Generate examples
     const { examples, exampleSummaries } = this.generateExamples(config, schema);
 
@@ -156,6 +168,9 @@ export class CodeGenerator {
       index,
       agent,
       configLoader,
+      entityContexts,
+      patterns,
+      quickstart,
       agentDocumentation: {
         markdown: agentMarkdown,
         module: agentModule
@@ -215,6 +230,10 @@ export class CodeGenerator {
     if (entity.relationships) {
       for (const rel of entity.relationships) {
         lines.push(...this.generateRelationshipMethod(rel));
+        // Generate inverse method if relationship is directional
+        if (rel.direction !== 'both') {
+          lines.push(...this.generateInverseRelationshipMethod(rel));
+        }
       }
     }
 
@@ -224,6 +243,51 @@ export class CodeGenerator {
         lines.push(...this.generateRerankMethod(strategy));
       }
     }
+
+    // Generate helper methods for better DX
+    lines.push(`  /**`);
+    lines.push(`   * Get the first result or undefined`);
+    lines.push(`   * @example`);
+    lines.push(`   * const result = await query.first();`);
+    lines.push(`   */`);
+    lines.push(`  async first(): Promise<import('@luciformresearch/ragforge-runtime').SearchResult<${entity.name}> | undefined> {`);
+    lines.push(`    const results = await this.limit(1).execute();`);
+    lines.push(`    return results[0];`);
+    lines.push(`  }`);
+    lines.push(``);
+
+    lines.push(`  /**`);
+    lines.push(`   * Extract a single field from all results`);
+    lines.push(`   * @example`);
+    lines.push(`   * const names = await query.pluck('${this.getDisplayNameField(entity)}');`);
+    lines.push(`   */`);
+    lines.push(`  async pluck<K extends keyof ${entity.name}>(field: K): Promise<${entity.name}[K][]> {`);
+    lines.push(`    const results = await this.execute();`);
+    lines.push(`    return results.map(r => r.entity[field]);`);
+    lines.push(`  }`);
+    lines.push(``);
+
+    lines.push(`  /**`);
+    lines.push(`   * Count the total number of results`);
+    lines.push(`   * @example`);
+    lines.push(`   * const total = await query.count();`);
+    lines.push(`   */`);
+    lines.push(`  async count(): Promise<number> {`);
+    lines.push(`    const results = await this.execute();`);
+    lines.push(`    return results.length;`);
+    lines.push(`  }`);
+    lines.push(``);
+
+    lines.push(`  /**`);
+    lines.push(`   * Show the generated Cypher query for debugging`);
+    lines.push(`   * @example`);
+    lines.push(`   * console.log(query.debug());`);
+    lines.push(`   */`);
+    lines.push(`  debug(): string {`);
+    lines.push(`    const built = this.buildCypher();`);
+    lines.push(`    return \`Cypher Query:\\n\${built.query}\\n\\nParameters:\\n\${JSON.stringify(built.params, null, 2)}\`;`);
+    lines.push(`  }`);
+    lines.push(``);
 
     lines.push(`}`);
 
@@ -366,7 +430,9 @@ export class CodeGenerator {
   private static generateFieldMethod(entityName: string, field: any): string[] {
     const lines: string[] = [];
     const methodName = `where${this.capitalize(field.name)}`;
+    const methodNameIn = `where${this.capitalize(field.name)}In`;
 
+    // Generate single value method
     lines.push(`  /**`);
     lines.push(`   * Filter by ${field.name}`);
     if (field.description) {
@@ -396,6 +462,28 @@ export class CodeGenerator {
     lines.push(`  }`);
     lines.push(``);
 
+    // Generate batch method (whereIn) - completely generic
+    lines.push(`  /**`);
+    lines.push(`   * Filter by ${field.name} matching any value in the array (batch query)`);
+    lines.push(`   * @example`);
+    lines.push(`   * .${methodNameIn}(['value1', 'value2', 'value3'])`);
+    lines.push(`   */`);
+
+    if (field.type === 'string') {
+      lines.push(`  ${methodNameIn}(values: string[]): this {`);
+    } else if (field.type === 'number') {
+      lines.push(`  ${methodNameIn}(values: number[]): this {`);
+    } else if (field.type === 'enum' && field.values) {
+      const enumType = field.values.map((v: string) => `'${v}'`).join(' | ');
+      lines.push(`  ${methodNameIn}(values: (${enumType})[]): this {`);
+    } else {
+      lines.push(`  ${methodNameIn}(values: any[]): this {`);
+    }
+
+    lines.push(`    return this.whereIn('${field.name}', values);`);
+    lines.push(`  }`);
+    lines.push(``);
+
     return lines;
   }
 
@@ -407,7 +495,7 @@ export class CodeGenerator {
     const methodName = this.camelCase(`with_${rel.type}`);
 
     lines.push(`  /**`);
-    lines.push(`   * Include related entities via ${rel.type}`);
+    lines.push(`   * Include related entities via ${rel.type} (${rel.direction})`);
     if (rel.description) {
       lines.push(`   * ${rel.description}`);
     }
@@ -422,6 +510,33 @@ export class CodeGenerator {
         lines.push(...this.generateRelationshipFilterMethod(rel, filter));
       }
     }
+
+    return lines;
+  }
+
+  /**
+   * Generate inverse relationship method (traversal in opposite direction)
+   * Completely generic - works for any relationship type
+   */
+  private static generateInverseRelationshipMethod(rel: any): string[] {
+    const lines: string[] = [];
+    const inverseMethodName = this.camelCase(`reversed_${rel.type}`);
+    const inverseDirection = rel.direction === 'outgoing' ? 'incoming' : 'outgoing';
+
+    lines.push(`  /**`);
+    lines.push(`   * Include related entities via ${rel.type} in reverse direction (${inverseDirection})`);
+    lines.push(`   * This traverses the relationship in the opposite direction from ${rel.direction}`);
+    if (rel.description) {
+      lines.push(`   * Inverse of: ${rel.description}`);
+    }
+    lines.push(`   * @example`);
+    lines.push(`   * // Find entities that have this relationship TO the current entity`);
+    lines.push(`   * .${inverseMethodName}(1)`);
+    lines.push(`   */`);
+    lines.push(`  ${inverseMethodName}(depth: number = 1): this {`);
+    lines.push(`    return this.expand('${rel.type}', { depth, direction: '${inverseDirection}' });`);
+    lines.push(`  }`);
+    lines.push(``);
 
     return lines;
   }
@@ -540,6 +655,11 @@ export class CodeGenerator {
 
     lines.push(``);
 
+    // Import entity contexts
+    const contextImports = config.entities.map(e => `${e.name.toUpperCase()}_CONTEXT`).join(', ');
+    lines.push(`import { ${contextImports} } from './entity-contexts.js';`);
+    lines.push(``);
+
     // Class declaration
     lines.push(`/**`);
     lines.push(` * ${config.name} RAG Client`);
@@ -561,9 +681,10 @@ export class CodeGenerator {
         lines.push(``);
       }
 
-      const entityContext = this.generateEntityContext(entity, schema);
-      lines.push(`  // Entity context for LLM reranker (generated from YAML config)`);
-      lines.push(`  private ${this.camelCase(entity.name)}EntityContext = ${entityContext};`);
+      // Import EntityContext from generated entity-contexts.ts instead of defining inline
+      const constantName = `${entity.name.toUpperCase()}_CONTEXT`;
+      lines.push(`  // Entity context for LLM reranker (imported from entity-contexts.ts)`);
+      lines.push(`  private ${this.camelCase(entity.name)}EntityContext = ${constantName};`);
       lines.push(``);
     }
 
@@ -729,9 +850,347 @@ export class CodeGenerator {
     lines.push(`export * from './types.js';`);
     lines.push(``);
 
+    // Export entity contexts
+    lines.push(`export * from './entity-contexts.js';`);
+    lines.push(``);
+
     // Export docs + agent
     lines.push(`export { CLIENT_DOCUMENTATION } from './documentation.js';`);
     lines.push(`export { createIterativeAgent, type GeneratedAgentConfig } from './agent.js';`);
+
+    return lines.join('\n');
+  }
+
+  /**
+   * Generate entity-contexts.ts module with EntityContext for all entities
+   * This replaces the hard-coded DEFAULT_SCOPE_CONTEXT fallback
+   */
+  private static generateEntityContextsModule(config: RagForgeConfig, schema: GraphSchema): string {
+    const lines: string[] = [];
+
+    lines.push(`/**`);
+    lines.push(` * Entity Contexts - Generated from RagForge config`);
+    lines.push(` * `);
+    lines.push(` * These EntityContext objects define how entities are presented to LLM rerankers.`);
+    lines.push(` * They are automatically generated from your ragforge.config.yaml.`);
+    lines.push(` * `);
+    lines.push(` * DO NOT EDIT - regenerate with: ragforge generate`);
+    lines.push(` */`);
+    lines.push(``);
+
+    // Import EntityContext type
+    lines.push(`import type { EntityContext } from '@luciformresearch/ragforge-runtime';`);
+    lines.push(``);
+
+    // Generate a constant for each entity
+    for (const entity of config.entities) {
+      const entityContext = this.generateEntityContext(entity, schema);
+      const constantName = `${entity.name.toUpperCase()}_CONTEXT`;
+
+      lines.push(`/**`);
+      lines.push(` * EntityContext for ${entity.name} entities`);
+      if (entity.description) {
+        lines.push(` * ${entity.description}`);
+      }
+      lines.push(` */`);
+      lines.push(`export const ${constantName}: EntityContext = ${entityContext};`);
+      lines.push(``);
+    }
+
+    // Export a map for easy lookup by entity type
+    lines.push(`/**`);
+    lines.push(` * Map of entity type to EntityContext`);
+    lines.push(` */`);
+    lines.push(`export const ENTITY_CONTEXTS: Record<string, EntityContext> = {`);
+    for (const entity of config.entities) {
+      const constantName = `${entity.name.toUpperCase()}_CONTEXT`;
+      lines.push(`  '${entity.name}': ${constantName},`);
+    }
+    lines.push(`};`);
+    lines.push(``);
+
+    // Export a helper to get context by entity type
+    lines.push(`/**`);
+    lines.push(` * Get EntityContext for a given entity type`);
+    lines.push(` * @throws Error if entity type is not found`);
+    lines.push(` */`);
+    lines.push(`export function getEntityContext(entityType: string): EntityContext {`);
+    lines.push(`  const context = ENTITY_CONTEXTS[entityType];`);
+    lines.push(`  if (!context) {`);
+    lines.push(`    throw new Error(\`No EntityContext found for entity type: \${entityType}. Available types: \${Object.keys(ENTITY_CONTEXTS).join(', ')}\`);`);
+    lines.push(`  }`);
+    lines.push(`  return context;`);
+    lines.push(`}`);
+
+    return lines.join('\n');
+  }
+
+  /**
+   * Generate patterns.ts module with common query patterns for better DX
+   * Completely generic - based only on config, not code-specific
+   */
+  private static generatePatternsModule(config: RagForgeConfig, schema: GraphSchema): string {
+    const lines: string[] = [];
+
+    lines.push(`/**`);
+    lines.push(` * Common Query Patterns - Generated from RagForge config`);
+    lines.push(` * `);
+    lines.push(` * Pre-built query patterns for common use cases to improve developer experience.`);
+    lines.push(` * These patterns provide a more intuitive API and reduce the learning curve.`);
+    lines.push(` * `);
+    lines.push(` * DO NOT EDIT - regenerate with: ragforge generate`);
+    lines.push(` */`);
+    lines.push(``);
+
+    // Import the client type (always RagClient)
+    const clientTypeName = 'RagClient';
+    lines.push(`import type { ${clientTypeName} } from './client.js';`);
+    lines.push(``);
+
+    // Generate patterns object with methods for each entity
+    lines.push(`/**`);
+    lines.push(` * Create common query patterns for easier discovery and use`);
+    lines.push(` */`);
+    lines.push(`export function createCommonPatterns(client: ${clientTypeName}) {`);
+    lines.push(`  return {`);
+
+    // For each entity, generate common patterns
+    for (const entity of config.entities) {
+      const entityMethodName = entity.name.charAt(0).toLowerCase() + entity.name.slice(1);
+      const queryField = this.getQueryField(entity);
+
+      lines.push(``);
+      lines.push(`    // ========== ${entity.name} Patterns ==========`);
+      lines.push(``);
+
+      // Pattern 1: Find by query field prefix
+      lines.push(`    /**`);
+      lines.push(`     * Find ${entity.name} entities where ${queryField} starts with a prefix`);
+      lines.push(`     * @example`);
+      lines.push(`     * const results = await patterns.find${entity.name}ByPrefix('example').execute();`);
+      lines.push(`     */`);
+      lines.push(`    find${entity.name}ByPrefix(prefix: string) {`);
+      lines.push(`      return client.${entityMethodName}().whereName({ startsWith: prefix });`);
+      lines.push(`    },`);
+      lines.push(``);
+
+      // Pattern 2: Find by query field containing
+      lines.push(`    /**`);
+      lines.push(`     * Find ${entity.name} entities where ${queryField} contains text`);
+      lines.push(`     * @example`);
+      lines.push(`     * const results = await patterns.find${entity.name}ByContaining('builder').execute();`);
+      lines.push(`     */`);
+      lines.push(`    find${entity.name}ByContaining(text: string) {`);
+      lines.push(`      return client.${entityMethodName}().whereName({ contains: text });`);
+      lines.push(`    },`);
+      lines.push(``);
+
+      // Pattern 3: Find by exact query field value
+      lines.push(`    /**`);
+      lines.push(`     * Find ${entity.name} by exact ${queryField}`);
+      lines.push(`     * @example`);
+      lines.push(`     * const result = await patterns.find${entity.name}ByExact('MyEntity').first();`);
+      lines.push(`     */`);
+      lines.push(`    find${entity.name}ByExact(value: string) {`);
+      lines.push(`      return client.${entityMethodName}().whereName(value);`);
+      lines.push(`    },`);
+
+      // Pattern 4: For each searchable_field in config, generate a search pattern
+      for (const field of entity.searchable_fields) {
+        const fieldMethodName = field.name.charAt(0).toUpperCase() + field.name.slice(1);
+        const whereMethod = `where${fieldMethodName}`;
+
+        lines.push(``);
+        lines.push(`    /**`);
+        lines.push(`     * Find ${entity.name} entities where ${field.name} contains text`);
+        lines.push(`     * @example`);
+        lines.push(`     * const results = await patterns.find${entity.name}By${fieldMethodName}('text').execute();`);
+        lines.push(`     */`);
+        lines.push(`    find${entity.name}By${fieldMethodName}(text: string) {`);
+        lines.push(`      return client.${entityMethodName}().${whereMethod}({ contains: text });`);
+        lines.push(`    },`);
+      }
+
+      // Pattern 5: Find with specific relationship expanded (based on config relationships)
+      if (entity.relationships && entity.relationships.length > 0) {
+        for (const rel of entity.relationships.slice(0, 3)) { // Limit to first 3 relationships
+          const relType = rel.type;
+          lines.push(``);
+          lines.push(`    /**`);
+          lines.push(`     * Find ${entity.name} entities with ${relType} relationship expanded`);
+          lines.push(`     * @example`);
+          lines.push(`     * const results = await patterns.find${entity.name}With${relType}(2).execute();`);
+          lines.push(`     */`);
+          lines.push(`    find${entity.name}With${relType}(depth: number = 1) {`);
+          lines.push(`      return client.${entityMethodName}().with${relType}(depth);`);
+          lines.push(`    },`);
+        }
+      }
+    }
+
+    // Close the patterns object
+    lines.push(`  };`);
+    lines.push(`}`);
+
+    return lines.join('\n');
+  }
+
+  /**
+   * Generate QUICKSTART.md guide for developers
+   */
+  private static generateQuickstart(config: RagForgeConfig, schema: GraphSchema): string {
+    const lines: string[] = [];
+    const clientVarName = config.name.toLowerCase();
+    const entityExample = config.entities[0]; // Use first entity as example
+    const entityMethodName = entityExample.name.charAt(0).toLowerCase() + entityExample.name.slice(1);
+    const queryField = this.getQueryField(entityExample);
+    const displayNameField = this.getDisplayNameField(entityExample);
+
+    lines.push(`# ${config.name} RAG Client - Quick Start Guide`);
+    lines.push('');
+    lines.push(`> Get started with the ${config.name} RAG framework in under 2 minutes`);
+    lines.push('');
+    lines.push('---');
+    lines.push('');
+    lines.push('## 📦 Installation');
+    lines.push('');
+    lines.push('```bash');
+    lines.push('npm install');
+    lines.push('```');
+    lines.push('');
+    lines.push('## 🚀 Basic Usage');
+    lines.push('');
+    lines.push('### 1. Create a client');
+    lines.push('');
+    lines.push('```typescript');
+    lines.push(`import { createRagClient } from './client.js';`);
+    lines.push('');
+    lines.push(`const ${clientVarName} = createRagClient();`);
+    lines.push('```');
+    lines.push('');
+    lines.push('### 2. Query entities');
+    lines.push('');
+    lines.push('```typescript');
+    lines.push(`// Find ${entityExample.name} by exact ${queryField}`);
+    lines.push(`const result = await ${clientVarName}.${entityMethodName}()`);
+    lines.push(`  .whereName('example')`);
+    lines.push(`  .first();`);
+    lines.push('');
+    lines.push(`console.log(result?.entity.${displayNameField});`);
+    lines.push('```');
+    lines.push('');
+    lines.push('### 3. Use helper methods');
+    lines.push('');
+    lines.push('```typescript');
+    lines.push(`// Get first result`);
+    lines.push(`const first = await ${clientVarName}.${entityMethodName}().whereName('example').first();`);
+    lines.push('');
+    lines.push(`// Extract single field`);
+    lines.push(`const names = await ${clientVarName}.${entityMethodName}().limit(10).pluck('${displayNameField}');`);
+    lines.push('');
+    lines.push(`// Count results`);
+    lines.push(`const total = await ${clientVarName}.${entityMethodName}().count();`);
+    lines.push('```');
+    lines.push('');
+    lines.push('---');
+    lines.push('');
+    lines.push('## 🎯 Common Patterns');
+    lines.push('');
+    lines.push('Use the patterns module for common queries:');
+    lines.push('');
+    lines.push('```typescript');
+    lines.push(`import { createCommonPatterns } from './patterns.js';`);
+    lines.push('');
+    lines.push(`const patterns = createCommonPatterns(${clientVarName});`);
+    lines.push('');
+    lines.push(`// Find by prefix`);
+    lines.push(`const results = await patterns.find${entityExample.name}ByPrefix('example').execute();`);
+    lines.push('');
+    lines.push(`// Find by containing`);
+    lines.push(`const results2 = await patterns.find${entityExample.name}ByContaining('text').execute();`);
+    lines.push('```');
+    lines.push('');
+    lines.push('---');
+    lines.push('');
+    lines.push('## 📋 Available Entities');
+    lines.push('');
+
+    for (const entity of config.entities) {
+      const methodName = entity.name.charAt(0).toLowerCase() + entity.name.slice(1);
+      lines.push(`### ${entity.name}`);
+      if (entity.description) {
+        lines.push(`> ${entity.description}`);
+      }
+      lines.push('');
+      lines.push('```typescript');
+      lines.push(`${clientVarName}.${methodName}()`);
+      lines.push(`  .whereName('value')`);
+      lines.push(`  .execute();`);
+      lines.push('```');
+      lines.push('');
+
+      // Show available filters
+      if (entity.searchable_fields.length > 0) {
+        lines.push('**Available filters:**');
+        for (const field of entity.searchable_fields) {
+          const methodName = `where${field.name.charAt(0).toUpperCase() + field.name.slice(1)}`;
+          lines.push(`- \`.${methodName}({ contains: 'text' })\` - Filter by ${field.name}`);
+        }
+        lines.push('');
+      }
+
+      // Show available relationships
+      if (entity.relationships && entity.relationships.length > 0) {
+        lines.push('**Available relationships:**');
+        for (const rel of entity.relationships) {
+          const methodName = `with${rel.type}`;
+          lines.push(`- \`.${methodName}(depth)\` - Expand ${rel.type} relationship`);
+        }
+        lines.push('');
+      }
+    }
+
+    lines.push('---');
+    lines.push('');
+    lines.push('## 🔍 Query Methods');
+    lines.push('');
+    lines.push('All query builders support these methods:');
+    lines.push('');
+    lines.push('### Filtering');
+    lines.push('- `.where(filter)` - Filter by field values');
+    lines.push('- `.whereName(value)` - Filter by name (exact or pattern)');
+    lines.push('- `.limit(n)` - Limit results');
+    lines.push('- `.offset(n)` - Skip results');
+    lines.push('');
+    lines.push('### Execution');
+    lines.push('- `.execute()` - Get all results');
+    lines.push('- `.first()` - Get first result or undefined');
+    lines.push('- `.count()` - Count total results');
+    lines.push('- `.pluck(field)` - Extract single field from all results');
+    lines.push('');
+    lines.push('### Debugging');
+    lines.push('- `.debug()` - Show generated Cypher query');
+    lines.push('');
+    lines.push('---');
+    lines.push('');
+    lines.push('## 📚 More Examples');
+    lines.push('');
+    lines.push('Check out the `examples/` directory for more detailed examples:');
+    lines.push('');
+    lines.push('```bash');
+    lines.push('npm run examples:01-basic-query');
+    lines.push('npm run examples:02-filters');
+    lines.push('npm run examples:03-relationships');
+    lines.push('```');
+    lines.push('');
+    lines.push('---');
+    lines.push('');
+    lines.push('## 🔗 Next Steps');
+    lines.push('');
+    lines.push('- Read the [Client Reference](./docs/client-reference.md) for complete API documentation');
+    lines.push('- Explore [Common Patterns](./patterns.ts) for reusable queries');
+    lines.push('- Check [Agent Reference](./docs/agent-reference.md) for LLM agent integration');
+    lines.push('');
 
     return lines.join('\n');
   }
@@ -1551,7 +2010,16 @@ export class CodeGenerator {
   private static generateEntityContext(entity: EntityConfig, schema: GraphSchema): string {
     const fields: string[] = [];
     const seen = new Set<string>();
-    const addField = (name?: string, opts: { required?: boolean; label?: string; maxLength?: number; maxItems?: number } = {}) => {
+
+    // Build a map of field names to their summarization config
+    const summarizationMap = new Map<string, any>();
+    for (const searchableField of entity.searchable_fields || []) {
+      if (searchableField.summarization?.enabled) {
+        summarizationMap.set(searchableField.name, searchableField.summarization);
+      }
+    }
+
+    const addField = (name?: string, opts: { required?: boolean; label?: string; maxLength?: number; maxItems?: number; preferSummary?: boolean } = {}) => {
       if (!name) return;
       if (seen.has(name)) return;
       seen.add(name);
@@ -1561,7 +2029,18 @@ export class CodeGenerator {
       if (label) {
         parts.push(`label: '${label}'`);
       }
-      if (opts.maxLength) parts.push(`maxLength: ${opts.maxLength}`);
+
+      // Check if this field has summarization configured
+      const hasSummarization = summarizationMap.has(name);
+      const preferSummary = opts.preferSummary !== undefined ? opts.preferSummary : hasSummarization;
+
+      if (preferSummary) {
+        parts.push('preferSummary: true');
+      } else {
+        // Only add maxLength if NOT using summary (summaries don't need truncation)
+        if (opts.maxLength) parts.push(`maxLength: ${opts.maxLength}`);
+      }
+
       if (opts.maxItems) parts.push(`maxItems: ${opts.maxItems}`);
       fields.push(`{ ${parts.join(', ')} }`);
     };
@@ -1569,7 +2048,13 @@ export class CodeGenerator {
     const displayField = this.getDisplayNameField(entity);
     addField(displayField, { required: true, maxLength: this.getDefaultFieldLength(displayField) });
 
-    if (entity.unique_field && entity.unique_field !== displayField) {
+    // Don't add unique_field to LLM context if it's a UUID/ID (not useful for semantic reranking)
+    const isUuidField = entity.unique_field && (
+      entity.unique_field.toLowerCase().includes('uuid') ||
+      entity.unique_field.toLowerCase().includes('id')
+    );
+
+    if (entity.unique_field && entity.unique_field !== displayField && !isUuidField) {
       addField(entity.unique_field, { required: fields.length < 2, maxLength: this.getDefaultFieldLength(entity.unique_field) });
     }
 

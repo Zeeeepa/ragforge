@@ -42,6 +42,14 @@ export async function writeFileIfChanged(filePath: string, content: string): Pro
   await fs.writeFile(filePath, content, 'utf-8');
 }
 
+function logGenerated(file: string) {
+  console.log(`  ✓ ${file}`);
+}
+
+function logSkipped(file: string, reason: string) {
+  console.log(`  ⚠️  Skipped ${file} (${reason})`);
+}
+
 export async function persistGeneratedArtifacts(
   outDir: string,
   generated: GeneratedCode,
@@ -50,6 +58,8 @@ export async function persistGeneratedArtifacts(
   projectName: string,
   dev: boolean = false
 ): Promise<void> {
+  console.log('\n📦 Generating project artifacts...\n');
+
   const queriesDir = path.join(outDir, 'queries');
   await fs.mkdir(queriesDir, { recursive: true });
 
@@ -57,23 +67,48 @@ export async function persistGeneratedArtifacts(
   await fs.mkdir(mutationsDir, { recursive: true });
 
   await writeFileIfChanged(path.join(outDir, 'client.ts'), generated.client);
+  logGenerated('client.ts');
+
   await writeFileIfChanged(path.join(outDir, 'index.ts'), generated.index);
+  logGenerated('index.ts');
+
   await writeFileIfChanged(path.join(outDir, 'types.ts'), typesContent);
+  logGenerated('types.ts');
+
   await writeFileIfChanged(path.join(outDir, 'agent.ts'), generated.agent);
+  logGenerated('agent.ts');
+
   await writeFileIfChanged(path.join(outDir, 'documentation.ts'), generated.agentDocumentation.module);
+  logGenerated('documentation.ts');
+
   await writeFileIfChanged(path.join(outDir, 'load-config.ts'), generated.configLoader);
+  logGenerated('load-config.ts');
+
+  await writeFileIfChanged(path.join(outDir, 'entity-contexts.ts'), generated.entityContexts);
+  logGenerated('entity-contexts.ts');
+
+  await writeFileIfChanged(path.join(outDir, 'patterns.ts'), generated.patterns);
+  logGenerated('patterns.ts');
+
+  await writeFileIfChanged(path.join(outDir, 'QUICKSTART.md'), generated.quickstart);
+  logGenerated('QUICKSTART.md');
 
   const docsDir = path.join(outDir, 'docs');
   await fs.mkdir(docsDir, { recursive: true });
   await writeFileIfChanged(path.join(docsDir, 'agent-reference.md'), generated.agentDocumentation.markdown);
+  logGenerated('docs/agent-reference.md');
+
   await writeFileIfChanged(path.join(docsDir, 'client-reference.md'), generated.developerDocumentation.markdown);
+  logGenerated('docs/client-reference.md');
 
   for (const [entity, code] of generated.queries.entries()) {
     await writeFileIfChanged(path.join(queriesDir, `${entity}.ts`), code);
+    logGenerated(`queries/${entity}.ts`);
   }
 
   for (const [entity, code] of generated.mutations.entries()) {
     await writeFileIfChanged(path.join(mutationsDir, `${entity}.ts`), code);
+    logGenerated(`mutations/${entity}.ts`);
   }
 
   // Create scripts directory (always needed for rebuild-agent script)
@@ -86,6 +121,7 @@ export async function persistGeneratedArtifacts(
 
     const loaderPath = path.join(embeddingsDir, 'load-config.ts');
     await writeFileIfChanged(loaderPath, generated.embeddings.loader);
+    logGenerated('embeddings/load-config.ts');
 
     // Clean up legacy files
     const legacyFiles = [
@@ -103,7 +139,10 @@ export async function persistGeneratedArtifacts(
       }
     }
     await writeFileIfChanged(path.join(scriptsDir, 'create-vector-indexes.ts'), generated.embeddings.createIndexesScript);
+    logGenerated('scripts/create-vector-indexes.ts');
+
     await writeFileIfChanged(path.join(scriptsDir, 'generate-embeddings.ts'), generated.embeddings.generateEmbeddingsScript);
+    logGenerated('scripts/generate-embeddings.ts');
 
     const legacyScriptFiles = [
       path.join(scriptsDir, 'create-vector-indexes.js'),
@@ -119,6 +158,9 @@ export async function persistGeneratedArtifacts(
         }
       }
     }
+  } else {
+    logSkipped('embeddings scripts', 'no embeddings config found');
+    console.log('    ℹ️  Add "embeddings:" section to ragforge.config.yaml to enable vector search');
   }
 
   // Write summarization artifacts (prompts + script)
@@ -129,6 +171,7 @@ export async function persistGeneratedArtifacts(
     // Write custom prompt templates
     for (const [filename, content] of generated.summarization.prompts.entries()) {
       await writeFileIfChanged(path.join(promptsDir, filename), content);
+      logGenerated(`prompts/${filename}`);
     }
 
     // Write generate-summaries script
@@ -136,10 +179,15 @@ export async function persistGeneratedArtifacts(
       path.join(scriptsDir, 'generate-summaries.ts'),
       generated.summarization.generateSummariesScript
     );
+    logGenerated('scripts/generate-summaries.ts');
+  } else {
+    logSkipped('summarization scripts', 'no summarization config found');
+    console.log('    ℹ️  Add "summarization:" config to entity fields to enable field summarization');
   }
 
   // Write rebuild-agent script
   await writeFileIfChanged(path.join(scriptsDir, 'rebuild-agent.ts'), generated.rebuildAgentScript);
+  logGenerated('scripts/rebuild-agent.ts');
 
   // In dev mode, use file: dependency instead of copying runtime
   // No longer copy runtime package, just use file: in package.json
@@ -280,10 +328,36 @@ async function writeGeneratedPackageJson(
 
   // Calculate relative path to runtime package when in dev mode
   let runtimeDependency = '^0.1.2';
+  let codeparsersDependency = 'file:../../packages/codeparsers';
+
   if (dev && rootDir) {
-    const runtimePath = path.join(rootDir, 'packages/runtime');
+    // Find the monorepo root by looking for packages/runtime
+    let monorepoRoot = rootDir;
+    const candidates = [
+      path.join(rootDir, 'packages/runtime'),           // Already at monorepo root
+      path.join(rootDir, '../packages/runtime'),        // One level up
+      path.join(rootDir, '../../packages/runtime'),     // Two levels up
+      path.join(rootDir, '../ragforge/packages/runtime') // Sibling ragforge folder
+    ];
+
+    for (const candidate of candidates) {
+      try {
+        await fs.access(candidate);
+        monorepoRoot = path.dirname(path.dirname(candidate)); // Go up to monorepo root
+        break;
+      } catch {
+        continue;
+      }
+    }
+
+    const runtimePath = path.join(monorepoRoot, 'packages/runtime');
     const relativePath = path.relative(outDir, runtimePath);
     runtimeDependency = `file:${relativePath}`;
+
+    // Also calculate codeparsers path
+    const codeparsersPath = path.join(monorepoRoot, '../packages/codeparsers');
+    const codeparsersRelativePath = path.relative(outDir, codeparsersPath);
+    codeparsersDependency = `file:${codeparsersRelativePath}`;
   }
 
   const pkg: any = {
@@ -303,7 +377,7 @@ async function writeGeneratedPackageJson(
   // Only add devDependencies in development mode
   if (dev) {
     pkg.devDependencies = {
-      '@luciformresearch/codeparsers': 'file:../../packages/codeparsers'
+      '@luciformresearch/codeparsers': codeparsersDependency
     };
   }
 
@@ -406,6 +480,7 @@ async function writeExampleScripts(outDir: string, generated: GeneratedCode, pro
   // Write generated examples from YAML
   for (const [filename, code] of generated.examples.entries()) {
     await writeFileIfChanged(path.join(examplesDir, `${filename}.ts`), code);
+    logGenerated(`examples/${filename}.ts`);
   }
 }
 

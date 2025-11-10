@@ -40,10 +40,6 @@ entities:
         provider: gemini
         model: text-embedding-004
     searchable_fields:
-      - name: name
-        type: string
-      - name: file
-        type: string
       - name: source
         type: string
         summarization:
@@ -135,6 +131,50 @@ entities:
             description: Filter scopes that inherit from the provided scope
             parameter: scopeName
             direction: outgoing
+  - name: File
+    unique_field: name
+    searchable_fields:
+      - name: name
+        type: string
+    relationships:
+      - type: DEFINED_IN
+        direction: incoming
+        target: Scope
+        description: Scope DEFINED_IN File
+      - type: IN_DIRECTORY
+        direction: outgoing
+        target: Directory
+        description: File IN_DIRECTORY Directory
+  - name: ExternalLibrary
+    unique_field: name
+    searchable_fields:
+      - name: name
+        type: string
+    relationships:
+      - type: USES_LIBRARY
+        direction: incoming
+        target: Scope
+        description: Scope USES_LIBRARY ExternalLibrary
+  - name: Directory
+    unique_field: path
+    searchable_fields:
+      - name: path
+        type: string
+    relationships:
+      - type: IN_DIRECTORY
+        direction: incoming
+        target: File
+        description: File IN_DIRECTORY Directory
+  - name: Project
+    unique_field: name
+    searchable_fields:
+      - name: name
+        type: string
+    relationships:
+      - type: BELONGS_TO
+        direction: incoming
+        target: Scope
+        description: Scope BELONGS_TO Project
 
 # Embedding configuration for semantic search
 embeddings:

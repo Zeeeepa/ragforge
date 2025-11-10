@@ -15,7 +15,6 @@ import { LuciformXMLParser } from '@luciformresearch/xmlparser';
 import type { LLMProvider } from './llm-provider.js';
 import type { SearchResult } from '../types/index.js';
 import type { EntityContext, EntityField } from '../types/entity-context.js';
-import { DEFAULT_SCOPE_CONTEXT } from '../types/entity-context.js';
 
 export interface LLMRerankOptions {
   /**
@@ -123,7 +122,9 @@ export interface RerankInput {
 export class LLMReranker {
   private static defaultProvider?: LLMProvider;
   private entityContext: EntityContext;
-  private static readonly DEFAULT_FIELD_MAX = 400;
+  // Increased from 400 to allow full code scopes in reranking prompts
+  // With modern LLMs (8k+ context), we can afford to send more context per item
+  private static readonly DEFAULT_FIELD_MAX = 2500;
   private static readonly DEFAULT_HEADER_MAX = 120;
   private static readonly DEFAULT_ARRAY_ITEMS = 5;
 
@@ -161,10 +162,9 @@ export class LLMReranker {
   constructor(
     private llmProvider: LLMProvider,
     private options: LLMRerankOptions = {},
-    entityContext?: EntityContext
+    entityContext: EntityContext
   ) {
-    // Default to Scope context for backward compatibility
-    this.entityContext = entityContext || DEFAULT_SCOPE_CONTEXT;
+    this.entityContext = entityContext;
   }
 
   /**
@@ -376,7 +376,8 @@ ${this.entityContext.displayName} to evaluate:
       // Render optional fields
       const optionalFields = this.entityContext.fields.filter(f => !f.required);
       optionalFields.forEach(field => {
-        const value = (entity as any)[field.name];
+        // Use getFieldValue to prefer summary if configured
+        const value = this.getFieldValue(entity, field);
         if (!value || this.shouldSkipField(field.name, value)) {
           return;
         }
@@ -448,6 +449,48 @@ Include query feedback in the same XML:
     return prompt;
   }
 
+  /**
+   * Get the appropriate field value, preferring summary if configured
+   */
+  private getFieldValue(entity: any, field: EntityField): unknown {
+    // If preferSummary is enabled, try to reconstruct summary from individual fields
+    if (field.preferSummary) {
+      const prefix = `${field.name}_summary_`;
+      const summaryFields = Object.keys(entity).filter(k => k.startsWith(prefix));
+
+      if (summaryFields.length > 0) {
+        // Reconstruct summary object from individual fields
+        const summary: any = {};
+
+        for (const key of summaryFields) {
+          const fieldName = key.substring(prefix.length);
+
+          // Skip metadata fields
+          if (fieldName === 'hash' || fieldName.endsWith('_at')) {
+            continue;
+          }
+
+          const value = entity[key];
+
+          // Parse comma-separated arrays back to arrays
+          if (typeof value === 'string' && value.includes(',')) {
+            summary[fieldName] = value.split(',').map(s => s.trim());
+          } else {
+            summary[fieldName] = value;
+          }
+        }
+
+        // Only use summary if it has actual content
+        if (Object.keys(summary).length > 0) {
+          return summary;
+        }
+      }
+    }
+
+    // Fall back to original field
+    return entity[field.name];
+  }
+
   private shouldSkipField(fieldName: string, value: unknown): boolean {
     const lower = fieldName.toLowerCase();
     if (lower.includes('embedding') || lower.includes('vector')) {
@@ -472,12 +515,49 @@ Include query feedback in the same XML:
     return value.slice(0, limit - 1) + '…';
   }
 
+  /**
+   * Format structured summary objects (with purpose, operation, dependency, etc.)
+   */
+  private formatStructuredSummary(summary: any): string {
+    const parts: string[] = [];
+
+    if (summary.purpose) {
+      parts.push(`Purpose: ${summary.purpose}`);
+    }
+
+    if (summary.operation && Array.isArray(summary.operation) && summary.operation.length > 0) {
+      parts.push(`Operations: ${summary.operation.join('; ')}`);
+    }
+
+    if (summary.dependency && Array.isArray(summary.dependency) && summary.dependency.length > 0) {
+      parts.push(`Dependencies: ${summary.dependency.join(', ')}`);
+    }
+
+    if (summary.concept && Array.isArray(summary.concept) && summary.concept.length > 0) {
+      parts.push(`Concepts: ${summary.concept.join(', ')}`);
+    }
+
+    if (summary.complexity) {
+      parts.push(`Complexity: ${summary.complexity}`);
+    }
+
+    if (summary.suggestion && Array.isArray(summary.suggestion) && summary.suggestion.length > 0) {
+      parts.push(`Suggestions: ${summary.suggestion.join('; ')}`);
+    }
+
+    return parts.join('\n');
+  }
+
   private formatValue(value: unknown, field: EntityField, fallbackMax: number = LLMReranker.DEFAULT_FIELD_MAX): string | null {
     if (typeof value === 'string') {
       return this.truncate(value, field.maxLength ?? fallbackMax);
     }
     if (typeof value === 'number' || typeof value === 'boolean') {
       return String(value);
+    }
+    // Handle structured summaries (JSON objects with purpose, operation, etc.)
+    if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+      return this.formatStructuredSummary(value);
     }
     return null;
   }

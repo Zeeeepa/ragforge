@@ -13,7 +13,7 @@ import type { LLMRerankOptions } from '../reranking/llm-reranker.js';
  * Base operation interface
  */
 export interface Operation {
-  type: 'fetch' | 'expand' | 'semantic' | 'llmRerank' | 'filter';
+  type: 'fetch' | 'expand' | 'semantic' | 'llmRerank' | 'filter' | 'clientFilter';
   config: any;
 }
 
@@ -91,6 +91,16 @@ export interface FilterOperation extends Operation {
 }
 
 /**
+ * CLIENT_FILTER: Client-side filtering using JavaScript predicate function
+ */
+export interface ClientFilterOperation extends Operation {
+  type: 'clientFilter';
+  config: {
+    predicate: (result: SearchResult) => boolean;
+  };
+}
+
+/**
  * Union type of all operations
  */
 export type PipelineOperation =
@@ -98,7 +108,8 @@ export type PipelineOperation =
   | ExpandOperation
   | SemanticOperation
   | LLMRerankOperation
-  | FilterOperation;
+  | FilterOperation
+  | ClientFilterOperation;
 
 /**
  * Operation execution context

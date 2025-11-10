@@ -277,24 +277,30 @@ export class GenericSummarizer {
 
       console.log(`  Strategy ${strategyId}: ${strategyItems.length} items → ${packs.length} prompts`);
 
-      // Process each pack
-      for (const pack of packs) {
-        const prompt = this.buildMultiItemPrompt(pack, strategy);
-        const response = await this.llmProvider.generateContent(prompt);
-        const summaries = await this.parseMultiItemResponse(response, pack, strategy);
+      // Process all packs in parallel for better throughput
+      const packResults = await Promise.all(
+        packs.map(async (pack) => {
+          const prompt = this.buildMultiItemPrompt(pack, strategy);
+          const response = await this.llmProvider.generateContent(prompt);
+          const summaries = await this.parseMultiItemResponse(response, pack, strategy);
 
-        // Validate summaries - warn about empty results and log raw response
-        const emptyCount = summaries.filter(s => !s || Object.keys(s).length === 0).length;
-        if (emptyCount > 0) {
-          console.warn(`    ⚠️  Warning: ${emptyCount}/${summaries.length} summaries were empty`);
-          console.warn(`       This may indicate max_tokens is too low or batch size too large`);
-          console.warn(`       Consider increasing max_tokens in config or reducing batch size`);
+          // Validate summaries - warn about empty results and log raw response
+          const emptyCount = summaries.filter(s => !s || Object.keys(s).length === 0).length;
+          if (emptyCount > 0) {
+            console.warn(`    ⚠️  Warning: ${emptyCount}/${summaries.length} summaries were empty`);
+            console.warn(`       This may indicate max_tokens is too low or batch size too large`);
+            console.warn(`       Consider increasing max_tokens in config or reducing batch size`);
 
-          // Log first 500 chars of raw response for debugging
-          console.warn(`       Raw response preview: ${response.substring(0, 500)}...`);
-        }
+            // Log first 500 chars of raw response for debugging
+            console.warn(`       Raw response preview: ${response.substring(0, 500)}...`);
+          }
 
-        // Add to results
+          return { pack, summaries };
+        })
+      );
+
+      // Collect results from all packs
+      for (const { pack, summaries } of packResults) {
         pack.forEach((item, i) => {
           allResults.push({
             index: item.originalIndex,

@@ -33,6 +33,14 @@ export interface EntityField {
    * Always show this field (included in entity header)
    */
   required?: boolean;
+
+  /**
+   * Prefer using summary field if available (e.g., use "source_summary" instead of "source")
+   * When true, the reranker will look for a field named "{name}_summary" and use it if present.
+   * Falls back to the original field if summary doesn't exist.
+   * This is useful for large fields that have been summarized for better LLM context.
+   */
+  preferSummary?: boolean;
 }
 
 /**
@@ -107,23 +115,3 @@ export interface EntityContext {
    */
   enrichments: EnrichmentField[];
 }
-
-/**
- * Default EntityContext for Scope entities (code analysis)
- * Used for backward compatibility when no context is provided.
- */
-export const DEFAULT_SCOPE_CONTEXT: EntityContext = {
-  type: 'Scope',
-  displayName: 'code scopes',
-  uniqueField: 'uuid',  // For backward compatibility with existing code analysis
-  fields: [
-    { name: 'name', required: true },
-    { name: 'type', required: true },
-    { name: 'file', required: true },
-    { name: 'signature', maxLength: 200 },
-    { name: 'source', label: 'Code', maxLength: 300 }
-  ],
-  enrichments: [
-    { fieldName: 'consumes', label: 'Uses', maxItems: 10 }
-  ]
-};

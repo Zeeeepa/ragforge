@@ -300,6 +300,86 @@ export async function runGenerate(options: GenerateOptions): Promise<void> {
   } else {
     console.log('   - Neo4j env: skipped (credentials not available)');
   }
+
+  // Show next steps
+  printNextSteps(config, generated, connectionForEnv !== null);
+}
+
+function printNextSteps(config: RagForgeConfig, generated: any, hasConnection: boolean): void {
+  console.log('\n' + '='.repeat(60));
+  console.log('📋 Next Steps:');
+  console.log('='.repeat(60) + '\n');
+
+  let step = 1;
+
+  // Step 1: Environment setup
+  if (!hasConnection) {
+    console.log(`${step}. Set up your environment variables:`);
+    console.log('   echo "NEO4J_URI=bolt://localhost:7687" >> .env');
+    console.log('   echo "NEO4J_USERNAME=neo4j" >> .env');
+    console.log('   echo "NEO4J_PASSWORD=your-password" >> .env');
+    console.log('   echo "NEO4J_DATABASE=neo4j" >> .env');
+    if (generated.embeddings || generated.summarization) {
+      console.log('   echo "GEMINI_API_KEY=your-key" >> .env');
+    }
+    console.log('');
+    step++;
+  }
+
+  // Step 2: Install dependencies
+  console.log(`${step}. Install dependencies:`);
+  console.log('   npm install');
+  console.log('');
+  step++;
+
+  // Step 3: Vector indexes (if embeddings configured)
+  if (generated.embeddings) {
+    console.log(`${step}. Create vector indexes:`);
+    console.log('   npm run embeddings:index');
+    console.log('');
+    step++;
+
+    console.log(`${step}. Generate embeddings:`);
+    console.log('   npm run embeddings:generate');
+    console.log('   # Or limit for testing: npm run embeddings:generate -- --limit=10');
+    console.log('');
+    step++;
+  }
+
+  // Step 4: Summaries (if configured)
+  if (generated.summarization) {
+    console.log(`${step}. Generate field summaries:`);
+    console.log('   npm run summaries:generate');
+    console.log('   # Or limit for testing: npm run summaries:generate -- --limit=20');
+    console.log('');
+    step++;
+  }
+
+  // Step 5: Test
+  console.log(`${step}. Test your setup:`);
+  console.log('   # Create a test script, e.g.:');
+  console.log('   # import { createRagClient } from \'./client.js\';');
+  console.log('   # const client = createRagClient();');
+  console.log('   # const results = await client.scope().limit(5).execute();');
+  console.log('');
+
+  // Documentation links
+  console.log('📚 Documentation:');
+  console.log('   - Client API: ./docs/client-reference.md');
+  console.log('   - Agent API: ./docs/agent-reference.md');
+
+  if (generated.embeddings || generated.summarization) {
+    console.log('\n💡 Tips:');
+    if (generated.embeddings) {
+      console.log('   - Vector search requires Neo4j 5.15+ for VECTOR INDEX support');
+    }
+    if (generated.summarization) {
+      console.log('   - Summaries improve LLM reranking by providing structured context');
+      console.log('   - Use preferSummary: true in EntityContext to use summaries over raw fields');
+    }
+  }
+
+  console.log('\n' + '='.repeat(60) + '\n');
 }
 
 function mergeVectorIndexes(entity: EntityConfig, embeddingFields: string[]): VectorIndexConfig[] {

@@ -19,6 +19,11 @@
           "nullable": true
         },
         {
+          "name": "source_embedding",
+          "type": "List",
+          "nullable": true
+        },
+        {
           "name": "source_summarized_at",
           "type": "String",
           "nullable": true
@@ -359,6 +364,17 @@
       ]
     },
     {
+      "name": "scopeSourceEmbeddings",
+      "type": "VECTOR",
+      "entityType": "NODE",
+      "labelsOrTypes": [
+        "Scope"
+      ],
+      "properties": [
+        "source_embedding"
+      ]
+    },
+    {
       "name": "scope_file",
       "type": "BTREE",
       "entityType": "NODE",
@@ -460,7 +476,13 @@
       ]
     }
   ],
-  "vectorIndexes": [],
+  "vectorIndexes": [
+    {
+      "name": "scopeSourceEmbeddings",
+      "label": "Scope",
+      "property": "source_embedding"
+    }
+  ],
   "relationshipExamples": {
     "BELONGS_TO": "ragforge",
     "DEFINED_IN": "index.ts",
