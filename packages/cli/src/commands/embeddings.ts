@@ -4,7 +4,8 @@ import { ConfigLoader, SchemaIntrospector } from '@luciformresearch/ragforge-cor
 import {
   Neo4jClient,
   runEmbeddingPipelines,
-  GeminiEmbeddingProvider
+  GeminiEmbeddingProvider, // Legacy - kept for backward compat
+  EmbeddingProvider
 } from '@luciformresearch/ragforge-runtime';
 import { ensureEnvLoaded, getEnv } from '../utils/env.js';
 import { ensureGeminiKey, validateGeminiSchema } from '../utils/gemini.js';
@@ -102,6 +103,77 @@ Options:
 `);
 }
 
+/**
+ * Create embedding provider from config (multi-provider support)
+ */
+function createEmbeddingProvider(config: any, embeddingsConfig: any): EmbeddingProvider {
+  // Check if user configured a specific embedding provider in config
+  if (config.embedding) {
+    const providerConfig = config.embedding;
+    const provider = providerConfig.provider || 'gemini';
+
+    console.log(`📦 Using embedding provider: ${provider} (from config)`);
+
+    // Get API key from config or environment
+    let apiKey = providerConfig.api_key;
+    if (!apiKey) {
+      // Try environment variables based on provider
+      switch (provider.toLowerCase()) {
+        case 'gemini':
+        case 'google':
+          apiKey = getEnv(['GEMINI_API_KEY', 'GOOGLE_API_KEY'], false);
+          break;
+        case 'openai':
+          apiKey = getEnv(['OPENAI_API_KEY'], false);
+          break;
+        case 'anthropic':
+          apiKey = getEnv(['ANTHROPIC_API_KEY'], false);
+          break;
+        case 'cohere':
+          apiKey = getEnv(['COHERE_API_KEY'], false);
+          break;
+        // Ollama doesn't need an API key
+        case 'ollama':
+          break;
+        default:
+          console.warn(`⚠️  Unknown provider "${provider}", trying to proceed without API key`);
+      }
+    }
+
+    return new EmbeddingProvider({
+      provider,
+      model: providerConfig.model || embeddingsConfig.defaults?.model,
+      apiKey,
+      dimensions: providerConfig.dimensions || embeddingsConfig.defaults?.dimension,
+      batchSize: providerConfig.batchSize,
+      options: providerConfig.options,
+    });
+  }
+
+  // Legacy: Fall back to embeddings.provider (old config format)
+  if (embeddingsConfig.provider && embeddingsConfig.provider !== 'gemini') {
+    console.log(`📦 Using embedding provider: ${embeddingsConfig.provider} (from embeddings.provider)`);
+
+    return new EmbeddingProvider({
+      provider: embeddingsConfig.provider,
+      model: embeddingsConfig.defaults?.model,
+      apiKey: getEnv(['GEMINI_API_KEY', 'GOOGLE_API_KEY', 'OPENAI_API_KEY'], false),
+      dimensions: embeddingsConfig.defaults?.dimension,
+    });
+  }
+
+  // Default: Gemini (backward compatible)
+  console.log(`📦 Using embedding provider: gemini (default)`);
+  const geminiKey = ensureGeminiKey(getEnv(['GEMINI_API_KEY'], true));
+
+  return new EmbeddingProvider({
+    provider: 'gemini',
+    model: embeddingsConfig.defaults?.model,
+    apiKey: geminiKey,
+    dimensions: embeddingsConfig.defaults?.dimension,
+  });
+}
+
 export async function runEmbeddingsIndex(options: EmbeddingOptions): Promise<void> {
   const config = await ConfigLoader.load(options.configPath);
   const embeddingsConfig = toRuntimeEmbeddingsConfig(config.embeddings);
@@ -168,11 +240,8 @@ export async function runEmbeddingsGenerate(options: EmbeddingOptions): Promise<
     database: options.database
   });
 
-  const provider = new GeminiEmbeddingProvider({
-    apiKey: options.geminiKey,
-    model: embeddingsConfig.defaults?.model,
-    dimension: embeddingsConfig.defaults?.dimension
-  });
+  // Create embedding provider based on config (multi-provider support!)
+  const provider = createEmbeddingProvider(config, embeddingsConfig);
 
   try {
     for (const entity of embeddingsConfig.entities) {

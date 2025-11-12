@@ -1,0 +1,68 @@
+# RagForge Multi-Provider Example Configuration
+# This shows how to configure different embedding providers
+
+name: multi-provider-example
+version: 1.0.0
+
+# Option 1: Use Ollama (local, free, no API key needed)
+embedding:
+  provider: ollama
+  model: nomic-embed-text
+  # No api_key needed for Ollama!
+
+# Option 2: Use OpenAI (uncomment to try)
+# embedding:
+#   provider: openai
+#   model: text-embedding-3-small
+#   dimensions: 1536
+#   # api_key: ${OPENAI_API_KEY}  # or set in .env
+
+# Option 3: Use Gemini (default if nothing specified)
+# embedding:
+#   provider: gemini
+#   model: text-embedding-004
+#   dimensions: 768
+#   # api_key: ${GEMINI_API_KEY}  # or set in .env
+
+# Option 4: Use Anthropic (when available)
+# embedding:
+#   provider: anthropic
+#   model: voyage-2  # Example
+#   # api_key: ${ANTHROPIC_API_KEY}
+
+neo4j:
+  uri: bolt://localhost:7687
+  username: neo4j
+  password: password
+  database: neo4j
+
+# Legacy embeddings config (still works, but use 'embedding' above instead)
+embeddings:
+  provider: gemini  # This is now optional, 'embedding' config takes precedence
+  defaults:
+    model: text-embedding-004
+    dimension: 768
+    similarity: cosine
+  entities:
+    - entity: Scope
+      pipelines:
+        - name: scopeSourceEmbeddings
+          source: source
+          target_property: source_embedding
+          model: text-embedding-004
+          dimension: 768
+          similarity: cosine
+
+entities:
+  - name: Scope
+    searchable_fields:
+      - name: name
+        type: string
+      - name: source
+        type: string
+    vector_indexes:
+      - name: scopeSourceEmbeddings
+        field: source_embedding
+        source_field: source
+        dimension: 768
+        similarity: cosine

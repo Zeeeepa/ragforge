@@ -47,6 +47,17 @@ export type {
   StructuredPromptConfig
 } from './llm/structured-prompt-builder.js';
 
+// Multi-Provider Adapters (LlamaIndex)
+export {
+  LLMProviderAdapter,
+  EmbeddingProviderAdapter,
+  ProviderRegistry
+} from './llm/provider-adapter.js';
+export type {
+  LLMProviderConfig as LlamaIndexLLMConfig,
+  EmbeddingProviderConfig as LlamaIndexEmbeddingConfig
+} from './llm/provider-adapter.js';
+
 // Summarization
 export { GenericSummarizer } from './summarization/generic-summarizer.js';
 export {
@@ -89,7 +100,12 @@ export type {
   GeneratedEmbeddingsConfig,
   GeneratedEmbeddingRelationshipConfig
 } from './embedding/types.js';
-export { GeminiEmbeddingProvider } from './embedding/gemini-provider.js';
+export {
+  EmbeddingProvider,
+  GeminiEmbeddingProvider, // Legacy - use EmbeddingProvider instead
+  type EmbeddingProviderOptions,
+  type GeminiProviderOptions, // Legacy
+} from './embedding/embedding-provider.js';
 export { runEmbeddingPipelines } from './embedding/pipeline.js';
 
 // Source Adapters

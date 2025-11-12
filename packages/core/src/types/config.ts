@@ -16,6 +16,12 @@ export interface RagForgeConfig {
   summarization_llm?: SummarizationLLMConfig;
   source?: SourceConfig;
   watch?: WatchConfig;
+
+  // Multi-provider LLM configuration (via LlamaIndex)
+  llm?: LLMProviderConfig;
+
+  // Multi-provider embedding configuration (via LlamaIndex)
+  embedding?: EmbeddingProviderConfig;
 }
 
 /**
@@ -310,4 +316,47 @@ export interface WatchConfig {
 
   /** Auto-generate embeddings after ingestion (default: false) */
   auto_embed?: boolean;
+}
+
+/**
+ * Multi-provider LLM configuration (via LlamaIndex)
+ */
+export interface LLMProviderConfig {
+  /** Provider name (gemini, openai, anthropic, ollama, etc.) */
+  provider: string;
+
+  /** Model name (e.g., "gemini-1.5-pro", "gpt-4", "claude-3-5-sonnet-20241022") */
+  model?: string;
+
+  /** API key (not needed for Ollama) */
+  api_key?: string;
+
+  /** Temperature for generation (0.0 to 1.0) */
+  temperature?: number;
+
+  /** Max tokens to generate */
+  max_tokens?: number;
+
+  /** Additional provider-specific options */
+  options?: Record<string, any>;
+}
+
+/**
+ * Multi-provider embedding configuration (via LlamaIndex)
+ */
+export interface EmbeddingProviderConfig {
+  /** Provider name (gemini, openai, cohere, ollama, etc.) */
+  provider: string;
+
+  /** Model name (e.g., "text-embedding-004", "text-embedding-3-small") */
+  model?: string;
+
+  /** API key (not needed for Ollama) */
+  api_key?: string;
+
+  /** Embedding dimensions (if customizable) */
+  dimensions?: number;
+
+  /** Additional provider-specific options */
+  options?: Record<string, any>;
 }

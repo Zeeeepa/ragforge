@@ -1,12 +1,13 @@
 /**
  * Vector Search Module
  *
- * Handles semantic search using Google Gemini embeddings and Neo4j vector indexes
+ * Handles semantic search using multi-provider embeddings and Neo4j vector indexes
+ * Supports: Gemini, OpenAI, Ollama, Anthropic, and more via LlamaIndex
  */
 
-import { GoogleGenAI } from '@google/genai';
 import neo4j from 'neo4j-driver';
 import type { Neo4jClient } from '../client/neo4j-client.js';
+import { EmbeddingProvider, type EmbeddingProviderOptions } from '../embedding/embedding-provider.js';
 
 export interface VectorSearchOptions {
   /** Vector index name to query */
@@ -30,14 +31,27 @@ export interface VectorSearchResult {
   properties: Record<string, any>;
 }
 
+/**
+ * Index configuration - now supports multi-provider!
+ */
 export interface IndexConfig {
+  /** Provider name (gemini, openai, ollama, etc.) */
+  provider?: string;
+  /** Model name (provider-specific) */
   model: string;
+  /** Embedding dimensions */
   dimension?: number;
+  /** API key (optional, can use env vars) */
   apiKey?: string;
+  /** Additional provider options */
+  options?: Record<string, any>;
 }
 
 export class VectorSearch {
-  private static defaultConfig: IndexConfig = { model: 'gemini-embedding-001' };
+  private static defaultConfig: IndexConfig = {
+    provider: 'gemini',
+    model: 'text-embedding-004'
+  };
   private static indexRegistry = new Map<string, IndexConfig>();
 
   static setDefaultConfig(config: IndexConfig) {
@@ -48,12 +62,15 @@ export class VectorSearch {
     this.indexRegistry.set(indexName, config);
   }
 
-  private genAIClients = new Map<string, GoogleGenAI>();
+  private embeddingProviders = new Map<string, EmbeddingProvider>();
 
   constructor(
     private neo4jClient: Neo4jClient,
     private options: {
+      /** Legacy: API key for Gemini (backward compat) */
       apiKey?: string;
+      /** Modern: Embedding provider options */
+      embeddingProvider?: EmbeddingProviderOptions;
     } = {}
   ) {}
 
@@ -61,51 +78,42 @@ export class VectorSearch {
     return VectorSearch.indexRegistry.get(indexName) ?? VectorSearch.defaultConfig;
   }
 
-  private getClient(apiKey?: string): GoogleGenAI {
-    const key = apiKey || this.options.apiKey || VectorSearch.defaultConfig.apiKey || process.env.GEMINI_API_KEY;
-    if (!key) {
-      throw new Error('GEMINI_API_KEY environment variable not set');
+  /**
+   * Get or create embedding provider for a given config
+   */
+  private getEmbeddingProvider(config: IndexConfig): EmbeddingProvider {
+    const provider = config.provider || 'gemini';
+    const cacheKey = `${provider}:${config.model}:${config.apiKey || ''}`;
+
+    let embeddingProvider = this.embeddingProviders.get(cacheKey);
+    if (!embeddingProvider) {
+      // Create provider from config
+      embeddingProvider = new EmbeddingProvider({
+        provider,
+        model: config.model,
+        apiKey: config.apiKey || this.options.apiKey,
+        dimensions: config.dimension,
+        options: config.options,
+      });
+
+      this.embeddingProviders.set(cacheKey, embeddingProvider);
+
+      console.log(
+        `[VectorSearch] Created embedding provider: ${embeddingProvider.getProviderName()} / ${embeddingProvider.getModelName()}`
+      );
     }
 
-    let client = this.genAIClients.get(key);
-    if (!client) {
-      client = new GoogleGenAI({ apiKey: key });
-      this.genAIClients.set(key, client);
-    }
-
-    return client;
+    return embeddingProvider;
   }
 
   private async generateEmbedding(text: string, config: IndexConfig): Promise<number[]> {
-    const client = this.getClient(config.apiKey);
+    const provider = this.getEmbeddingProvider(config);
 
-    const request: any = {
-      model: config.model,
-      contents: [
-        {
-          role: 'user',
-          parts: [{ text }]
-        }
-      ]
-    };
+    // Generate embedding using multi-provider
+    const embedding = await provider.embedSingle(text);
 
-    if (config.dimension) {
-      request.config = {
-        ...(request.config ?? {}),
-        outputDimensionality: config.dimension
-      };
-    }
-
-    const response = await client.models.embedContent(request);
-
-    const embedding = response.embeddings?.[0]?.values;
-    if (!Array.isArray(embedding)) {
-      throw new Error('Invalid embedding response from Google GenAI');
-    }
-
-    const dimension = embedding.length;
     console.log(
-      `[VectorSearch] Generated embedding for index using model=${config.model ?? 'default'} dimension=${dimension}`
+      `[VectorSearch] Generated embedding using ${provider.getProviderName()}/${provider.getModelName()} dimension=${embedding.length}`
     );
 
     return embedding;
@@ -206,7 +214,10 @@ export class VectorSearch {
    */
   async generateEmbeddings(texts: string[], indexName: string): Promise<number[][]> {
     const config = this.resolveIndexConfig(indexName);
-    return Promise.all(texts.map(text => this.generateEmbedding(text, config)));
+    const provider = this.getEmbeddingProvider(config);
+
+    // Use batch embedding for efficiency
+    return await provider.embed(texts);
   }
 
   /**
@@ -214,9 +225,9 @@ export class VectorSearch {
    */
   getModelInfo() {
     return {
+      provider: VectorSearch.defaultConfig.provider || 'gemini',
       model: VectorSearch.defaultConfig.model,
-      dimension: VectorSearch.defaultConfig.dimension ?? 768,
-      provider: 'gemini'
+      dimension: VectorSearch.defaultConfig.dimension ?? 768
     };
   }
 }

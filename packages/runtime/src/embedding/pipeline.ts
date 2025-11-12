@@ -10,7 +10,7 @@ import type {
   GeneratedEmbeddingEntityConfig,
   GeneratedEmbeddingRelationshipConfig
 } from './types.js';
-import { GeminiEmbeddingProvider } from './gemini-provider.js';
+import { GeminiEmbeddingProvider } from './embedding-provider.js';
 
 const DEFAULT_BATCH_SIZE = 16;
 const DEFAULT_CONCURRENCY = 1;

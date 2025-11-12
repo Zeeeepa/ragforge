@@ -1,0 +1,187 @@
+RAGFORGE CODEBASE STRUCTURE & KEY FILES
+======================================
+
+ABSOLUTE FILE PATHS (Linux)
+===========================
+
+## RUNTIME PACKAGE
+/home/luciedefraiteur/LR_CodeRag/ragforge/packages/runtime/src/
+
+### Query Pipeline (Core)
+- query-builder.ts (1911 lines) - Main fluent API with pipeline execution
+- operations.ts (121 lines) - Operation type definitions
+- Types: FetchOperation, ExpandOperation, SemanticOperation, LLMRerankOperation, FilterOperation
+
+### Vector Search & Embeddings
+- vector/vector-search.ts - Google Gemini embeddings integration
+- embedding/gemini-provider.ts - Gemini embedding provider
+- embedding/pipeline.ts - Batch embedding processing
+- embedding/types.ts - Embedding configuration types
+
+### Neo4j Integration
+- client/neo4j-client.ts - Neo4j driver wrapper (transactions, pooling)
+
+### LLM Integration
+- reranking/llm-reranker.ts - LLM-based result reranking with batching
+- reranking/llm-provider.ts - Provider interface
+- reranking/vertex-ai-provider.ts - Google Vertex AI implementation
+- reranking/gemini-api-provider.ts - Direct Gemini API implementation
+- llm/structured-prompt-builder.ts - Prompt formatting utilities
+
+### Agents & Tools
+- agent/iterative-code-agent.ts (534 lines) - Multi-iteration agent with code generation/execution
+
+### Code Parsing & Ingestion
+- adapters/code-source-adapter.ts (1100 lines) - TypeScript/Python parser
+- adapters/types.ts - Adapter interface definitions
+- adapters/index.ts - Exports
+- adapters/incremental-ingestion.ts - Change detection (WIP)
+- adapters/file-watcher.ts - File system watching
+- adapters/change-tracker.ts - Version tracking
+
+### Mutations (Write Operations)
+- mutations/mutation-builder.ts - CRUD operations on entities
+
+### Summarization
+- summarization/generic-summarizer.ts - LLM-based summarization
+- summarization/default-strategies.ts - Built-in strategies
+- summarization/summary-storage.ts - Caching & persistence
+
+### Types & Utilities
+- types/index.ts
+- types/config.ts - RuntimeConfig interface
+- types/query.ts - Query parameter types
+- types/result.ts - SearchResult, SearchResultWithMetadata
+- types/entity-context.ts - EntityContext for runtime metadata
+- utils/UniqueIDHelper.ts - Deterministic UUID generation
+- utils/ImportResolver.ts - Import path resolution
+- utils/timestamp.ts - Timestamp utilities
+
+### Index & Exports
+- index.ts (162 lines) - Main exports: createClient(), QueryBuilder, etc.
+
+## CORE PACKAGE
+/home/luciedefraiteur/LR_CodeRag/ragforge/packages/core/src/
+
+### Code Generation
+- generator/code-generator.ts - Generates TypeScript clients from schema
+- generator/config-generator.ts - Config file generation
+- generator/type-generator.ts - Entity type generation
+
+### Schema & Introspection
+- schema/introspector.ts - Neo4j schema reading
+
+### Configuration
+- config/loader.ts - YAML configuration loading
+- config/merger.ts - Configuration merging
+- config/writer.ts - Configuration writing
+
+### Types
+- types/config.ts - RagForgeConfig, EntityConfig interfaces (100+ lines)
+- types/schema.ts - GraphSchema interface
+
+### Index
+- index.ts - Public API exports
+
+## CLI PACKAGE
+/home/luciedefraiteur/LR_CodeRag/ragforge/packages/cli/src/
+
+### Commands
+- commands/init.ts - Initialize project
+- commands/introspect.ts - Inspect Neo4j schema
+- commands/generate.ts - Generate client code
+- commands/quickstart.ts - Interactive setup
+- commands/embeddings.ts - Embedding management
+
+### Utilities
+- utils/io.ts - File I/O & prompting
+- utils/env.ts - Environment detection
+- utils/field-detector.ts - Auto-detect searchable fields
+- utils/gemini.ts - Gemini API utilities
+- utils/embedding-transform.ts - Embedding format conversion
+- utils/project-name.ts - Project naming utilities
+
+### Index
+- index.ts - Main CLI entry point
+
+## CONFIGURATION FILES
+
+### Project Level
+- /home/luciedefraiteur/LR_CodeRag/ragforge/packages/runtime/package.json
+  Version: 0.2.1
+  Main deps: neo4j-driver, @google/genai, codeparsers, xmlparser
+
+### Test Projects
+- /home/luciedefraiteur/LR_CodeRag/ragforge/test-code-rag/ - Reference implementation
+
+## KEY PATTERNS
+
+### Type-Safe Entities (Auto-Generated)
+Scope, File, Project, ExternalLibrary
+
+### Query Operations (Pipeline-Based)
+1. fetch - Neo4j retrieval
+2. semantic - Vector search
+3. expand - Relationship traversal
+4. filter - Field/relationship constraints
+5. llmRerank - LLM evaluation
+6. clientFilter - JavaScript predicate
+
+### Relationship Types (Neo4j)
+CONSUMES, INHERITS_FROM, IMPLEMENTS, HAS_PARENT,
+BELONGS_TO, DEFINED_IN, IN_DIRECTORY, USES_LIBRARY
+
+### Scoring Strategies
+- vector (embedding similarity)
+- semantic (composite)
+- llm (LLM evaluation)
+- Merging: weighted, multiplicative, llm-override
+
+## DEPENDENCY GRAPH
+
+runtime/
+  ├── neo4j-driver (Neo4j)
+  ├── @google/genai (Embeddings & LLM)
+  ├── @luciformresearch/codeparsers (Code parsing)
+  ├── @luciformresearch/xmlparser (XML parsing)
+  ├── globby (File matching)
+  ├── chokidar (File watching)
+  ├── diff (Change detection)
+  └── p-limit (Concurrency)
+
+core/
+  └── runtime (all above)
+
+cli/
+  ├── core (all above)
+  ├── @inquirer/prompts (Interactive CLI)
+  └── zx (Shell execution)
+
+## INTEGRATION POINTS
+
+### For External Tools/Libraries:
+
+1. **Tool Calling**
+   - LLMProvider interface (reranking/llm-provider.ts)
+   - Adapt for Anthropic tool_use, OpenAI functions
+   
+2. **Vector Stores**
+   - VectorSearch class - abstract to plugin interface
+   - Support Pinecone, Weaviate, Qdrant, Milvus
+
+3. **LLM Backends**
+   - LLMProvider interface - implement for OpenAI, Anthropic, local
+   - AgentConfig accepts any LLMClient
+
+4. **Caching**
+   - QueryBuilder - add CacheProvider interface
+   - Cache semantic search, filter results
+
+5. **Observability**
+   - QueryBuilder - add telemetry hooks
+   - Track operation timing, costs, errors
+
+6. **Knowledge Graph Construction**
+   - CodeSourceAdapter - extend for more languages
+   - Add extractors for other data sources
+
