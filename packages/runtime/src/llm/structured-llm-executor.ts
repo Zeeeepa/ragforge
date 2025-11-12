@@ -220,7 +220,7 @@ export class StructuredLLMExecutor {
    */
   async executeReranking<T>(
     items: T[],
-    config: LLMStructuredCallConfig<T, ItemEvaluation> & {
+    config: Partial<LLMStructuredCallConfig<T, ItemEvaluation>> & {
       userQuestion: string;
       withFeedback?: boolean;
       getItemId?: (item: T, index: number) => string;

@@ -124,6 +124,7 @@ export interface RerankInput {
 export class LLMReranker {
   private static defaultProvider?: LLMProvider;
   private entityContext: EntityContext;
+  private executor: StructuredLLMExecutor; // NEW: Use unified executor
   // Increased from 400 to allow full code scopes in reranking prompts
   // With modern LLMs (8k+ context), we can afford to send more context per item
   private static readonly DEFAULT_FIELD_MAX = 2500;
@@ -167,6 +168,7 @@ export class LLMReranker {
     entityContext: EntityContext
   ) {
     this.entityContext = entityContext;
+    this.executor = new StructuredLLMExecutor(); // Initialize unified executor
   }
 
   /**
@@ -183,7 +185,64 @@ export class LLMReranker {
     return this.buildPrompt(batch, userQuestion, queryContext, false);
   }
 
+  /**
+   * NEW: Rerank using StructuredLLMExecutor (unified approach)
+   */
+  async rerankWithExecutor(input: RerankInput): Promise<LLMRerankResult> {
+    const {
+      batchSize = 10,
+      parallel = 5,
+      minScore = 0.0,
+      topK,
+      withSuggestions = false
+    } = this.options;
+
+    // Extract entities from SearchResults
+    const entities = input.results.map(r => r.entity);
+
+    // Use StructuredLLMExecutor for reranking
+    const { evaluations, queryFeedback } = await this.executor.executeReranking(entities, {
+      userQuestion: input.userQuestion,
+      entityContext: this.entityContext,
+      llmProvider: this.llmProvider,
+      batchSize,
+      parallel,
+      withFeedback: withSuggestions,
+      getItemId: (entity, index) => this.getEntityId(entity, index),
+      contextData: input.queryContext ? { queryContext: input.queryContext } : undefined
+    });
+
+    // Convert ItemEvaluation to ScopeEvaluation (same structure)
+    const scopeEvaluations: ScopeEvaluation[] = evaluations
+      .filter(e => e.score >= minScore)
+      .map(e => ({
+        scopeId: e.id,
+        relevant: e.relevant ?? true,
+        score: e.score,
+        reasoning: e.reasoning
+      }));
+
+    // Sort and limit
+    scopeEvaluations.sort((a, b) => b.score - a.score);
+    const limited = topK !== undefined && topK > 0
+      ? scopeEvaluations.slice(0, topK)
+      : scopeEvaluations;
+
+    return {
+      evaluations: limited,
+      queryFeedback
+    };
+  }
+
+  /**
+   * LEGACY: Original rerank implementation (kept for backward compatibility)
+   * TODO: Eventually deprecate in favor of rerankWithExecutor
+   */
   async rerank(input: RerankInput): Promise<LLMRerankResult> {
+    // For now, delegate to new implementation
+    return this.rerankWithExecutor(input);
+
+    /* ORIGINAL IMPLEMENTATION COMMENTED OUT - can be removed after testing
     const {
       batchSize = 10,
       parallel = 5,
@@ -280,6 +339,7 @@ export class LLMReranker {
       evaluations: filtered,
       queryFeedback
     };
+    */
   }
 
   private createBatches(results: SearchResult[], size: number): SearchResult[][] {
