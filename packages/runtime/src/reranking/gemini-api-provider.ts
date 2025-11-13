@@ -49,7 +49,24 @@ export class GeminiAPIProvider implements LLMProvider {
 
   async generateContent(prompt: string): Promise<string> {
     const promptSize = prompt.length;
-    console.log(`[GeminiAPIProvider] 📤 Sending request | Prompt: ${promptSize} chars | Model: ${this.modelName}`);
+
+    // Estimate prompt tokens (rough heuristic: 1 token ≈ 4 characters)
+    const promptTokens = Math.ceil(promptSize / 4);
+
+    // Calculate maxOutputTokens dynamically if not explicitly set via constructor
+    // If user provided maxOutputTokens in constructor, use it; otherwise calculate
+    // Use 1x prompt size, with sensible min/max bounds
+    const calculatedMaxTokens = this.maxOutputTokens === 512 // Check if it's still the default
+      ? Math.max(
+          Math.min(promptTokens, 8192), // Cap at 8k tokens (reasonable for most responses)
+          2048 // Minimum 2k tokens for decent responses
+        )
+      : this.maxOutputTokens; // Use user-provided value
+
+    console.log(
+      `[GeminiAPIProvider] 📤 Sending request | Prompt: ${promptSize} chars (~${promptTokens} tokens) | ` +
+      `MaxOutput: ${calculatedMaxTokens} tokens | Model: ${this.modelName}`
+    );
 
     const startTime = Date.now();
 
@@ -76,7 +93,7 @@ export class GeminiAPIProvider implements LLMProvider {
         contents: prompt,
         config: {
           temperature: this.temperature,
-          maxOutputTokens: this.maxOutputTokens,
+          maxOutputTokens: calculatedMaxTokens,
         }
       });
 

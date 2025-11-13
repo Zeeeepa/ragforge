@@ -96,9 +96,26 @@ export class LLMProviderAdapter {
 
   /**
    * Generate text using the LLM
+   * Automatically calculates maxTokens based on prompt size if not configured
    */
-  async generate(prompt: string): Promise<string> {
-    const response = await this.llm.complete({ prompt });
+  async generate(prompt: string, options?: { maxTokens?: number }): Promise<string> {
+    // Estimate prompt tokens (rough heuristic: 1 token ≈ 4 characters)
+    const promptTokens = Math.ceil(prompt.length / 4);
+
+    // Calculate maxTokens for output if not provided
+    // Use a ratio of prompt size (default: 1x prompt length)
+    // This ensures the model has enough space to respond proportionally
+    const maxTokens = options?.maxTokens || Math.max(
+      promptTokens, // At least as much as the prompt
+      2048 // Minimum reasonable response size
+    );
+
+    const response = await this.llm.complete({
+      prompt,
+      // Note: LlamaIndex uses different param names per provider
+      // Gemini: maxTokens, OpenAI: maxTokens, Anthropic: maxTokens
+      ...(maxTokens && { maxTokens })
+    });
     return response.text;
   }
 

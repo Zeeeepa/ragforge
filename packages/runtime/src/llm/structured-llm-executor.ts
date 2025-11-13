@@ -390,6 +390,76 @@ export class StructuredLLMExecutor {
     })) as any;
   }
 
+  /**
+   * Estimate token cost for LLM batch operation
+   * Useful for budget planning before executing
+   *
+   * @param items - Items to process
+   * @param config - LLM configuration (same as executeLLMBatch)
+   * @returns Token estimates and cost breakdown by provider
+   */
+  estimateTokens<T>(
+    items: T[],
+    config: LLMStructuredCallConfig<T, any>
+  ): {
+    totalPromptTokens: number;
+    totalResponseTokens: number;
+    estimatedCostUSD: number;
+    batchCount: number;
+    itemsPerBatch: number[];
+    provider: string;
+    model?: string;
+  } {
+    // Validate config first
+    this.validateLLMConfig(config);
+
+    // Pack items into batches (same logic as actual execution)
+    const batches = this.packBatches(items, config);
+
+    let totalPromptTokens = 0;
+    let totalResponseTokens = 0;
+
+    // Estimate tokens for each batch
+    for (const batch of batches) {
+      // Build actual prompt to get accurate estimate
+      const prompt = this.buildPrompt(batch.items, config);
+
+      // Estimate prompt tokens: 1 token ≈ 4 characters (rough heuristic)
+      const promptTokens = Math.ceil(prompt.length / 4);
+      totalPromptTokens += promptTokens;
+
+      // Estimate response tokens based on output schema
+      const responseTokens = this.estimateResponseTokensForBatch(
+        batch.items.length,
+        config.outputSchema,
+        config.globalSchema
+      );
+      totalResponseTokens += responseTokens;
+    }
+
+    // Get provider info
+    const provider = config.llm?.provider || this.defaultLLMConfig?.provider || 'unknown';
+    const model = config.llm?.model || this.defaultLLMConfig?.model;
+
+    // Estimate cost based on provider/model
+    const estimatedCostUSD = this.estimateCost(
+      totalPromptTokens,
+      totalResponseTokens,
+      provider,
+      model
+    );
+
+    return {
+      totalPromptTokens,
+      totalResponseTokens,
+      estimatedCostUSD,
+      batchCount: batches.length,
+      itemsPerBatch: batches.map(b => b.items.length),
+      provider,
+      model
+    };
+  }
+
   // ===== PRIVATE METHODS =====
 
   private validateLLMConfig<T>(config: LLMStructuredCallConfig<T, any>): void {

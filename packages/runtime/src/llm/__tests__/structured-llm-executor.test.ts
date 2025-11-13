@@ -108,9 +108,9 @@ let sharedLLMProvider: LLMProvider;
 if (USE_REAL_LLM && GEMINI_API_KEY) {
   sharedLLMProvider = new GeminiAPIProvider({
     apiKey: GEMINI_API_KEY,
-    model: 'gemma-3n-e2b-it', // More parallel-friendly and cheaper than gemini-2.0-flash-exp
+    model: 'gemini-2.0-flash', // Flash 2.0: 1000 RPM (vs gemma 30 RPM)
     temperature: 0.1,
-    maxOutputTokens: 2048,
+    // maxOutputTokens now calculated automatically based on prompt size
     // rateLimitStrategy defaults to 'reactive' (model-agnostic, handles 429 gracefully)
     // Can override to 'proactive' for zero 429s, or 'none' to disable
   });
@@ -1069,5 +1069,598 @@ items:
       expect(globalMetadata.confidence).toBeLessThanOrEqual(100);
       console.log('[Multi-format test] Mixed formats ✓');
     }, 120000); // 2 minute timeout to handle retries
+
+    it('should handle realistic prompts of varying sizes (1k, 5k, 10k chars)', async () => {
+      console.log('[Realistic sizes test] Testing small, medium, and large realistic prompts...');
+
+      const outputSchema: OutputSchema<{ analysis: string; recommendation: string }> = {
+        analysis: {
+          type: 'string',
+          description: 'Analysis of the code or content',
+          required: true
+        },
+        recommendation: {
+          type: 'string',
+          description: 'Recommendation for improvement',
+          required: true
+        }
+      };
+
+      // Test 1: Small prompt (~1k chars) - Simple function
+      console.log('[Realistic sizes test] Testing small prompt (~1k chars)...');
+      const smallCode = [{
+        id: 'small',
+        code: `function calculateTotal(items) {
+  let total = 0;
+  for (let i = 0; i < items.length; i++) {
+    total += items[i].price * items[i].quantity;
+  }
+  return total;
+}
+
+function applyDiscount(total, discountPercent) {
+  return total - (total * discountPercent / 100);
+}
+
+function formatCurrency(amount) {
+  return '$' + amount.toFixed(2);
+}
+
+// Usage example
+const cart = [
+  { name: 'Widget', price: 9.99, quantity: 2 },
+  { name: 'Gadget', price: 14.99, quantity: 1 },
+  { name: 'Doohickey', price: 4.99, quantity: 3 }
+];
+
+const subtotal = calculateTotal(cart);
+const discounted = applyDiscount(subtotal, 10);
+console.log('Final price:', formatCurrency(discounted));`
+      }];
+
+      const result1k = await executor.executeLLMBatch(smallCode, {
+        inputFields: ['code'],
+        llmProvider: sharedLLMProvider,
+        systemPrompt: 'You are a code reviewer analyzing JavaScript code.',
+        userTask: 'Review this code for quality and suggest improvements.',
+        outputSchema,
+        logPrompts: './test-logs/variable-sizes-1k-prompt.log',
+        logResponses: './test-logs/variable-sizes-1k-response.log'
+      });
+      expect(result1k).toHaveLength(1);
+      expect(result1k[0]).toHaveProperty('analysis');
+      expect(result1k[0]).toHaveProperty('recommendation');
+      console.log(`[Realistic sizes test] Small (~${smallCode[0].code.length} chars): ✓`);
+
+      // Test 2: Medium prompt (~5k chars) - API endpoint with documentation
+      console.log('[Realistic sizes test] Testing medium prompt (~5k chars)...');
+      const mediumCode = [{
+        id: 'medium',
+        code: `/**
+ * User Authentication API
+ *
+ * This module provides comprehensive user authentication functionality including:
+ * - User registration with email verification
+ * - Login with JWT token generation
+ * - Password reset flows
+ * - Session management
+ * - OAuth integration (Google, GitHub)
+ *
+ * Security features:
+ * - Bcrypt password hashing with salt rounds = 12
+ * - JWT tokens with 1h expiration
+ * - Refresh token rotation
+ * - Rate limiting on authentication endpoints
+ * - CSRF protection
+ * - SQL injection prevention via parameterized queries
+ *
+ * Dependencies:
+ * - express: Web framework
+ * - bcrypt: Password hashing
+ * - jsonwebtoken: JWT generation and verification
+ * - express-validator: Input validation
+ * - nodemailer: Email sending
+ * - passport: OAuth strategies
+ */
+
+const express = require('express');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const { body, validationResult } = require('express-validator');
+const nodemailer = require('nodemailer');
+const crypto = require('crypto');
+
+const router = express.Router();
+const SALT_ROUNDS = 12;
+const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_EXPIRY = '1h';
+const REFRESH_TOKEN_EXPIRY = '7d';
+
+// Email configuration
+const emailTransporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: process.env.SMTP_PORT,
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS
+  }
+});
+
+/**
+ * Register new user
+ * POST /api/auth/register
+ *
+ * Request body:
+ * {
+ *   email: string,
+ *   password: string,
+ *   name: string
+ * }
+ *
+ * Returns:
+ * {
+ *   success: boolean,
+ *   message: string,
+ *   userId?: string
+ * }
+ */
+router.post('/register',
+  body('email').isEmail().normalizeEmail(),
+  body('password').isLength({ min: 8 }).matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\\d)/),
+  body('name').trim().isLength({ min: 2, max: 100 }),
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { email, password, name } = req.body;
+
+    try {
+      // Check if user exists
+      const existingUser = await db.query('SELECT id FROM users WHERE email = $1', [email]);
+      if (existingUser.rows.length > 0) {
+        return res.status(409).json({ success: false, message: 'User already exists' });
+      }
+
+      // Hash password
+      const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
+
+      // Generate email verification token
+      const verificationToken = crypto.randomBytes(32).toString('hex');
+
+      // Insert user
+      const result = await db.query(
+        'INSERT INTO users (email, password_hash, name, verification_token, created_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING id',
+        [email, hashedPassword, name, verificationToken]
+      );
+
+      const userId = result.rows[0].id;
+
+      // Send verification email
+      await emailTransporter.sendMail({
+        from: process.env.FROM_EMAIL,
+        to: email,
+        subject: 'Verify your email',
+        html: \`<p>Click <a href="\${process.env.BASE_URL}/verify/\${verificationToken}">here</a> to verify your email.</p>\`
+      });
+
+      res.status(201).json({
+        success: true,
+        message: 'User registered. Please check your email to verify.',
+        userId
+      });
+    } catch (error) {
+      console.error('Registration error:', error);
+      res.status(500).json({ success: false, message: 'Internal server error' });
+    }
+  }
+);
+
+/**
+ * Login
+ * POST /api/auth/login
+ */
+router.post('/login',
+  body('email').isEmail().normalizeEmail(),
+  body('password').exists(),
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { email, password } = req.body;
+
+    try {
+      const result = await db.query(
+        'SELECT id, password_hash, email_verified FROM users WHERE email = $1',
+        [email]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(401).json({ success: false, message: 'Invalid credentials' });
+      }
+
+      const user = result.rows[0];
+
+      if (!user.email_verified) {
+        return res.status(403).json({ success: false, message: 'Email not verified' });
+      }
+
+      const validPassword = await bcrypt.compare(password, user.password_hash);
+      if (!validPassword) {
+        return res.status(401).json({ success: false, message: 'Invalid credentials' });
+      }
+
+      // Generate tokens
+      const accessToken = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: JWT_EXPIRY });
+      const refreshToken = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: REFRESH_TOKEN_EXPIRY });
+
+      // Store refresh token
+      await db.query('INSERT INTO refresh_tokens (user_id, token, expires_at) VALUES ($1, $2, NOW() + INTERVAL \\'7 days\\')',
+        [user.id, refreshToken]);
+
+      res.json({
+        success: true,
+        accessToken,
+        refreshToken
+      });
+    } catch (error) {
+      console.error('Login error:', error);
+      res.status(500).json({ success: false, message: 'Internal server error' });
+    }
+  }
+);
+
+module.exports = router;`
+      }];
+
+      const result5k = await executor.executeLLMBatch(mediumCode, {
+        inputFields: ['code'],
+        llmProvider: sharedLLMProvider,
+        systemPrompt: 'You are a senior security engineer reviewing authentication code.',
+        userTask: 'Analyze this authentication API for security vulnerabilities and best practices.',
+        outputSchema,
+        logPrompts: './test-logs/variable-sizes-5k-prompt.log',
+        logResponses: './test-logs/variable-sizes-5k-response.log'
+      });
+      expect(result5k).toHaveLength(1);
+      expect(result5k[0]).toHaveProperty('analysis');
+      expect(result5k[0]).toHaveProperty('recommendation');
+      console.log(`[Realistic sizes test] Medium (~${mediumCode[0].code.length} chars): ✓`);
+
+      // Test 3: Large prompt (~10k chars) - Full React component with hooks and context
+      console.log('[Realistic sizes test] Testing large prompt (~10k chars)...');
+      const largeCode = [{
+        id: 'large',
+        code: `/**
+ * E-commerce Product Dashboard Component
+ *
+ * A comprehensive React component that manages product listings, inventory,
+ * analytics, and user interactions for an e-commerce platform.
+ *
+ * Features:
+ * - Real-time product search and filtering
+ * - Inventory management with live updates
+ * - Sales analytics with charts
+ * - Bulk operations (edit, delete, export)
+ * - Pagination and infinite scroll
+ * - Image upload and optimization
+ * - Price history tracking
+ * - Review management
+ * - Integration with payment gateway
+ * - Multi-currency support
+ * - A/B testing framework
+ */
+
+import React, { useState, useEffect, useCallback, useMemo, useContext, useRef } from 'react';
+import { useQuery, useMutation, useQueryClient } from 'react-query';
+import { debounce } from 'lodash';
+import { Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend } from 'chart.js';
+import { Line } from 'react-chartjs-2';
+import { toast } from 'react-hot-toast';
+import { AuthContext } from '../../contexts/AuthContext';
+import { ThemeContext } from '../../contexts/ThemeContext';
+import { api } from '../../services/api';
+import { formatCurrency, formatDate, validatePrice } from '../../utils/formatters';
+import { useInfiniteScroll } from '../../hooks/useInfiniteScroll';
+import { useImageUpload } from '../../hooks/useImageUpload';
+import ProductCard from './ProductCard';
+import FilterPanel from './FilterPanel';
+import BulkActions from './BulkActions';
+import AnalyticsDashboard from './AnalyticsDashboard';
+import LoadingSpinner from '../common/LoadingSpinner';
+import ErrorBoundary from '../common/ErrorBoundary';
+
+ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend);
+
+const ProductDashboard = () => {
+  // Context
+  const { user, permissions } = useContext(AuthContext);
+  const { theme } = useContext(ThemeContext);
+
+  // State management
+  const [searchQuery, setSearchQuery] = useState('');
+  const [filters, setFilters] = useState({
+    category: 'all',
+    priceRange: { min: 0, max: 10000 },
+    inStock: true,
+    sortBy: 'name',
+    sortOrder: 'asc'
+  });
+  const [selectedProducts, setSelectedProducts] = useState(new Set());
+  const [viewMode, setViewMode] = useState('grid'); // 'grid' | 'list' | 'analytics'
+  const [page, setPage] = useState(1);
+  const [currency, setCurrency] = useState('USD');
+
+  // Refs
+  const queryClient = useQueryClient();
+  const scrollRef = useRef(null);
+
+  // Data fetching
+  const { data: productsData, isLoading, isError, error } = useQuery(
+    ['products', searchQuery, filters, page],
+    () => api.products.getAll({ search: searchQuery, ...filters, page, limit: 20 }),
+    {
+      keepPreviousData: true,
+      staleTime: 30000,
+      onError: (err) => toast.error('Failed to load products')
+    }
+  );
+
+  const { data: analyticsData } = useQuery(
+    ['analytics', filters],
+    () => api.analytics.getProductMetrics(filters),
+    { enabled: viewMode === 'analytics' }
+  );
+
+  // Mutations
+  const updateProductMutation = useMutation(
+    (product) => api.products.update(product.id, product),
+    {
+      onSuccess: () => {
+        queryClient.invalidateQueries('products');
+        toast.success('Product updated successfully');
+      },
+      onError: () => toast.error('Failed to update product')
+    }
+  );
+
+  const deleteProductsMutation = useMutation(
+    (productIds) => api.products.bulkDelete(productIds),
+    {
+      onSuccess: () => {
+        queryClient.invalidateQueries('products');
+        setSelectedProducts(new Set());
+        toast.success('Products deleted successfully');
+      },
+      onError: () => toast.error('Failed to delete products')
+    }
+  );
+
+  const { uploadImage, isUploading, uploadProgress } = useImageUpload();
+
+  // Debounced search
+  const debouncedSearch = useMemo(
+    () => debounce((query) => setSearchQuery(query), 300),
+    []
+  );
+
+  // Infinite scroll
+  useInfiniteScroll(scrollRef, () => {
+    if (productsData?.hasMore && !isLoading) {
+      setPage(prev => prev + 1);
+    }
+  });
+
+  // Handlers
+  const handleSearchChange = useCallback((e) => {
+    debouncedSearch(e.target.value);
+  }, [debouncedSearch]);
+
+  const handleFilterChange = useCallback((newFilters) => {
+    setFilters(prev => ({ ...prev, ...newFilters }));
+    setPage(1);
+  }, []);
+
+  const handleProductSelect = useCallback((productId) => {
+    setSelectedProducts(prev => {
+      const next = new Set(prev);
+      if (next.has(productId)) {
+        next.delete(productId);
+      } else {
+        next.add(productId);
+      }
+      return next;
+    });
+  }, []);
+
+  const handleBulkDelete = useCallback(async () => {
+    if (selectedProducts.size === 0) return;
+
+    const confirmed = window.confirm(\`Delete \${selectedProducts.size} products?\`);
+    if (confirmed) {
+      await deleteProductsMutation.mutateAsync(Array.from(selectedProducts));
+    }
+  }, [selectedProducts, deleteProductsMutation]);
+
+  const handleBulkEdit = useCallback(async (updates) => {
+    const promises = Array.from(selectedProducts).map(id => {
+      const product = productsData?.products.find(p => p.id === id);
+      return updateProductMutation.mutateAsync({ ...product, ...updates });
+    });
+    await Promise.all(promises);
+  }, [selectedProducts, productsData, updateProductMutation]);
+
+  const handleExport = useCallback(async (format = 'csv') => {
+    try {
+      const data = await api.products.export({
+        productIds: Array.from(selectedProducts),
+        format
+      });
+      const blob = new Blob([data], { type: 'text/csv' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = \`products-\${Date.now()}.\${format}\`;
+      a.click();
+      toast.success('Export completed');
+    } catch (error) {
+      toast.error('Export failed');
+    }
+  }, [selectedProducts]);
+
+  const handleImageUpload = useCallback(async (productId, file) => {
+    try {
+      const imageUrl = await uploadImage(file);
+      await updateProductMutation.mutateAsync({ id: productId, imageUrl });
+    } catch (error) {
+      toast.error('Image upload failed');
+    }
+  }, [uploadImage, updateProductMutation]);
+
+  // Computed values
+  const products = productsData?.products || [];
+  const totalProducts = productsData?.total || 0;
+  const hasMore = productsData?.hasMore || false;
+
+  const selectedProductsData = useMemo(() => {
+    return products.filter(p => selectedProducts.has(p.id));
+  }, [products, selectedProducts]);
+
+  const totalValue = useMemo(() => {
+    return selectedProductsData.reduce((sum, p) => sum + (p.price * p.stock), 0);
+  }, [selectedProductsData]);
+
+  // Effects
+  useEffect(() => {
+    // Track page view
+    api.analytics.trackPageView('product-dashboard', { filters, viewMode });
+  }, [filters, viewMode]);
+
+  useEffect(() => {
+    // Real-time inventory updates via WebSocket
+    const ws = new WebSocket(process.env.REACT_APP_WS_URL);
+
+    ws.onmessage = (event) => {
+      const update = JSON.parse(event.data);
+      if (update.type === 'inventory-update') {
+        queryClient.setQueryData(['products'], (old) => {
+          return {
+            ...old,
+            products: old.products.map(p =>
+              p.id === update.productId ? { ...p, stock: update.stock } : p
+            )
+          };
+        });
+      }
+    };
+
+    return () => ws.close();
+  }, [queryClient]);
+
+  // Render helpers
+  const renderProducts = () => {
+    if (isLoading) return <LoadingSpinner />;
+    if (isError) return <div className="error">Error: {error.message}</div>;
+    if (products.length === 0) return <div className="empty">No products found</div>;
+
+    return products.map(product => (
+      <ProductCard
+        key={product.id}
+        product={product}
+        selected={selectedProducts.has(product.id)}
+        onSelect={handleProductSelect}
+        onUpdate={updateProductMutation.mutate}
+        onImageUpload={(file) => handleImageUpload(product.id, file)}
+        viewMode={viewMode}
+        currency={currency}
+      />
+    ));
+  };
+
+  // Main render
+  return (
+    <ErrorBoundary>
+      <div className={\`product-dashboard theme-\${theme}\`}>
+        <header className="dashboard-header">
+          <h1>Product Management</h1>
+          <div className="header-actions">
+            <input
+              type="search"
+              placeholder="Search products..."
+              onChange={handleSearchChange}
+              className="search-input"
+            />
+            <select value={currency} onChange={(e) => setCurrency(e.target.value)}>
+              <option value="USD">USD</option>
+              <option value="EUR">EUR</option>
+              <option value="GBP">GBP</option>
+            </select>
+            <button onClick={() => setViewMode('grid')}>Grid</button>
+            <button onClick={() => setViewMode('list')}>List</button>
+            <button onClick={() => setViewMode('analytics')}>Analytics</button>
+          </div>
+        </header>
+
+        <div className="dashboard-content">
+          <aside className="sidebar">
+            <FilterPanel filters={filters} onChange={handleFilterChange} />
+          </aside>
+
+          <main className="main-content" ref={scrollRef}>
+            {selectedProducts.size > 0 && (
+              <BulkActions
+                selectedCount={selectedProducts.size}
+                totalValue={formatCurrency(totalValue, currency)}
+                onDelete={handleBulkDelete}
+                onEdit={handleBulkEdit}
+                onExport={handleExport}
+              />
+            )}
+
+            {viewMode === 'analytics' ? (
+              <AnalyticsDashboard data={analyticsData} />
+            ) : (
+              <div className={\`product-grid view-\${viewMode}\`}>
+                {renderProducts()}
+              </div>
+            )}
+
+            {hasMore && <LoadingSpinner className="load-more" />}
+          </main>
+        </div>
+
+        <footer className="dashboard-footer">
+          <p>Showing {products.length} of {totalProducts} products</p>
+          {permissions.includes('admin') && (
+            <p>Selected: {selectedProducts.size} | Total Value: {formatCurrency(totalValue, currency)}</p>
+          )}
+        </footer>
+      </div>
+    </ErrorBoundary>
+  );
+};
+
+export default ProductDashboard;`
+      }];
+
+      const result10k = await executor.executeLLMBatch(largeCode, {
+        inputFields: ['code'],
+        llmProvider: sharedLLMProvider,
+        systemPrompt: 'You are a React expert reviewing production code.',
+        userTask: 'Analyze this React component for performance, best practices, and potential issues.',
+        outputSchema,
+        logPrompts: './test-logs/variable-sizes-10k-prompt.log',
+        logResponses: './test-logs/variable-sizes-10k-response.log'
+      });
+      expect(result10k).toHaveLength(1);
+      expect(result10k[0]).toHaveProperty('analysis');
+      expect(result10k[0]).toHaveProperty('recommendation');
+      console.log(`[Realistic sizes test] Large (~${largeCode[0].code.length} chars): ✓`);
+
+      console.log('[Realistic sizes test] All realistic prompts handled successfully ✓');
+    }, 180000); // 3 minute timeout for larger prompts
   });
 });
