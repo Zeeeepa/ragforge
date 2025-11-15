@@ -57,6 +57,8 @@
   },
   "dependencies": {
     "@google/genai": "^1.28.0",
+    "@langchain/core": "^1.0.5",
+    "@langchain/google-genai": "^1.0.1",
     "@llamaindex/anthropic": "^0.3.26",
     "@llamaindex/google": "^0.3.22",
     "@llamaindex/ollama": "^0.1.23",
@@ -72,7 +74,8 @@
     "llamaindex": "^0.12.0",
     "neo4j-driver": "^5.14.0",
     "p-limit": "^4.0.0",
-    "strip-json-comments": "^5.0.3"
+    "strip-json-comments": "^5.0.3",
+    "uuid": "^9.0.1"
   },
   "devDependencies": {
     "@types/diff": "^5.0.9",

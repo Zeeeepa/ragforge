@@ -14,6 +14,13 @@ import { LuciformXMLParser } from '@luciformresearch/xmlparser';
 import type { EntityContext, EntityField } from '../types/entity-context.js';
 import type { LLMProvider } from '../reranking/llm-provider.js';
 import type { QueryFeedback } from '../reranking/llm-reranker.js';
+import {
+  GeminiNativeToolProvider,
+  type ToolDefinition,
+  type ToolCall,
+  type Message as NativeMessage,
+  type NativeToolCallingProvider,
+} from './native-tool-calling/index.js';
 
 // ===== CORE INTERFACES =====
 
@@ -136,9 +143,44 @@ export interface LLMStructuredCallConfig<TInput = any, TOutput = any> {
   onOverflow?: 'truncate' | 'split' | 'error';
   cache?: boolean | CacheConfig;
 
+  // === TOOL CALLING (NEW) ===
+  tools?: ToolDefinition[];
+  toolMode?: 'global' | 'per-item'; // Default: 'global'
+  maxIterationsPerItem?: number; // For per-item mode, default: 3
+  toolChoice?: 'auto' | 'any' | 'none'; // Default: 'auto'
+  useNativeToolCalling?: boolean; // Default: true
+  nativeToolProvider?: NativeToolCallingProvider; // Provider for native tool calling (global mode only)
+  toolExecutor?: ToolExecutor; // Custom tool executor
+
   // === DEBUGGING ===
   logPrompts?: boolean | string; // true = console, string = file path
   logResponses?: boolean | string; // true = console, string = file path
+}
+
+/**
+ * Tool call request
+ */
+export interface ToolCallRequest {
+  tool_name: string;
+  arguments: Record<string, any>;
+}
+
+/**
+ * Tool execution result
+ */
+export interface ToolExecutionResult {
+  tool_name: string;
+  success: boolean;
+  result?: any;
+  error?: string;
+}
+
+/**
+ * Tool executor interface
+ */
+export interface ToolExecutor {
+  execute(toolCall: ToolCallRequest): Promise<any>;
+  executeBatch(toolCalls: ToolCallRequest[]): Promise<ToolExecutionResult[]>;
 }
 
 /**
@@ -200,6 +242,7 @@ export interface LLMBatchResult<TInput, TOutput, TGlobal = any> {
 export class StructuredLLMExecutor {
   private llmProviders: Map<string, LLMProviderAdapter> = new Map();
   private embeddingProviders: Map<string, EmbeddingProviderAdapter> = new Map();
+  private nativeToolProvider?: GeminiNativeToolProvider;
 
   constructor(
     private defaultLLMConfig?: LLMConfig,
@@ -1738,5 +1781,481 @@ export class StructuredLLMExecutor {
     }
 
     return this.embeddingProviders.get(cacheKey)!;
+  }
+
+  // ===== TOOL CALLING SUPPORT =====
+
+  /**
+   * Execute LLM batch with tool calling support
+   *
+   * Supports two modes:
+   * - 'global' (default): Tool calls once for entire batch, then batch process
+   * - 'per-item': Each item gets its own mini-loop with tool calls
+   */
+  async executeLLMBatchWithTools<TInput, TOutput>(
+    items: TInput[],
+    config: LLMStructuredCallConfig<TInput, TOutput>
+  ): Promise<(TInput & TOutput)[] | LLMBatchResult<TInput, TOutput, any>> {
+    // If no tools provided, fallback to regular batch execution
+    if (!config.tools || config.tools.length === 0) {
+      return this.executeLLMBatch(items, config);
+    }
+
+    const toolMode = config.toolMode ?? 'global';
+
+    console.log(`\n🔧 [StructuredLLMExecutor] Tool calling enabled (${toolMode} mode)`);
+    console.log(`   Tools: ${config.tools.map(t => t.function.name).join(', ')}`);
+
+    if (toolMode === 'global') {
+      return this.executeBatchWithGlobalTools(items, config);
+    } else {
+      return this.executeBatchWithPerItemTools(items, config);
+    }
+  }
+
+  /**
+   * Global tool calling mode:
+   * 1. LLM sees all items
+   * 2. Makes global tool calls
+   * 3. Batch process with tool results
+   */
+  private async executeBatchWithGlobalTools<TInput, TOutput>(
+    items: TInput[],
+    config: LLMStructuredCallConfig<TInput, TOutput>
+  ): Promise<(TInput & TOutput)[] | LLMBatchResult<TInput, TOutput, any>> {
+    console.log(`\n📊 Global tool calling: Analyzing ${items.length} items...`);
+
+    // 1. Request global tool calls
+    const toolCallsResponse = await this.requestGlobalToolCalls(items, config);
+
+    // 2. Execute tools if requested
+    let toolResults: ToolExecutionResult[] = [];
+    if (toolCallsResponse.tool_calls && toolCallsResponse.tool_calls.length > 0) {
+      console.log(`   🔧 Executing ${toolCallsResponse.tool_calls.length} tool(s)...`);
+      toolResults = await this.executeToolCalls(
+        toolCallsResponse.tool_calls,
+        config.toolExecutor
+      );
+
+      const successful = toolResults.filter(r => r.success).length;
+      console.log(`   ✅ Tools executed: ${successful}/${toolResults.length} successful`);
+    } else {
+      console.log(`   ℹ️  No tool calls needed`);
+    }
+
+    // 3. Batch process with tool results
+    console.log(`\n📦 Batch processing ${items.length} items with tool context...`);
+    return this.batchProcessWithToolResults(items, toolResults, config);
+  }
+
+  /**
+   * Per-item tool calling mode:
+   * Each item gets its own mini-loop
+   */
+  private async executeBatchWithPerItemTools<TInput, TOutput>(
+    items: TInput[],
+    config: LLMStructuredCallConfig<TInput, TOutput>
+  ): Promise<(TInput & TOutput)[] | LLMBatchResult<TInput, TOutput, any>> {
+    const maxIterations = config.maxIterationsPerItem ?? 3;
+    console.log(`\n🔁 Per-item tool calling: Processing ${items.length} items (max ${maxIterations} iterations each)...`);
+
+    const results: (TInput & TOutput)[] = [];
+
+    for (let i = 0; i < items.length; i++) {
+      console.log(`\n   Item ${i + 1}/${items.length}:`);
+      const result = await this.processItemWithTools(items[i], config, maxIterations);
+      results.push(result);
+    }
+
+    console.log(`\n✅ All items processed`);
+
+    // Return in same format as executeLLMBatch
+    if (config.globalSchema) {
+      return {
+        items: results,
+        globalMetadata: undefined, // No global metadata in per-item mode
+      };
+    }
+
+    return results;
+  }
+
+  /**
+   * Process single item with tool loop
+   */
+  private async processItemWithTools<TInput, TOutput>(
+    item: TInput,
+    config: LLMStructuredCallConfig<TInput, TOutput>,
+    maxIterations: number
+  ): Promise<TInput & TOutput> {
+    let iteration = 0;
+    let toolContext: ToolExecutionResult[] = [];
+
+    while (iteration < maxIterations) {
+      iteration++;
+      console.log(`      Iteration ${iteration}...`);
+
+      // Call LLM with item + tool context
+      const response = await this.callLLMForItemWithTools(item, toolContext, config);
+
+      // Check if we have tool calls
+      if (response.tool_calls && response.tool_calls.length > 0) {
+        console.log(`      → ${response.tool_calls.length} tool call(s)`);
+
+        // Execute tools
+        const toolResults = await this.executeToolCalls(
+          response.tool_calls,
+          config.toolExecutor
+        );
+
+        toolContext.push(...toolResults);
+      } else if (response.output) {
+        // We have final output
+        console.log(`      → Final output`);
+        return { ...item, ...response.output } as TInput & TOutput;
+      } else {
+        throw new Error(`Item iteration ${iteration}: LLM returned neither tool_calls nor output`);
+      }
+    }
+
+    throw new Error(`Max iterations (${maxIterations}) reached without final output`);
+  }
+
+  /**
+   * Request global tool calls for entire batch
+   */
+  private async requestGlobalToolCalls<TInput>(
+    items: TInput[],
+    config: LLMStructuredCallConfig<TInput, any>
+  ): Promise<{ tool_calls?: ToolCallRequest[] }> {
+    // Build prompt with all items
+    const prompt = this.buildGlobalToolCallPrompt(items, config);
+    const systemPrompt = this.buildSystemPromptWithTools(config.tools!);
+
+    // Use native tool calling if available (preferred)
+    const useNative = config.useNativeToolCalling !== false; // Default: true
+    if (useNative && config.nativeToolProvider) {
+      console.log('🔧 Using native tool calling (global mode)');
+      return await this.requestGlobalToolCallsNative(
+        items,
+        config,
+        systemPrompt,
+        prompt
+      );
+    }
+
+    // Fallback to XML-based tool calling
+    console.log('🔧 Using XML-based tool calling (global mode)');
+    const result = await this.executeLLMBatch<any, { tool_calls?: ToolCallRequest[] }>(
+      [{ items }],
+      {
+        inputFields: ['items'],
+        systemPrompt,
+        userTask: prompt,
+        outputSchema: {
+          tool_calls: {
+            type: 'array',
+            description: 'Tools to call before processing batch (leave empty if you have enough information)',
+            required: false,
+            items: {
+              type: 'object',
+              description: 'Tool call',
+              properties: {
+                tool_name: {
+                  type: 'string',
+                  description: 'Name of the tool to call',
+                  required: true,
+                },
+                arguments: {
+                  type: 'object',
+                  description: 'Tool arguments as key-value pairs',
+                  required: true,
+                },
+              },
+            },
+          },
+        },
+        outputFormat: 'xml',
+        llmProvider: config.llmProvider,
+        batchSize: 1,
+      }
+    );
+
+    const response = Array.isArray(result) ? result[0] : result.items[0];
+    return response || { tool_calls: [] };
+  }
+
+  /**
+   * Request global tool calls using native tool calling
+   */
+  private async requestGlobalToolCallsNative<TInput>(
+    items: TInput[],
+    config: LLMStructuredCallConfig<TInput, any>,
+    systemPrompt: string,
+    userPrompt: string
+  ): Promise<{ tool_calls?: ToolCallRequest[] }> {
+    const messages: NativeMessage[] = [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ];
+
+    const response = await config.nativeToolProvider!.generateWithTools(
+      messages,
+      config.tools!,
+      {
+        toolChoice: config.toolChoice as any,
+        temperature: 0.1,
+      }
+    );
+
+    // Convert native ToolCall[] to our ToolCallRequest[] format
+    if (response.toolCalls && response.toolCalls.length > 0) {
+      const toolCalls: ToolCallRequest[] = response.toolCalls.map((tc: ToolCall) => ({
+        tool_name: tc.function.name,
+        arguments: JSON.parse(tc.function.arguments),
+      }));
+      return { tool_calls: toolCalls };
+    }
+
+    return { tool_calls: [] };
+  }
+
+  /**
+   * Build prompt for global tool call request
+   */
+  private buildGlobalToolCallPrompt<TInput>(
+    items: TInput[],
+    config: LLMStructuredCallConfig<TInput, any>
+  ): string {
+    const inputFields = config.inputFields || [];
+
+    const itemsStr = items
+      .map((item, i) => {
+        const fields = inputFields
+          .map(field => {
+            const fieldName = typeof field === 'string' ? field : field.name;
+            const value = (item as any)[fieldName];
+            return `  ${fieldName}: ${this.formatValue(value)}`;
+          })
+          .join('\n');
+        return `Item ${i + 1}:\n${fields}`;
+      })
+      .join('\n\n');
+
+    return `${config.userTask || 'Analyze the following items'}
+
+Items to process (${items.length} total):
+${itemsStr}
+
+Look at ALL items and decide if you need to call any tools to gather additional information before processing them.
+If you need tools, return the tool_calls array with the tools you want to call.
+If you already have enough information to process all items, return an empty tool_calls array.`;
+  }
+
+  /**
+   * Build system prompt with tool descriptions
+   */
+  private buildSystemPromptWithTools(tools: ToolDefinition[]): string {
+    const toolsDesc = tools
+      .map(
+        t => `- ${t.function.name}: ${t.function.description}
+  Parameters: ${JSON.stringify(t.function.parameters, null, 2)}`
+      )
+      .join('\n\n');
+
+    return `You are an AI assistant with access to tools.
+
+Available tools:
+${toolsDesc}
+
+Use tools when you need additional information to complete the task.
+Call tools strategically - only when the information is truly needed.`;
+  }
+
+  /**
+   * Call LLM for single item with tool context
+   */
+  private async callLLMForItemWithTools<TInput, TOutput>(
+    item: TInput,
+    toolContext: ToolExecutionResult[],
+    config: LLMStructuredCallConfig<TInput, TOutput>
+  ): Promise<{ output?: TOutput; tool_calls?: ToolCallRequest[] }> {
+    // Build task with tool context
+    const taskWithContext = toolContext.length > 0
+      ? this.buildTaskWithToolResults(config.userTask ?? '', toolContext)
+      : config.userTask ?? '';
+
+    // Create combined schema: either output OR tool_calls
+    const combinedSchema: any = {
+      ...config.outputSchema,
+      tool_calls: {
+        type: 'array',
+        description: 'Tools to call if you need more information. Leave an empty array if you can provide the final output.',
+        required: false,
+        items: {
+          type: 'object',
+          properties: {
+            tool_name: { type: 'string', required: true },
+            arguments: { type: 'object', required: true },
+          },
+        },
+      },
+    };
+
+    // Call LLM
+    const { customMerge, tools, toolMode, maxIterationsPerItem, toolChoice, useNativeToolCalling, nativeToolProvider, toolExecutor, ...restConfig } = config;
+    const result = await this.executeLLMBatch<TInput, TOutput & { tool_calls?: ToolCallRequest[] }>(
+      [item],
+      {
+        ...restConfig,
+        userTask: taskWithContext,
+        outputSchema: combinedSchema,
+        systemPrompt: config.tools && config.tools.length > 0
+          ? this.buildSystemPromptWithTools(config.tools)
+          : config.systemPrompt,
+      }
+    );
+
+    const response = Array.isArray(result) ? result[0] : result.items[0];
+
+    // Debug logging
+    console.log('      [DEBUG] Raw response:', JSON.stringify(response, null, 2).substring(0, 500));
+
+    // Separate output from tool_calls
+    const { tool_calls, ...output } = response as any;
+
+    // Filter and validate tool_calls
+    const validToolCalls: ToolCallRequest[] = [];
+    if (tool_calls && Array.isArray(tool_calls)) {
+      for (const tc of tool_calls) {
+        // Skip empty strings or invalid objects
+        if (typeof tc === 'string' && tc.trim() === '') {
+          continue;
+        }
+        if (typeof tc === 'object' && tc.tool_name && tc.arguments) {
+          validToolCalls.push(tc);
+        }
+      }
+    }
+
+    // If we have valid tool_calls, return them
+    if (validToolCalls.length > 0) {
+      console.log('      [DEBUG] Returning tool calls:', validToolCalls);
+      return { tool_calls: validToolCalls };
+    }
+
+    // Otherwise return the output
+    console.log('      [DEBUG] Returning output (no valid tool calls)');
+    return { output: output as TOutput };
+  }
+
+  /**
+   * Execute tool calls
+   */
+  private async executeToolCalls(
+    toolCalls: ToolCallRequest[],
+    toolExecutor?: ToolExecutor
+  ): Promise<ToolExecutionResult[]> {
+    if (toolExecutor) {
+      return toolExecutor.executeBatch(toolCalls);
+    }
+
+    // Default: mock execution
+    console.warn('   ⚠️  No toolExecutor provided, using mock execution');
+    return toolCalls.map(tc => ({
+      tool_name: tc.tool_name,
+      success: true,
+      result: { mock: true, tool: tc.tool_name, arguments: tc.arguments },
+    }));
+  }
+
+  /**
+   * Batch process items with tool results
+   */
+  private async batchProcessWithToolResults<TInput, TOutput>(
+    items: TInput[],
+    toolResults: ToolExecutionResult[],
+    config: LLMStructuredCallConfig<TInput, TOutput>
+  ): Promise<(TInput & TOutput)[] | LLMBatchResult<TInput, TOutput, any>> {
+    // Build enhanced user task with tool results
+    const enhancedTask = this.buildTaskWithToolResults(config.userTask ?? '', toolResults);
+
+    // Execute regular batch with enhanced context
+    return this.executeLLMBatch(items, {
+      ...config,
+      userTask: enhancedTask,
+    });
+  }
+
+  /**
+   * Build task with tool results context
+   */
+  private buildTaskWithToolResults(originalTask: string, toolResults: ToolExecutionResult[]): string {
+    if (toolResults.length === 0) {
+      return originalTask;
+    }
+
+    const resultsStr = toolResults
+      .filter(r => r.success)
+      .map((r, i) => {
+        const resultStr = typeof r.result === 'object'
+          ? JSON.stringify(r.result, null, 2)
+          : String(r.result);
+        return `Tool ${i + 1}: ${r.tool_name}\nResult: ${resultStr}`;
+      })
+      .join('\n\n');
+
+    return `${originalTask}
+
+Tool Results Available:
+${resultsStr}
+
+Use these tool results to enhance your analysis of each item.`;
+  }
+
+  /**
+   * Estimate response tokens for a batch based on output schema
+   */
+  private estimateResponseTokensForBatch(
+    itemCount: number,
+    outputSchema: OutputSchema<any>,
+    globalSchema?: OutputSchema<any>
+  ): number {
+    // Estimate tokens per item based on schema fields
+    const fieldsPerItem = Object.keys(outputSchema).length;
+    const tokensPerField = 50; // Average tokens per field
+    const tokensPerItem = fieldsPerItem * tokensPerField;
+
+    // Add global schema if present
+    const globalTokens = globalSchema ? Object.keys(globalSchema).length * tokensPerField : 0;
+
+    // Total: items + global + XML overhead
+    return (itemCount * tokensPerItem) + globalTokens + 100;
+  }
+
+  /**
+   * Estimate cost based on provider/model token pricing
+   */
+  private estimateCost(
+    promptTokens: number,
+    responseTokens: number,
+    provider: string,
+    model?: string
+  ): number {
+    // Simplified cost estimation (USD per 1M tokens)
+    // These are rough estimates - actual pricing varies
+    const pricing: Record<string, { input: number; output: number }> = {
+      'gemini': { input: 0.35, output: 1.05 }, // Gemini 1.5 Pro
+      'openai': { input: 10, output: 30 }, // GPT-4 Turbo
+      'anthropic': { input: 3, output: 15 }, // Claude 3.5 Sonnet
+      'ollama': { input: 0, output: 0 }, // Local, free
+    };
+
+    const rates = pricing[provider.toLowerCase()] || { input: 1, output: 3 };
+
+    const inputCost = (promptTokens / 1_000_000) * rates.input;
+    const outputCost = (responseTokens / 1_000_000) * rates.output;
+
+    return inputCost + outputCost;
   }
 }

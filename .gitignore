@@ -45,3 +45,6 @@ coverage/
 tmp/
 temp/
 *.tmp
+
+# LangChain.js clone (for extraction reference)
+langchainjs/

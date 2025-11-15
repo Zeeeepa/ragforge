@@ -180,7 +180,33 @@ export async function parseQuickstartOptions(args: string[]): Promise<Quickstart
     throw new Error(`Invalid --source-type: ${options.sourceType}. Must be one of: code, documents, chat`);
   }
 
-  const geminiKey = getEnv(['GEMINI_API_KEY'], true);
+  // Get Gemini API key - in dev mode, try monorepo .env if not found locally
+  let geminiKey = getEnv(['GEMINI_API_KEY'], true);
+
+  if (!geminiKey && options.dev) {
+    // Try to find it in the monorepo .env
+    try {
+      const pathname = new URL(import.meta.url).pathname;
+      const distEsmDir = path.dirname(path.dirname(pathname));
+      const ragforgeRoot = path.resolve(distEsmDir, '../../../..');
+      const monorepoEnvPath = path.join(ragforgeRoot, '.env');
+
+      // Check if monorepo .env exists
+      try {
+        await fs.access(monorepoEnvPath);
+        const envContent = await fs.readFile(monorepoEnvPath, 'utf-8');
+        const match = envContent.match(/^GEMINI_API_KEY=(.+)$/m);
+        if (match) {
+          geminiKey = match[1].trim();
+          console.log('✓ Using GEMINI_API_KEY from monorepo .env (dev mode)');
+        }
+      } catch {
+        // Monorepo .env doesn't exist, that's ok
+      }
+    } catch (error) {
+      // Failed to read monorepo .env, continue without it
+    }
+  }
 
   // Merge language and adapter (backward compat)
   const finalLanguage = options.language || options.adapter;
@@ -630,7 +656,8 @@ export async function runQuickstart(options: QuickstartOptions): Promise<void> {
   let neo4jUri = getEnv(['NEO4J_URI'], true) || 'bolt://localhost:7687';
   const neo4jUsername = getEnv(['NEO4J_USERNAME'], true) || 'neo4j';
   const neo4jDatabase = getEnv(['NEO4J_DATABASE'], true) || 'neo4j';
-  const geminiKey = getEnv(['GEMINI_API_KEY'], true);
+  // Use geminiKey from options (might be from monorepo .env in dev mode)
+  const geminiKey = options.geminiKey || getEnv(['GEMINI_API_KEY'], true);
 
   // IMPORTANT: Reload password from env after writing .env file
   // The password might have been generated and written to .env, so we need to read it back

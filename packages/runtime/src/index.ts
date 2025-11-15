@@ -63,7 +63,10 @@ export type {
   LLMConfig,
   FallbackConfig,
   CacheConfig,
-  ItemEvaluation
+  ItemEvaluation,
+  ToolCallRequest,
+  ToolExecutionResult,
+  ToolExecutor
   // Note: QueryFeedback is already exported from llm-reranker
 } from './llm/structured-llm-executor.js';
 
@@ -77,6 +80,9 @@ export type {
   LLMProviderConfig as LlamaIndexLLMConfig,
   EmbeddingProviderConfig as LlamaIndexEmbeddingConfig
 } from './llm/provider-adapter.js';
+
+// Native Tool Calling
+export * from './llm/native-tool-calling/index.js';
 
 // Summarization
 export { GenericSummarizer } from './summarization/generic-summarizer.js';

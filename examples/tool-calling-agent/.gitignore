@@ -1,0 +1,16 @@
+# Environment
+.env
+
+# Dependencies
+node_modules/
+
+# Logs
+logs/
+*.log
+
+# Database backups
+*.dump
+*.cypher
+
+# Generated at runtime
+prompts/*.txt
