@@ -183,7 +183,7 @@ Your job is to answer questions about a codebase by using the available tools.`;
   console.log('─'.repeat(80));
 
   // 4. Display feedback (if present)
-  const feedback = (response as any).tool_feedback;
+  const feedback = response.tool_feedback;
 
   if (feedback) {
     console.log('\n' + '═'.repeat(80));

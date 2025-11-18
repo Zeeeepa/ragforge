@@ -1402,8 +1402,18 @@ export class StructuredLLMExecutor {
           if (value === undefined && item.children) {
             const childEl = item.children.find((c: any) => c.type === 'element' && c.name === fieldName);
             if (childEl) {
-              // Extract text content from child elements
-              value = this.getTextContentFromElement(childEl);
+              // Handle arrays of objects recursively
+              if (fieldSchema.type === 'array' && fieldSchema.items) {
+                value = this.parseArrayFromElement(childEl, fieldSchema.items);
+              }
+              // Handle nested objects recursively
+              else if (fieldSchema.type === 'object' && fieldSchema.properties) {
+                value = this.parseObjectFromElement(childEl, fieldSchema.properties);
+              }
+              // Simple types: extract text
+              else {
+                value = this.getTextContentFromElement(childEl);
+              }
             }
           }
 
@@ -1440,40 +1450,19 @@ export class StructuredLLMExecutor {
           );
 
           if (globalEl) {
-            // Extract value from element
-            const value = this.getTextContentFromElement(globalEl);
-            if (value) {
-              globalMetadata[fieldName] = this.convertValue(value, fieldSchema);
+            // Handle arrays of objects recursively
+            if (fieldSchema.type === 'array' && fieldSchema.items) {
+              globalMetadata[fieldName] = this.parseArrayFromElement(globalEl, fieldSchema.items);
             }
-
-            // Also check for nested elements (like <suggestion> inside <feedback>)
-            if (globalEl.children) {
-              const nestedItems = globalEl.children.filter((c: any) => c.type === 'element');
-              if (nestedItems.length > 0 && fieldSchema.type === 'array') {
-                // Array of nested elements
-                globalMetadata[fieldName] = nestedItems.map((el: any) => {
-                  const obj: any = {};
-
-                  // Extract attributes
-                  if (el.attributes) {
-                    const attrs = el.attributes;
-                    if (attrs instanceof Map) {
-                      attrs.forEach((value, key) => {
-                        obj[key] = value;
-                      });
-                    } else {
-                      Object.assign(obj, attrs);
-                    }
-                  }
-
-                  // Extract text content
-                  const text = this.getTextContentFromElement(el);
-                  if (text && !obj.description) {
-                    obj.description = text;
-                  }
-
-                  return obj;
-                });
+            // Handle nested objects recursively
+            else if (fieldSchema.type === 'object' && fieldSchema.properties) {
+              globalMetadata[fieldName] = this.parseObjectFromElement(globalEl, fieldSchema.properties);
+            }
+            // Simple types: extract text and convert
+            else {
+              const value = this.getTextContentFromElement(globalEl);
+              if (value) {
+                globalMetadata[fieldName] = this.convertValue(value, fieldSchema);
               }
             }
           }
@@ -1503,6 +1492,101 @@ export class StructuredLLMExecutor {
     }
 
     return '';
+  }
+
+  /**
+   * Parse array field from XML element
+   * Handles nested structures like:
+   * <tool_calls>
+   *   <tool_call>
+   *     <tool_name>query_entities</tool_name>
+   *     <arguments>{"limit": 10}</arguments>
+   *   </tool_call>
+   * </tool_calls>
+   */
+  private parseArrayFromElement(
+    element: any,
+    itemSchema: OutputFieldSchema
+  ): any[] {
+    if (!element || !element.children) return [];
+
+    // Find all child elements (excluding text nodes)
+    const childElements = element.children.filter(
+      (c: any) => c.type === 'element'
+    );
+
+    if (childElements.length === 0) {
+      // No nested elements, try parsing as JSON string or comma-separated
+      const textContent = this.getTextContentFromElement(element);
+      if (!textContent) return [];
+
+      try {
+        return JSON.parse(textContent);
+      } catch {
+        return textContent.split(',').map(s => s.trim());
+      }
+    }
+
+    // Parse each child element based on itemSchema
+    return childElements.map((childEl: any) => {
+      if (itemSchema.type === 'object' && itemSchema.properties) {
+        // Parse object recursively
+        return this.parseObjectFromElement(childEl, itemSchema.properties);
+      } else if (itemSchema.type === 'string') {
+        return this.getTextContentFromElement(childEl);
+      } else if (itemSchema.type === 'number') {
+        return parseFloat(this.getTextContentFromElement(childEl));
+      } else if (itemSchema.type === 'boolean') {
+        const text = this.getTextContentFromElement(childEl).toLowerCase();
+        return text === 'true' || text === '1';
+      } else {
+        // Unknown type, return text content
+        return this.getTextContentFromElement(childEl);
+      }
+    });
+  }
+
+  /**
+   * Parse object from XML element
+   * Extracts properties based on schema
+   */
+  private parseObjectFromElement(
+    element: any,
+    properties: Record<string, OutputFieldSchema>
+  ): any {
+    const obj: any = {};
+
+    for (const [propName, propSchema] of Object.entries(properties)) {
+      // Try attribute first
+      let value = element.attributes?.get?.(propName) || element.attributes?.[propName];
+
+      // Then try child element
+      if (value === undefined && element.children) {
+        const childEl = element.children.find(
+          (c: any) => c.type === 'element' && c.name === propName
+        );
+
+        if (childEl) {
+          if (propSchema.type === 'array' && propSchema.items) {
+            value = this.parseArrayFromElement(childEl, propSchema.items);
+          } else if (propSchema.type === 'object' && propSchema.properties) {
+            value = this.parseObjectFromElement(childEl, propSchema.properties);
+          } else {
+            value = this.getTextContentFromElement(childEl);
+          }
+        }
+      }
+
+      if (value !== undefined) {
+        obj[propName] = this.convertValue(value, propSchema);
+      } else if (propSchema.default !== undefined) {
+        obj[propName] = propSchema.default;
+      } else if (propSchema.required) {
+        console.warn(`Required property "${propName}" missing in nested object`);
+      }
+    }
+
+    return obj;
   }
 
   /**

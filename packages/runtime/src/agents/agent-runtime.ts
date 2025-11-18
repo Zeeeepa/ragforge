@@ -155,6 +155,7 @@ export class AgentRuntime {
     // 3. Agent loop: iterate until we get a final answer
     let iteration = 0;
     let finalAnswer: string | null = null;
+    let lastToolFeedback: import('../types/chat.js').ToolFeedback | undefined = undefined;
 
     console.log(`\n🤖 Agent starting (session: ${sessionId})`);
     console.log(`   Query: "${userMessage.content}"`);
@@ -170,6 +171,14 @@ export class AgentRuntime {
       const llmResponse = await this.callLLMWithTools(context);
 
       console.log(`Reasoning: ${llmResponse.reasoning}`);
+
+      // Capture tool_feedback if present (from debug mode)
+      if (llmResponse.tool_feedback) {
+        lastToolFeedback = llmResponse.tool_feedback;
+        if (this.config.debug?.verbose_logging) {
+          console.log(`🐛 Tool feedback received`);
+        }
+      }
 
       if (llmResponse.tool_calls && llmResponse.tool_calls.length > 0) {
         // LLM requested tool calls
@@ -209,8 +218,8 @@ export class AgentRuntime {
 
     console.log(`\n✅ Agent complete (${iteration} iterations, ${context.toolExecutions.length} tool executions)\n`);
 
-    // 4. Create agent message with all tool executions
-    return this.createAgentMessage(sessionId, finalAnswer!, context.toolExecutions);
+    // 4. Create agent message with all tool executions and feedback
+    return this.createAgentMessage(sessionId, finalAnswer!, context.toolExecutions, lastToolFeedback);
   }
 
   // ============================================
@@ -775,7 +784,8 @@ Description: ${tool.description}`;
   private createAgentMessage(
     sessionId: string,
     content: string,
-    toolExecutions: ToolExecution[]
+    toolExecutions: ToolExecution[],
+    toolFeedback?: import('../types/chat.js').ToolFeedback
   ): Message {
     // Flatten all tool calls from all iterations
     const allToolCalls: ToolCall[] = toolExecutions.flatMap((exec) =>
@@ -794,6 +804,7 @@ Description: ${tool.description}`;
       sentBy: this.config.id,
       timestamp: new Date(),
       toolCalls: allToolCalls.length > 0 ? allToolCalls : undefined,
+      tool_feedback: toolFeedback, // Include feedback when debug mode enabled
     };
   }
 

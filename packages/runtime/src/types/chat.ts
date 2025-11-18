@@ -28,6 +28,7 @@ export interface Message {
   timestamp: Date;
   tokens?: number;
   toolCalls?: ToolCall[];
+  tool_feedback?: ToolFeedback; // Feedback about tool usage (when debug mode enabled)
   metadata?: Record<string, any>;
 }
 

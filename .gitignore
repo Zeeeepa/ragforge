@@ -3,6 +3,9 @@
 .env.local
 .env.*.local
 
+# Luciform XMLL Parser
+LR_XMLParser
+
 # Secrets
 secrets/
 *.key
