@@ -305,7 +305,7 @@ export class GeminiAPIProvider implements LLMProvider {
   /**
    * Create a default provider using environment variables
    */
-  static fromEnv(model: string = 'gemma-3n-e2b-it'): GeminiAPIProvider {
+  static fromEnv(model: string = 'gemini-2.0-flash'): GeminiAPIProvider {
     const apiKey = process.env.GEMINI_API_KEY;
 
     if (!apiKey) {

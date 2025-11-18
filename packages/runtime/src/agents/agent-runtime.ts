@@ -74,6 +74,8 @@ interface LLMResponse {
   reasoning: string;
   tool_calls?: ToolCallRequest[];
   answer?: string;
+  // NEW: Tool feedback (only when debug mode enabled)
+  tool_feedback?: import('../types/chat.js').ToolFeedback;
 }
 
 // ============================================
@@ -219,10 +221,16 @@ export class AgentRuntime {
    * Call LLM with current context and available tools
    *
    * Uses native tool calling if available, otherwise falls back to StructuredLLMExecutor
+   * NOTE: When debug mode is enabled, always uses StructuredLLMExecutor to support tool_feedback
    */
   private async callLLMWithTools(
     context: ConversationContext
   ): Promise<LLMResponse> {
+    // When debug mode enabled, must use StructuredLLMExecutor (native tool calling doesn't support custom fields)
+    if (this.isDebugModeEnabled()) {
+      return this.callLLMWithStructuredExecutor(context);
+    }
+
     // Try native tool calling first
     if (this.nativeToolProvider) {
       try {
@@ -286,46 +294,14 @@ export class AgentRuntime {
     // Build user task with full context
     const userTask = this.buildUserTaskWithContext(context);
 
-    // Call StructuredLLMExecutor
+    // Call StructuredLLMExecutor with dynamic schema (includes tool_feedback in debug mode)
     const result = await this.executor.executeLLMBatch<any, LLMResponse>(
       [{ context: 'see_task' }], // Placeholder, context is in userTask
       {
         inputFields: ['context'],
         systemPrompt,
         userTask,
-        outputSchema: {
-          reasoning: {
-            type: 'string',
-            description: 'Your reasoning about the next step',
-            required: true,
-          },
-          tool_calls: {
-            type: 'array',
-            description: 'Tools to execute (if you need more information)',
-            required: false,
-            items: {
-              type: 'object',
-              description: 'Tool call',
-              properties: {
-                tool_name: {
-                  type: 'string',
-                  description: 'Name of the tool to call',
-                  required: true,
-                },
-                arguments: {
-                  type: 'object',
-                  description: 'Tool arguments as key-value pairs',
-                  required: true,
-                },
-              },
-            },
-          },
-          answer: {
-            type: 'string',
-            description: 'Final answer (if you have enough information)',
-            required: false,
-          },
-        },
+        outputSchema: this.buildOutputSchema(),
         outputFormat: 'xml',
         llmProvider: this.llmProvider,
         batchSize: 1,
@@ -336,6 +312,130 @@ export class AgentRuntime {
   }
 
   /**
+   * Build output schema (includes tool_feedback when debug mode enabled)
+   */
+  private buildOutputSchema(): any {
+    const schema: any = {
+      reasoning: {
+        type: 'string',
+        description: 'Your reasoning about the next step',
+        required: true,
+      },
+      tool_calls: {
+        type: 'array',
+        description: 'Tools to execute (if you need more information)',
+        required: false,
+        items: {
+          type: 'object',
+          description: 'Tool call',
+          properties: {
+            tool_name: {
+              type: 'string',
+              description: 'Name of the tool to call',
+              required: true,
+            },
+            arguments: {
+              type: 'object',
+              description: 'Tool arguments as key-value pairs',
+              required: true,
+            },
+          },
+        },
+      },
+      answer: {
+        type: 'string',
+        description: 'Final answer (if you have enough information)',
+        required: false,
+      },
+    };
+
+    // Add tool_feedback field if debug mode is enabled
+    if (this.isDebugModeEnabled()) {
+      schema.tool_feedback = {
+        type: 'object',
+        description: 'Structured feedback about tool usage, limitations, and suggestions',
+        required: false,
+        properties: {
+          tools_used: {
+            type: 'array',
+            required: true,
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string', required: true },
+                purpose: { type: 'string', required: true },
+                success: { type: 'boolean', required: true },
+                result_quality: { type: 'string', required: false }
+              }
+            }
+          },
+          tools_considered: {
+            type: 'array',
+            required: false,
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string', required: true },
+                reason_not_used: { type: 'string', required: true }
+              }
+            }
+          },
+          limitations: {
+            type: 'array',
+            required: false,
+            items: {
+              type: 'object',
+              properties: {
+                description: { type: 'string', required: true },
+                impact: { type: 'string', required: true },
+                missing_capability: { type: 'string', required: false }
+              }
+            }
+          },
+          suggestions: {
+            type: 'array',
+            required: false,
+            items: {
+              type: 'object',
+              properties: {
+                type: { type: 'string', required: true },
+                priority: { type: 'string', required: true },
+                description: { type: 'string', required: true },
+                tool_spec: { type: 'object', required: false },
+                config_change: { type: 'object', required: false }
+              }
+            }
+          },
+          alternatives: {
+            type: 'array',
+            required: false,
+            items: {
+              type: 'object',
+              properties: {
+                approach: { type: 'string', required: true },
+                pros: { type: 'array', required: true },
+                cons: { type: 'array', required: true },
+                requires: { type: 'array', required: false }
+              }
+            }
+          },
+          answer_quality: {
+            type: 'object',
+            required: true,
+            properties: {
+              completeness: { type: 'number', required: true },
+              confidence: { type: 'number', required: true },
+              notes: { type: 'string', required: false }
+            }
+          }
+        }
+      };
+    }
+
+    return schema;
+  }
+
+  /**
    * Build system prompt with tool descriptions
    */
   private buildSystemPromptWithTools(): string {
@@ -343,7 +443,7 @@ export class AgentRuntime {
       .map((name) => this.tools.get(name))
       .filter((t): t is Tool => t !== undefined);
 
-    return `${this.config.systemPrompt}
+    let prompt = `${this.config.systemPrompt}
 
 Available Tools:
 ${tools.map((t) => this.formatToolDescription(t)).join('\n\n')}
@@ -354,6 +454,91 @@ Instructions:
 - You can call multiple tools in one iteration
 - Once you have enough information, provide the final answer
 - Keep iterating until you can provide a complete answer`;
+
+    // Add debug instructions if enabled
+    if (this.isDebugModeEnabled()) {
+      prompt += this.getDebugModeInstructions();
+    }
+
+    return prompt;
+  }
+
+  /**
+   * Check if debug mode is enabled
+   */
+  private isDebugModeEnabled(): boolean {
+    return this.config.debug?.enabled === true &&
+           this.config.debug?.tool_feedback?.enabled === true;
+  }
+
+  /**
+   * Get debug mode instructions to append to system prompt
+   */
+  private getDebugModeInstructions(): string {
+    const feedbackConfig = this.config.debug?.tool_feedback;
+
+    return `
+
+## 🐛 DEBUG MODE ACTIVE
+
+In addition to answering the query, provide structured feedback about your tool usage.
+
+Include these sections in your response:
+
+${feedbackConfig?.include_reasoning !== false ? `
+### Tools Used
+For each tool you called, explain:
+- name: Tool name
+- purpose: Why you chose this tool
+- success: Did it work as expected?
+- result_quality: How good were the results? (excellent/good/partial/failed)
+` : ''}
+
+${feedbackConfig?.include_limitations !== false ? `
+### Limitations
+If you encountered any limitations, describe:
+- description: What you couldn't do
+- impact: How critical is this? (critical/high/medium/low)
+- missing_capability: What's missing? (tool/field/operator/relationship)
+
+Be specific. For example:
+❌ "I need better tools"
+✅ "Cannot filter by line_count - no numeric comparison operators available"
+` : ''}
+
+${feedbackConfig?.include_suggestions !== false ? `
+### Suggestions
+Recommend specific improvements:
+- type: What kind of improvement? (new_tool/expose_field/add_relationship/improve_existing)
+- priority: How important? (critical/high/medium/low)
+- description: Detailed explanation
+- tool_spec (if new_tool): {name, purpose, parameters}
+- config_change (if expose_field): {entity, change, example}
+
+For example:
+✅ "A number_range_search tool would allow filtering by line_count with operators: gt, lt, between, approximately"
+` : ''}
+
+${feedbackConfig?.include_alternatives !== false ? `
+### Alternatives (optional)
+If there are other ways to answer the query:
+- approach: Description
+- pros: Advantages
+- cons: Disadvantages
+- requires: What would be needed
+` : ''}
+
+### Answer Quality
+Assess your answer:
+- completeness: 0-100% (how complete is the answer?)
+- confidence: 0-100% (how confident are you?)
+- notes: Additional context
+
+IMPORTANT:
+1. Always provide the BEST answer possible with current tools
+2. Then add feedback to explain limitations and suggest improvements
+3. Be honest about what you can and cannot do
+4. Make suggestions specific and actionable`;
   }
 
   /**
@@ -464,6 +649,7 @@ Description: ${tool.description}`;
             result,
           };
         } catch (error: any) {
+          console.error(`   ❌ Tool ${tc.tool_name} failed:`, error.message);
           return {
             tool_name: tc.tool_name,
             success: false,
@@ -551,25 +737,29 @@ Description: ${tool.description}`;
       }
 
       // Convert to OpenAI-style tool definition
+      // Use inputSchema if available (for complex schemas with arrays/objects)
+      // Otherwise fall back to simple parameter conversion
+      const parameters = tool.inputSchema || {
+        type: "object",
+        properties: Object.fromEntries(
+          tool.parameters.map(p => [
+            p.name,
+            {
+              type: p.type,
+              description: p.description,
+              ...(p.default !== undefined ? { default: p.default } : {}),
+            },
+          ])
+        ),
+        required: tool.parameters.filter(p => p.required).map(p => p.name),
+      };
+
       return {
         type: "function",
         function: {
           name: tool.name,
           description: tool.description,
-          parameters: {
-            type: "object",
-            properties: Object.fromEntries(
-              tool.parameters.map(p => [
-                p.name,
-                {
-                  type: p.type,
-                  description: p.description,
-                  ...(p.default !== undefined ? { default: p.default } : {}),
-                },
-              ])
-            ),
-            required: tool.parameters.filter(p => p.required).map(p => p.name),
-          },
+          parameters,
         },
       };
     });

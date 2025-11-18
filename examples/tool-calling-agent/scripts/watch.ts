@@ -35,6 +35,16 @@ const watchConfig = {
   onBatchComplete: (stats) => {
     console.log(`✅ Batch complete: ${stats.created + stats.updated} scope(s) updated`);
     
+    // Auto-generate embeddings for dirty scopes only
+    if (stats.created + stats.updated > 0) {
+      console.log('🔢 Generating embeddings for modified scopes...');
+      spawn('npm', ['run', 'embeddings:generate', '--', '--only-dirty'], {
+        cwd: projectRoot,
+        stdio: 'inherit',
+        shell: true
+      });
+    }
+    
   },
   onBatchError: (error) => {
     console.error('❌ Batch failed:', error);

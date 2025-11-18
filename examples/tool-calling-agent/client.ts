@@ -96,6 +96,37 @@ export class RagClient {
   }
 
   /**
+   * Generic query API - Start a query for any entity type
+   *
+   * @example
+   * const results = await client.get('Scope')
+   *   .where('complexity', '>', 5)
+   *   .semanticSearch('code_embeddings', 'authentication logic')
+   *   .limit(10)
+   *   .execute();
+   */
+  get<T = any>(entity: string) {
+    return this.runtime.get<T>(entity);
+  }
+
+  /**
+   * Register a custom filter for use with .filter()
+   *
+   * @example
+   * client.registerFilter('complexityGt5', 'n.complexity > 5');
+   */
+  registerFilter(name: string, cypherCondition: string, paramNames?: string[]) {
+    return this.runtime.registerFilter(name, cypherCondition, paramNames);
+  }
+
+  /**
+   * Get all registered filters
+   */
+  getFilters() {
+    return this.runtime.getFilters();
+  }
+
+  /**
    * Close database connection
    */
   async close(): Promise<void> {

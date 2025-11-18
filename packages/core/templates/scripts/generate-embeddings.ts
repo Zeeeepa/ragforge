@@ -1,6 +1,7 @@
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { parseArgs } from 'node:util';
 import {
   Neo4jClient,
   GeminiEmbeddingProvider,
@@ -13,6 +14,18 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.resolve(__dirname, '../.env'), override: true });
 
 async function main(): Promise<void> {
+  // Parse CLI arguments
+  const { values } = parseArgs({
+    options: {
+      'only-dirty': {
+        type: 'boolean',
+        default: false,
+      },
+    },
+  });
+
+  const onlyDirty = values['only-dirty'] ?? false;
+
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     throw new Error('GEMINI_API_KEY is required to generate embeddings.');
@@ -50,7 +63,7 @@ async function main(): Promise<void> {
 
   try {
     for (const entity of EMBEDDINGS_CONFIG.entities) {
-      console.log(`🔄 Generating embeddings for ${entity.entity}`);
+      console.log(`🔄 Generating embeddings for ${entity.entity}${onlyDirty ? ' (dirty only)' : ''}`);
       for (const pipeline of entity.pipelines) {
         const provider = getProvider(pipeline.model, pipeline.dimension);
         await runEmbeddingPipelines({
@@ -60,7 +73,8 @@ async function main(): Promise<void> {
             pipelines: [pipeline]
           },
           provider,
-          defaults: EMBEDDINGS_CONFIG.defaults
+          defaults: EMBEDDINGS_CONFIG.defaults,
+          onlyDirty
         });
       }
     }

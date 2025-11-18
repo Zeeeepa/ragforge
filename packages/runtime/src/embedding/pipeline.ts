@@ -63,10 +63,11 @@ interface PipelineRunOptions {
     dimension?: number;
   };
   batchSize?: number;
+  onlyDirty?: boolean;
 }
 
 export async function runEmbeddingPipelines(options: PipelineRunOptions): Promise<void> {
-  const { neo4j, entity, provider, defaults } = options;
+  const { neo4j, entity, provider, defaults, onlyDirty } = options;
 
   if (!loggingInitialized) {
     loggingInitialized = true;
@@ -88,7 +89,7 @@ export async function runEmbeddingPipelines(options: PipelineRunOptions): Promis
     );
 
     try {
-      const stats = await runSinglePipeline({ neo4j, entity: entity.entity, pipeline, provider, defaults });
+      const stats = await runSinglePipeline({ neo4j, entity: entity.entity, pipeline, provider, defaults, onlyDirty });
 
       if (stats.total === 0) {
         await writeLog('warn', pipelineId, 'No records contained usable source text. Skipping.');
@@ -112,15 +113,18 @@ async function runSinglePipeline(params: {
   pipeline: GeneratedEmbeddingPipelineConfig;
   provider: GeminiEmbeddingProvider;
   defaults?: { model?: string; dimension?: number };
+  onlyDirty?: boolean;
 }): Promise<{ total: number; processed: number }> {
-  const { neo4j, entity, pipeline, provider, defaults } = params;
+  const { neo4j, entity, pipeline, provider, defaults, onlyDirty } = params;
   const pipelineId = `${entity}/${pipeline.name}`;
   const sourceField = pipeline.source;
   const targetProperty = pipeline.targetProperty;
 
+  // Build query with optional dirty filter
+  const dirtyFilter = onlyDirty ? 'AND n.embeddingsDirty = true' : '';
   const query = `
     MATCH (n:\`${entity}\`)
-    WHERE n.\`${sourceField}\` IS NOT NULL
+    WHERE n.\`${sourceField}\` IS NOT NULL ${dirtyFilter}
     RETURN elementId(n) AS id, n
   `;
 
@@ -314,13 +318,30 @@ async function runSinglePipeline(params: {
     `Persisting ${payload.length} embedding vector(s) to Neo4j`
   );
 
-  await neo4j.run(
-    `UNWIND $rows AS row
-     MATCH (n)
-     WHERE elementId(n) = row.id
-     SET n.\`${targetProperty}\` = row.embedding`,
-    { rows: payload }
-  );
+  // Persist embeddings and mark as clean if onlyDirty mode
+  if (onlyDirty) {
+    await neo4j.run(
+      `UNWIND $rows AS row
+       MATCH (n)
+       WHERE elementId(n) = row.id
+       SET n.\`${targetProperty}\` = row.embedding,
+           n.embeddingsDirty = false`,
+      { rows: payload }
+    );
+    await writeLog(
+      'info',
+      pipelineId,
+      `Marked ${payload.length} node(s) as clean (embeddingsDirty = false)`
+    );
+  } else {
+    await neo4j.run(
+      `UNWIND $rows AS row
+       MATCH (n)
+       WHERE elementId(n) = row.id
+       SET n.\`${targetProperty}\` = row.embedding`,
+      { rows: payload }
+    );
+  }
 
   return {
     total: preparedRows.length,

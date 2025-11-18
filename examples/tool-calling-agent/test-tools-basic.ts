@@ -30,6 +30,14 @@ const rag = createRagClient();
  * Tool Executor that uses RAG queries
  */
 class CodeSearchToolExecutor implements ToolExecutor {
+  private llmProvider: LLMProvider;
+  private executor: StructuredLLMExecutor;
+
+  constructor(llmProvider: LLMProvider) {
+    this.llmProvider = llmProvider;
+    this.executor = new StructuredLLMExecutor();
+  }
+
   async execute(toolCall: ToolCallRequest): Promise<any> {
     console.log(`   🔧 Executing: ${toolCall.tool_name}(${JSON.stringify(toolCall.arguments)})`);
     const result = await this._executeInternal(toolCall);
@@ -50,6 +58,13 @@ class CodeSearchToolExecutor implements ToolExecutor {
         return await this.searchByRelationship(
           toolCall.arguments.scopeName,
           toolCall.arguments.relationship
+        );
+
+      case 'batch_analyze':
+        return await this.batchAnalyze(
+          toolCall.arguments.items,
+          toolCall.arguments.task,
+          toolCall.arguments.outputSchema
         );
 
       default:
@@ -156,6 +171,37 @@ class CodeSearchToolExecutor implements ToolExecutor {
       })),
     };
   }
+
+  /**
+   * Meta-LLM tool: Analyze/transform items with structured LLM output
+   *
+   * This is the power tool - allows agent to use executeLLMBatch on results from other tools
+   */
+  private async batchAnalyze(
+    items: any[],
+    task: string,
+    outputSchema: Record<string, any>
+  ): Promise<any> {
+    if (!items || items.length === 0) {
+      return [];
+    }
+
+    console.log(`   🧠 Meta-LLM: Analyzing ${items.length} items with task: "${task}"`);
+
+    // Determine input fields from first item
+    const inputFields = Object.keys(items[0]);
+
+    // Execute batch LLM analysis
+    const results = await this.executor.executeLLMBatch(items, {
+      inputFields,
+      userTask: task,
+      outputSchema,
+      llmProvider: this.llmProvider,
+      batchSize: 5, // Process 5 at a time
+    });
+
+    return Array.isArray(results) ? results : results.items;
+  }
 }
 
 /**
@@ -217,6 +263,31 @@ const TOOLS: ToolDefinition[] = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'batch_analyze',
+      description: 'Use LLM to analyze/transform a batch of items with structured output. Perfect for analyzing search results, generating suggestions, or extracting insights. This is a meta-tool that lets you apply structured LLM reasoning to results from other tools.',
+      parameters: {
+        type: 'object',
+        properties: {
+          items: {
+            type: 'array',
+            description: 'Array of items to analyze (typically from a previous tool call)',
+          },
+          task: {
+            type: 'string',
+            description: 'What to do with each item. Examples: "suggest refactoring improvements", "analyze complexity and identify issues", "extract key insights"',
+          },
+          outputSchema: {
+            type: 'object',
+            description: 'Schema for structured output per item. Define the fields you want extracted. Example: {suggestion: {type: "string"}, priority: {type: "string", enum: ["low","medium","high"]}}',
+          },
+        },
+        required: ['items', 'task', 'outputSchema'],
+      },
+    },
+  },
 ];
 
 async function testGlobalMode() {
@@ -274,7 +345,7 @@ async function testGlobalMode() {
         toolMode: 'global',
         toolChoice: 'any', // Force at least one tool call
         nativeToolProvider, // Add native tool provider
-        toolExecutor: new CodeSearchToolExecutor(),
+        toolExecutor: new CodeSearchToolExecutor(llmProvider),
         llmProvider,
         batchSize: 10,
       }
@@ -340,7 +411,7 @@ async function testPerItemMode() {
         tools: TOOLS,
         toolMode: 'per-item',
         maxIterationsPerItem: 5,
-        toolExecutor: new CodeSearchToolExecutor(),
+        toolExecutor: new CodeSearchToolExecutor(llmProvider),
         llmProvider,
       }
     );

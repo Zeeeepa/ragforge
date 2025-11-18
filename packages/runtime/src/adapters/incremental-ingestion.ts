@@ -110,10 +110,16 @@ export class IncrementalIngestionManager {
     for (const [labels, nodeData] of nodesByLabel) {
       if (nodeData.length === 0) continue;
 
+      // Determine unique field based on node type
+      // File and Directory use 'path', others use 'uuid'
+      const isFileOrDirectory = labels.includes('File') || labels.includes('Directory');
+      const uniqueField = isFileOrDirectory ? 'path' : 'uuid';
+      const uniqueValue = isFileOrDirectory ? 'nodeData.props.path' : 'nodeData.uuid';
+
       await this.client.run(
         `
         UNWIND $nodes AS nodeData
-        MERGE (n:${labels} {uuid: nodeData.uuid})
+        MERGE (n:${labels} {${uniqueField}: ${uniqueValue}})
         SET n += nodeData.props
         `,
         { nodes: nodeData }

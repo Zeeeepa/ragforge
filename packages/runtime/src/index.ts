@@ -10,6 +10,23 @@ export { Neo4jClient } from './client/neo4j-client.js';
 // Query
 export { QueryBuilder } from './query/query-builder.js';
 
+// Generic Query Builder (for agent tools)
+export { GenericQueryBuilder, QueryClient } from './query/generic-query-builder.js';
+export { QueryPlan } from './query/query-plan.js';
+export { QueryExecutor, type FilterRegistry } from './query/query-executor.js';
+export type {
+  RelationshipDirection,
+  FilterOperation,
+  RelationshipStep,
+  SemanticSearchStep,
+  TextSearchStep,
+  WhereCondition
+} from './query/query-plan.js';
+export type {
+  GenericQueryBuilderOptions,
+  SemanticSearchOptions
+} from './query/generic-query-builder.js';
+
 // Mutations
 export { MutationBuilder } from './mutations/mutation-builder.js';
 export type {
@@ -116,6 +133,50 @@ export {
   type IterationAnalysis
 } from './agent/iterative-code-agent.js';
 
+// Agent Runtime (tool-calling loop)
+export { AgentRuntime } from './agents/agent-runtime.js';
+export { ToolRegistry } from './agents/tools/tool-registry.js';
+export type {
+  AgentConfig as ToolAgentConfig,
+  AgentDebugConfig,
+  ToolFeedback,
+  ToolUsageInfo,
+  ToolConsideredInfo,
+  ToolLimitation,
+  ToolSuggestion,
+  AlternativeApproach,
+  AnswerQuality
+} from './types/chat.js';
+
+// Conversational Agent with Memory
+export { ConversationAgent } from './conversation/agent.js';
+export { Conversation } from './conversation/conversation.js';
+export { ConversationStorage } from './conversation/storage.js';
+export { ConversationExporter } from './conversation/exporter.js';
+export type {
+  ConversationConfig,
+  ConversationAgentOptions,
+  ConversationMetadata,
+  Message,
+  ToolCall,
+  ToolResult,
+  Summary,
+  SummaryContent,
+  AssistantResponse,
+  ConversationContext,
+  RecentContext,
+  RAGContext,
+  ConversationFullData,
+  ListConversationsOptions,
+  GetMessagesOptions,
+  StoreMessageOptions,
+  SummarizationTrigger
+} from './conversation/types.js';
+
+// Chat Session Manager
+export { ChatSessionManager } from './chat/session-manager.js';
+export type { CreateSessionOptions } from './chat/session-manager.js';
+
 // Types
 export * from './types/index.js';
 
@@ -140,6 +201,7 @@ export * from './adapters/index.js';
 // Main factory function
 import { Neo4jClient } from './client/neo4j-client.js';
 import { QueryBuilder } from './query/query-builder.js';
+import { GenericQueryBuilder, QueryClient } from './query/generic-query-builder.js';
 import type { RuntimeConfig, RelationshipConfig } from './types/index.js';
 import type { EntityContext } from './types/entity-context.js';
 
@@ -155,20 +217,67 @@ import type { EntityContext } from './types/entity-context.js';
  *   }
  * });
  *
+ * // Legacy query API (for generated code)
  * const results = await client.query('Scope')
  *   .where({ type: 'function' })
+ *   .limit(10)
+ *   .execute();
+ *
+ * // Generic query API (for agent tools)
+ * const results = await client.get('Scope')
+ *   .where('complexity', '>', 5)
+ *   .semanticSearch('code_embeddings', 'authentication logic')
  *   .limit(10)
  *   .execute();
  */
 export function createClient(config: RuntimeConfig) {
   const neo4jClient = new Neo4jClient(config.neo4j);
 
+  // Create QueryClient for generic queries
+  const queryClient = new QueryClient({
+    neo4j: neo4jClient,
+    filterRegistry: {}
+  });
+
   return {
     /**
-     * Create a query builder for an entity type
+     * Create a query builder for an entity type (legacy API for generated code)
      */
     query<T = any>(entityType: string, options?: { enrichment?: RelationshipConfig[]; context?: EntityContext }): QueryBuilder<T> {
       return new QueryBuilder<T>(neo4jClient, entityType, options?.enrichment, options?.context);
+    },
+
+    /**
+     * Create a generic query for an entity type (new API for agent tools)
+     *
+     * @example
+     * const results = await client.get('Scope')
+     *   .getRelationship('DEPENDS_ON')
+     *   .filter('complexityGt5')
+     *   .semanticSearch('code_embeddings', 'authentication logic')
+     *   .limit(10)
+     *   .execute();
+     */
+    get<T = any>(entity: string): GenericQueryBuilder<T> {
+      return queryClient.get<T>(entity);
+    },
+
+    /**
+     * Register a custom filter for use with .filter()
+     *
+     * @example
+     * client.registerFilter('complexityGt5', 'n.complexity > 5');
+     * client.registerFilter('modifiedAfter', 'n.last_modified > $afterDate', ['afterDate']);
+     */
+    registerFilter(name: string, cypherCondition: string, paramNames?: string[]): void {
+      queryClient.registerFilter(name, cypherCondition, paramNames);
+    },
+
+    /**
+     * Get all registered filters
+     */
+    getFilters() {
+      return queryClient.getFilters();
     },
 
     /**

@@ -17,10 +17,10 @@ watch:
   enabled: true
   batch_interval: 1000
   verbose: true
-  auto_embed: false
+  auto_embed: true
 summarization_llm:
   provider: gemini
-  model: gemini-2.0-flash-exp
+  model: gemini-2.0-flash
   temperature: 0.3
   max_tokens: 8000
 entities:

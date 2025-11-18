@@ -70,7 +70,7 @@ export class VertexAIProvider implements LLMProvider {
   /**
    * Create a default provider using GEMINI_API_KEY
    */
-  static fromEnv(model: string = 'gemma-3n-e2b-it'): VertexAIProvider {
+  static fromEnv(model: string = 'gemini-2.0-flash'): VertexAIProvider {
     return new VertexAIProvider({
       apiKey: process.env.GEMINI_API_KEY,
       model,

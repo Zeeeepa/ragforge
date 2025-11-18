@@ -1,16 +1,7 @@
-# Environment
+node_modules
+.npm-cache
 .env
-
-# Dependencies
-node_modules/
-
-# Logs
-logs/
-*.log
-
-# Database backups
-*.dump
-*.cypher
-
-# Generated at runtime
-prompts/*.txt
+.env.local
+packages/runtime/node_modules
+dist
+logs

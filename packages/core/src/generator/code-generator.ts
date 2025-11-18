@@ -887,6 +887,41 @@ export class CodeGenerator {
     lines.push(`  }`);
     lines.push(``);
 
+    // Add generic query API methods
+    lines.push(`  /**`);
+    lines.push(`   * Generic query API - Start a query for any entity type`);
+    lines.push(`   *`);
+    lines.push(`   * @example`);
+    lines.push(`   * const results = await client.get('Scope')`);
+    lines.push(`   *   .where('complexity', '>', 5)`);
+    lines.push(`   *   .semanticSearch('code_embeddings', 'authentication logic')`);
+    lines.push(`   *   .limit(10)`);
+    lines.push(`   *   .execute();`);
+    lines.push(`   */`);
+    lines.push(`  get<T = any>(entity: string) {`);
+    lines.push(`    return this.runtime.get<T>(entity);`);
+    lines.push(`  }`);
+    lines.push(``);
+
+    lines.push(`  /**`);
+    lines.push(`   * Register a custom filter for use with .filter()`);
+    lines.push(`   *`);
+    lines.push(`   * @example`);
+    lines.push(`   * client.registerFilter('complexityGt5', 'n.complexity > 5');`);
+    lines.push(`   */`);
+    lines.push(`  registerFilter(name: string, cypherCondition: string, paramNames?: string[]) {`);
+    lines.push(`    return this.runtime.registerFilter(name, cypherCondition, paramNames);`);
+    lines.push(`  }`);
+    lines.push(``);
+
+    lines.push(`  /**`);
+    lines.push(`   * Get all registered filters`);
+    lines.push(`   */`);
+    lines.push(`  getFilters() {`);
+    lines.push(`    return this.runtime.getFilters();`);
+    lines.push(`  }`);
+    lines.push(``);
+
     // Add close method
     lines.push(`  /**`);
     lines.push(`   * Close database connection`);
@@ -3995,13 +4030,15 @@ const watchConfig = {
   onBatchComplete: (stats) => {
     console.log(\`✅ Batch complete: \${stats.created + stats.updated} scope(s) updated\`);
     ${config.watch?.auto_embed ? `
-    // Auto-generate embeddings if configured
-    console.log('🔢 Auto-generating embeddings...');
-    spawn('npm', ['run', 'embeddings:generate'], {
-      cwd: projectRoot,
-      stdio: 'inherit',
-      shell: true
-    });
+    // Auto-generate embeddings for dirty scopes only
+    if (stats.created + stats.updated > 0) {
+      console.log('🔢 Generating embeddings for modified scopes...');
+      spawn('npm', ['run', 'embeddings:generate', '--', '--only-dirty'], {
+        cwd: projectRoot,
+        stdio: 'inherit',
+        shell: true
+      });
+    }
     ` : ''}
   },
   onBatchError: (error) => {

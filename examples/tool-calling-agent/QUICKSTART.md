@@ -47,6 +47,7 @@ npm run watch
 This watches your source files and automatically ingests changes:
 - 🔄 Batches changes every 1000ms
 - ⚡ Only processes modified files (incremental)
+- 🔢 Auto-generates embeddings after each batch
 - ⚠️  Marks changed scopes with dirty embeddings flag
 
 Press Ctrl+C to stop watching.
