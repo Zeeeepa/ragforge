@@ -3,6 +3,10 @@
 .env.local
 .env.*.local
 
+# node-glob and minimatch for inspiration
+node-glob/
+minimatch/
+
 # Luciform XMLL Parser
 LR_XMLParser
 

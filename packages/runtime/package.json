@@ -69,6 +69,7 @@
     "diff": "^5.1.0",
     "dotenv": "^16.3.1",
     "fast-xml-parser": "^4.3.0",
+    "glob-to-regexp": "^0.4.1",
     "globby": "^14.0.0",
     "js-yaml": "^4.1.1",
     "llamaindex": "^0.12.0",

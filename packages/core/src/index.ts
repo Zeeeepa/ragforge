@@ -21,5 +21,20 @@ export { TypeGenerator } from './generator/type-generator.js';
 export { ConfigGenerator, type DomainPattern } from './generator/config-generator.js';
 export { CodeGenerator, type GeneratedCode } from './generator/code-generator.js';
 
+// Tool Generation (Phase 1)
+export { generateToolsFromConfig } from './tools/tool-generator.js';
+export type {
+  ToolGenerationOptions,
+  GeneratedTools,
+  GeneratedToolDefinition,
+  ToolHandlerGenerator,
+  ToolGenerationContext,
+  EntityMetadata,
+  FieldMetadata,
+  VectorIndexMetadata,
+  RelationshipMetadata,
+  ToolGenerationMetadata,
+} from './tools/types/index.js';
+
 // Version
 export const VERSION = '0.0.1';
