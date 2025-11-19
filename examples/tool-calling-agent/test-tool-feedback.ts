@@ -147,7 +147,8 @@ Your job is to answer questions about a codebase by using the available tools.`;
   );
 
   console.log(`✅ Loaded ${tools.length} database tools`);
-  console.log('✅ Debug mode enabled with full feedback\n');
+  console.log('✅ Debug mode enabled with full feedback');
+  console.log(`📋 Available tools: ${toolRegistry.list().map(t => t.name).join(', ')}\n`);
 
   // 2. Test query that should trigger feedback
   const testQuery = "What are the most complex classes in the codebase? (Based on lines of code)";

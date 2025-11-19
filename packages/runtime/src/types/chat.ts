@@ -56,8 +56,25 @@ export interface AgentConfig {
   metadata?: Record<string, any>;
 
   /**
+   * Final response configuration (optional)
+   * Generate a structured response after tool loop completes
+   * Use cases: feedback, analysis, summary, report generation, etc.
+   */
+  finalResponse?: {
+    /** Schema for the final structured response */
+    schema: any; // OutputSchema from StructuredLLMExecutor
+    /** Prompt explaining what to include in the final response */
+    prompt: string;
+    /** Output format (default: 'xml') */
+    format?: 'json' | 'xml' | 'yaml';
+    /** Field name in Message where response will be stored (default: 'metadata.finalResponse') */
+    fieldName?: string;
+  };
+
+  /**
    * Debug mode configuration (optional)
    * Enables tool feedback and verbose logging
+   * Uses finalResponse internally with a predefined feedback schema
    */
   debug?: AgentDebugConfig;
 }

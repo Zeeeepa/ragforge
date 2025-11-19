@@ -104,8 +104,96 @@ export class AgentRuntime {
   ) {
     this.executor = new StructuredLLMExecutor();
 
+    // Setup finalResponse for debug mode if enabled
+    if (this.isDebugModeEnabled() && !this.config.finalResponse) {
+      this.setupDebugModeFinalResponse();
+    }
+
     // Try to initialize native tool calling provider
     this.initializeNativeToolProvider();
+  }
+
+  /**
+   * Setup finalResponse configuration for debug mode
+   * Automatically configures tool feedback schema
+   */
+  private setupDebugModeFinalResponse(): void {
+    const feedbackConfig = this.config.debug?.tool_feedback;
+
+    this.config.finalResponse = {
+      fieldName: 'tool_feedback',
+      format: 'xml',
+      prompt: `You just completed answering a user query. Please provide structured feedback about your experience.`,
+      schema: {
+        tool_feedback: {
+          type: 'object',
+          description: 'Structured feedback about tool usage',
+          required: true,
+          properties: {
+            tools_used: {
+              type: 'array',
+              description: 'List of tools you used',
+              required: true,
+              items: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string', description: 'Tool name', required: true },
+                  purpose: { type: 'string', description: 'Why you used this tool', required: true },
+                  success: { type: 'boolean', description: 'Whether the tool succeeded', required: true },
+                  result_quality: { type: 'string', description: 'Quality of results', required: false }
+                }
+              }
+            },
+            limitations: {
+              type: 'array',
+              description: 'Limitations you encountered',
+              required: false,
+              items: {
+                type: 'object',
+                properties: {
+                  description: { type: 'string', description: 'What limitation you faced', required: true },
+                  impact: { type: 'string', description: 'Impact severity', required: true },
+                  missing_capability: { type: 'string', description: 'Type of missing capability', required: false }
+                }
+              }
+            },
+            suggestions: {
+              type: 'array',
+              description: 'Suggestions for improving the tools',
+              required: false,
+              items: {
+                type: 'object',
+                properties: {
+                  type: { type: 'string', description: 'Type of suggestion', required: true },
+                  priority: { type: 'string', description: 'Priority level', required: true },
+                  description: { type: 'string', description: 'Detailed suggestion', required: true },
+                  tool_spec: {
+                    type: 'object',
+                    description: 'Specification for a new tool',
+                    required: false,
+                    properties: {
+                      name: { type: 'string', required: false },
+                      purpose: { type: 'string', required: false },
+                      parameters: { type: 'array', required: false, items: { type: 'string' } }
+                    }
+                  }
+                }
+              }
+            },
+            answer_quality: {
+              type: 'object',
+              description: 'Self-assessment of answer quality',
+              required: true,
+              properties: {
+                completeness: { type: 'number', description: 'Completeness (0-100)', required: true },
+                confidence: { type: 'number', description: 'Confidence level (0-100)', required: true },
+                notes: { type: 'string', description: 'Additional notes', required: false }
+              }
+            }
+          }
+        }
+      }
+    };
   }
 
   /**
@@ -218,7 +306,17 @@ export class AgentRuntime {
 
     console.log(`\n✅ Agent complete (${iteration} iterations, ${context.toolExecutions.length} tool executions)\n`);
 
-    // 4. Create agent message with all tool executions and feedback
+    // 4. Generate final structured response if configured
+    if (this.config.finalResponse && finalAnswer) {
+      const finalResponseData = await this.generateFinalResponse(userMessage.content, finalAnswer, context);
+
+      // Extract tool_feedback if it's the debug mode field
+      if (this.config.finalResponse.fieldName === 'tool_feedback' && finalResponseData) {
+        lastToolFeedback = finalResponseData.tool_feedback || finalResponseData;
+      }
+    }
+
+    // 5. Create agent message with all tool executions and feedback
     return this.createAgentMessage(sessionId, finalAnswer!, context.toolExecutions, lastToolFeedback);
   }
 
@@ -230,17 +328,12 @@ export class AgentRuntime {
    * Call LLM with current context and available tools
    *
    * Uses native tool calling if available, otherwise falls back to StructuredLLMExecutor
-   * NOTE: When debug mode is enabled, always uses StructuredLLMExecutor to support tool_feedback
+   * NOTE: Debug mode feedback is now handled via the 'respond' tool, so native tool calling works in all modes
    */
   private async callLLMWithTools(
     context: ConversationContext
   ): Promise<LLMResponse> {
-    // When debug mode enabled, must use StructuredLLMExecutor (native tool calling doesn't support custom fields)
-    if (this.isDebugModeEnabled()) {
-      return this.callLLMWithStructuredExecutor(context);
-    }
-
-    // Try native tool calling first
+    // Try native tool calling first (works for both normal and debug mode with 'respond' tool)
     if (this.nativeToolProvider) {
       try {
         return await this.callLLMWithNativeTools(context);
@@ -459,17 +552,70 @@ ${tools.map((t) => this.formatToolDescription(t)).join('\n\n')}
 
 Instructions:
 - Use reasoning to explain your thought process in every response
-- If you need more information, specify tool_calls with tool names and arguments
+- If you need more information, call tools to gather data
 - You can call multiple tools in one iteration
 - Once you have enough information, provide the final answer
 - Keep iterating until you can provide a complete answer`;
 
-    // Add debug instructions if enabled
-    if (this.isDebugModeEnabled()) {
-      prompt += this.getDebugModeInstructions();
-    }
-
     return prompt;
+  }
+
+  /**
+   * Generate final structured response after tool loop completes
+   * Uses StructuredLLMExecutor with configured schema
+   */
+  private async generateFinalResponse(
+    userQuery: string,
+    finalAnswer: string,
+    context: ConversationContext
+  ): Promise<any> {
+    if (!this.config.finalResponse) return undefined;
+
+    const config = this.config.finalResponse;
+
+    // Build context description
+    const toolExecutionsSummary = context.toolExecutions.map((exec, i) => {
+      return `Iteration ${exec.iteration}:
+- Tools called: ${exec.toolCalls.map(tc => tc.tool_name).join(', ')}
+- Results: ${exec.results.map((r, j) =>
+  `${exec.toolCalls[j].tool_name}: ${r.success ? 'success' : 'failed'}`
+).join(', ')}`;
+    }).join('\n\n');
+
+    const userTask = `${config.prompt}
+
+USER QUERY:
+"${userQuery}"
+
+YOUR FINAL ANSWER:
+"${finalAnswer}"
+
+TOOL EXECUTIONS:
+${toolExecutionsSummary || '(No tools were used)'}
+
+AVAILABLE TOOLS:
+${this.config.tools.join(', ')}
+
+Please provide your analysis in the requested structured format.`;
+
+    console.log(`🔄 Generating final structured response...`);
+
+    const result = await this.executor.executeLLMBatch<any, any>(
+      [{ context: 'final_response' }],
+      {
+        inputFields: ['context'],
+        userTask,
+        outputSchema: config.schema,
+        outputFormat: config.format || 'xml',
+        llmProvider: this.llmProvider,
+        batchSize: 1,
+      }
+    );
+
+    const response = Array.isArray(result) ? result[0] : result.items[0];
+    console.log(`✅ Final structured response generated`);
+
+    return response;
   }
 
   /**
