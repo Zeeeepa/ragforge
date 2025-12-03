@@ -11,12 +11,14 @@ import type {
   GeneratedTools,
   EntityMetadata,
   FieldMetadata,
+  ComputedFieldMetadata,
   VectorIndexMetadata,
   RelationshipMetadata,
   GeneratedToolDefinition,
   ToolHandlerGenerator,
   ToolGenerationContext,
 } from './types/index.js';
+import { generateChangeTrackingTools, generateAggregationTools } from './advanced/index.js';
 
 /**
  * Generate database query tools from RagForge config
@@ -29,19 +31,22 @@ export function generateToolsFromConfig(
   config: RagForgeConfig,
   options: ToolGenerationOptions = {}
 ): GeneratedTools {
+  // Extract metadata from config first
+  const context = extractMetadata(config);
+
+  // Auto-detect change tracking (Phase 5)
+  const hasChangeTracking = context.entities.some(e => e.changeTracking?.enabled);
+
   // Set defaults
   const opts: Required<ToolGenerationOptions> = {
     includeSemanticSearch: options.includeSemanticSearch ?? true,
     includeRelationships: options.includeRelationships ?? true,
     includeSpecializedTools: options.includeSpecializedTools ?? false,
     includeAggregations: options.includeAggregations ?? false,
-    includeChangeTracking: options.includeChangeTracking ?? false,
+    includeChangeTracking: options.includeChangeTracking ?? hasChangeTracking,
     customTemplates: options.customTemplates ?? [],
     allowRawCypher: options.allowRawCypher ?? false,
   };
-
-  // Extract metadata from config
-  const context = extractMetadata(config);
 
   // Generate core tools
   const tools: GeneratedToolDefinition[] = [];
@@ -70,6 +75,20 @@ export function generateToolsFromConfig(
   const getById = generateGetEntityByIdTool(context);
   tools.push(getById);
   handlers[getById.name] = generateGetEntityByIdHandler(context);
+
+  // 5. Change tracking tools (Phase 5 - if change tracking enabled)
+  if (opts.includeChangeTracking) {
+    const changeTools = generateChangeTrackingTools(context);
+    tools.push(...changeTools.tools);
+    Object.assign(handlers, changeTools.handlers);
+  }
+
+  // 6. Aggregation tools (Phase 5 - if enabled)
+  if (opts.includeAggregations) {
+    const aggTools = generateAggregationTools(context);
+    tools.push(...aggTools.tools);
+    Object.assign(handlers, aggTools.handlers);
+  }
 
   // Count fields
   let searchableFieldsCount = 0;
@@ -137,6 +156,16 @@ function extractEntityMetadata(entityConfig: EntityConfig): EntityMetadata {
     computed: false,
   }));
 
+  // Extract computed fields (Phase 3)
+  const computedFields: ComputedFieldMetadata[] = (entityConfig.computed_fields || []).map(cf => ({
+    name: cf.name,
+    type: cf.type,
+    description: cf.description,
+    expression: cf.expression,
+    cypher: cf.cypher,
+    materialized: cf.materialized,
+  }));
+
   // Extract vector indexes (support both legacy and new format)
   const vectorIndexes: VectorIndexMetadata[] = [];
   if (entityConfig.vector_indexes) {
@@ -177,6 +206,7 @@ function extractEntityMetadata(entityConfig: EntityConfig): EntityMetadata {
     description: entityConfig.description,
     uniqueField,
     searchableFields,
+    computedFields: computedFields.length > 0 ? computedFields : undefined,
     vectorIndexes,
     relationships,
     changeTracking: entityConfig.track_changes
@@ -200,13 +230,21 @@ function generateQueryEntitiesTool(context: ToolGenerationContext): GeneratedToo
 
   // Build field documentation per entity
   const fieldDocs = context.entities.map(entity => {
-    const fields = entity.searchableFields.map(field => {
-      const computedTag = field.computed ? ' (computed)' : '';
+    const searchableFieldsStr = entity.searchableFields.map(field => {
       const uniqueTag = field.name === entity.uniqueField ? ' [UNIQUE FIELD]' : '';
-      return `  * ${field.name}${computedTag} (${field.type}) - ${field.description || ''}${uniqueTag}`;
+      return `  * ${field.name} (${field.type}) - ${field.description || ''}${uniqueTag}`;
     }).join('\n');
 
-    return `- ${entity.name}:\n${fields}`;
+    // Add computed fields if present (read-only, can be used in ORDER BY)
+    const computedFieldsStr = entity.computedFields && entity.computedFields.length > 0
+      ? '\n  Computed fields (read-only, can be used in ORDER BY):\n' +
+        entity.computedFields.map(cf => {
+          const materializedTag = cf.materialized ? ' [CACHED]' : '';
+          return `  * ${cf.name} (${cf.type}) - ${cf.description || ''}${materializedTag}`;
+        }).join('\n')
+      : '';
+
+    return `- ${entity.name}:\n${searchableFieldsStr}${computedFieldsStr}`;
   }).join('\n\n');
 
   // Build unique field documentation
@@ -243,7 +281,7 @@ Examples:
 - Find services: {field: "name", operator: "REGEX", value: ".*Service$"}
 - Find specific scopes: {field: "name", operator: "IN", value: ["AuthService", "UserService"]}
 
-You can ORDER BY any searchable field (ASC or DESC).`;
+You can ORDER BY any searchable field or computed field (ASC or DESC).`;
 
   return {
     name: 'query_entities',

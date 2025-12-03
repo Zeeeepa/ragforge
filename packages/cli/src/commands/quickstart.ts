@@ -28,6 +28,7 @@ import {
 } from '@luciformresearch/ragforge-core';
 import {
   CodeSourceAdapter,
+  TikaSourceAdapter,
   type SourceConfig,
   Neo4jClient
 } from '@luciformresearch/ragforge-runtime';
@@ -64,19 +65,23 @@ export function printQuickstartHelp(): void {
   ragforge quickstart [options]
 
 Description:
-  One-command setup for code RAG with everything included!
+  One-command setup for RAG with everything included!
 
   The RagForge workspace (config, Docker, generated client) is created in the
-  current directory. Use --root to specify a different source code location.
+  current directory. Use --root to specify a different source location.
 
   This command will:
-  ✓ Auto-detect your project type (TypeScript, Python, etc.)
+  ✓ Auto-detect your project type (TypeScript, Python, etc.) or use Tika for documents
   ✓ Create or expand your ragforge.config.yaml with best practices
   ✓ Set up and launch Neo4j with Docker Compose
   ✓ Clean/reset the database
-  ✓ Parse and ingest your codebase into Neo4j
-  ✓ Generate TypeScript client for querying your code
+  ✓ Parse and ingest your codebase or documents into Neo4j
+  ✓ Generate TypeScript client for querying
   ✓ Create vector indexes and generate embeddings (enabled by default)
+
+  For document ingestion (PDF, DOCX, images with OCR, etc.):
+  - Set source.type: document and source.adapter: tika in your config
+  - Requires Java installed locally (for Apache Tika)
 
 Environment variables (from .env):
   GEMINI_API_KEY       Required for embeddings and summarization
@@ -427,6 +432,7 @@ export async function runQuickstart(options: QuickstartOptions): Promise<void> {
 
   await log('🚀 RagForge Quickstart');
   await log('═'.repeat(60));
+  await log('📦 LOCAL DEV VERSION - ' + new Date().toISOString());
   await log('');
 
   // Debug: Show parsed options (only if --debug)
@@ -703,15 +709,30 @@ export async function runQuickstart(options: QuickstartOptions): Promise<void> {
   await cleanDatabase(neo4jUri, neo4jUsername, neo4jPassword, neo4jDatabase, 10, options.debug);
   console.log('');
 
-  // Step 11: Ingest code if requested (default: true)
+  // Step 11: Ingest source if requested (default: true)
   if (options.ingest && mergedConfig.source) {
-    await parseAndIngestCode(
-      mergedConfig.source as SourceConfig,
-      neo4jUri,
-      neo4jUsername,
-      neo4jPassword,
-      neo4jDatabase
-    );
+    const source = mergedConfig.source as SourceConfig;
+
+    // Detect source type and use appropriate adapter
+    if (source.type === 'document' && source.adapter === 'tika') {
+      // Document ingestion with Tika
+      await parseAndIngestDocuments(
+        source,
+        neo4jUri,
+        neo4jUsername,
+        neo4jPassword,
+        neo4jDatabase
+      );
+    } else {
+      // Code ingestion (default)
+      await parseAndIngestCode(
+        source,
+        neo4jUri,
+        neo4jUsername,
+        neo4jPassword,
+        neo4jDatabase
+      );
+    }
   } else if (!mergedConfig.source) {
     console.warn('⚠️  No source configuration found, skipping ingestion');
   }
@@ -1161,8 +1182,8 @@ async function cleanDatabase(uri: string, username: string, password: string, da
         console.log(`🔍 DEBUG: Connectivity verified, running delete query...`);
       }
 
-      // Delete all code-related nodes
-      await client.run('MATCH (n) WHERE n:Scope OR n:File OR n:Directory OR n:ExternalLibrary OR n:Project DETACH DELETE n');
+      // Delete all code and document nodes
+      await client.run('MATCH (n) WHERE n:Scope OR n:File OR n:Directory OR n:ExternalLibrary OR n:Project OR n:Document OR n:Chunk DETACH DELETE n');
 
       console.log('✓ Database cleaned');
       await client.close();
@@ -1396,6 +1417,192 @@ async function parseAndIngestCode(
     console.log('');
 
     console.log(`✅ Ingestion complete!`);
+  } finally {
+    await client.close();
+  }
+}
+
+/**
+ * Check if Java is installed (required for Tika)
+ */
+async function checkJavaInstalled(): Promise<boolean> {
+  try {
+    await execAsync('java -version');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Parse and ingest documents into Neo4j using TikaSourceAdapter
+ */
+async function parseAndIngestDocuments(
+  sourceConfig: SourceConfig,
+  uri: string,
+  username: string,
+  password: string,
+  database?: string
+): Promise<void> {
+  console.log('\n📄 Parsing and ingesting documents...');
+  console.log(`📁 Root: ${sourceConfig.root || process.cwd()}`);
+  console.log(`📝 Adapter: ${sourceConfig.adapter} (Tika)`);
+
+  // Check Java is installed
+  const javaInstalled = await checkJavaInstalled();
+  if (!javaInstalled) {
+    throw new Error(
+      'Java is required for document parsing with Tika.\n' +
+      '   Install Java and try again:\n' +
+      '   - Ubuntu/Debian: sudo apt install default-jdk\n' +
+      '   - macOS: brew install openjdk\n' +
+      '   - Windows: download from https://adoptium.net/'
+    );
+  }
+  console.log('✓ Java detected');
+
+  // Create Tika adapter
+  const adapter = new TikaSourceAdapter();
+
+  // Validate config
+  const validation = await adapter.validate(sourceConfig);
+  if (!validation.valid) {
+    throw new Error(`Source config validation failed: ${validation.errors?.join(', ')}`);
+  }
+
+  if (validation.warnings && validation.warnings.length > 0) {
+    validation.warnings.forEach(warning => console.warn(`⚠️  ${warning}`));
+  }
+
+  // Parse documents with progress reporting
+  const parseResult = await adapter.parse({
+    source: sourceConfig,
+    onProgress: (progress) => {
+      const percent = Math.round(progress.percentComplete);
+      if (progress.phase === 'discovering') {
+        process.stdout.write(`\r🔎 Discovering files...`);
+      } else if (progress.phase === 'parsing') {
+        process.stdout.write(`\r📄 Parsing ${progress.filesProcessed}/${progress.totalFiles} files (${percent}%)    `);
+      } else if (progress.phase === 'complete') {
+        process.stdout.write(`\r✅ Parsing complete                                        `);
+      }
+    }
+  });
+
+  console.log(''); // New line after progress
+  const { graph } = parseResult;
+  console.log(`✅ Parsed ${graph.metadata.filesProcessed} documents → ${graph.metadata.nodesGenerated} nodes, ${graph.metadata.relationshipsGenerated} relationships`);
+
+  // Connect to Neo4j and ingest graph
+  console.log(`💾 Ingesting graph into Neo4j...`);
+  const client = new Neo4jClient({ uri, username, password, database });
+
+  try {
+    await client.verifyConnectivity();
+
+    // Create schema (indexes and constraints for Document/Chunk)
+    console.log(`📋 Creating indexes and constraints...`);
+    await client.run('CREATE CONSTRAINT document_uuid IF NOT EXISTS FOR (d:Document) REQUIRE d.uuid IS UNIQUE');
+    await client.run('CREATE CONSTRAINT chunk_uuid IF NOT EXISTS FOR (c:Chunk) REQUIRE c.uuid IS UNIQUE');
+    await client.run('CREATE INDEX document_path IF NOT EXISTS FOR (d:Document) ON (d.path)');
+    await client.run('CREATE INDEX document_type IF NOT EXISTS FOR (d:Document) ON (d.type)');
+    await client.run('CREATE INDEX chunk_document IF NOT EXISTS FOR (c:Chunk) ON (c.document_path)');
+    console.log(`✓ Schema created`);
+
+    // Create nodes with batching
+    const BATCH_SIZE = 500;
+    const documentNodes = graph.nodes.filter(n => n.labels.includes('Document'));
+    const chunkNodes = graph.nodes.filter(n => n.labels.includes('Chunk'));
+
+    console.log(`📝 Creating ${graph.nodes.length} nodes...`);
+
+    // Batch create Document nodes
+    for (let i = 0; i < documentNodes.length; i += BATCH_SIZE) {
+      const batch = documentNodes.slice(i, i + BATCH_SIZE);
+      await client.run(
+        `UNWIND $nodes AS node
+         MERGE (n:Document {uuid: node.uuid})
+         SET n += node`,
+        { nodes: batch.map(n => n.properties) }
+      );
+      process.stdout.write(`\r  ↳ Documents: ${Math.min(i + BATCH_SIZE, documentNodes.length)}/${documentNodes.length}    `);
+    }
+    console.log('');
+
+    // Batch create Chunk nodes
+    for (let i = 0; i < chunkNodes.length; i += BATCH_SIZE) {
+      const batch = chunkNodes.slice(i, i + BATCH_SIZE);
+      await client.run(
+        `UNWIND $nodes AS node
+         MERGE (n:Chunk {uuid: node.uuid})
+         SET n += node`,
+        { nodes: batch.map(n => n.properties) }
+      );
+      process.stdout.write(`\r  ↳ Chunks: ${Math.min(i + BATCH_SIZE, chunkNodes.length)}/${chunkNodes.length}    `);
+    }
+    console.log('');
+
+    // Create relationships
+    console.log(`🔗 Creating ${graph.relationships.length} relationships...`);
+
+    // Group by type for efficient batch creation
+    const relsByType = new Map<string, typeof graph.relationships>();
+    for (const rel of graph.relationships) {
+      if (!relsByType.has(rel.type)) {
+        relsByType.set(rel.type, []);
+      }
+      relsByType.get(rel.type)!.push(rel);
+    }
+
+    let totalRelsCreated = 0;
+    for (const [relType, rels] of relsByType) {
+      for (let i = 0; i < rels.length; i += BATCH_SIZE) {
+        const batch = rels.slice(i, i + BATCH_SIZE);
+
+        // Determine node types based on relationship type
+        let query: string;
+        if (relType === 'CONTAINS') {
+          query = `UNWIND $batch AS rel
+                   MATCH (a:Document {uuid: rel.from})
+                   MATCH (b:Chunk {uuid: rel.to})
+                   MERGE (a)-[r:${relType}]->(b)
+                   SET r += rel.props`;
+        } else if (relType === 'IN_DOCUMENT') {
+          query = `UNWIND $batch AS rel
+                   MATCH (a:Chunk {uuid: rel.from})
+                   MATCH (b:Document {uuid: rel.to})
+                   MERGE (a)-[r:${relType}]->(b)
+                   SET r += rel.props`;
+        } else if (relType === 'NEXT_CHUNK') {
+          query = `UNWIND $batch AS rel
+                   MATCH (a:Chunk {uuid: rel.from})
+                   MATCH (b:Chunk {uuid: rel.to})
+                   MERGE (a)-[r:${relType}]->(b)
+                   SET r += rel.props`;
+        } else {
+          // Generic fallback
+          query = `UNWIND $batch AS rel
+                   MATCH (a {uuid: rel.from})
+                   MATCH (b {uuid: rel.to})
+                   MERGE (a)-[r:${relType}]->(b)
+                   SET r += rel.props`;
+        }
+
+        await client.run(query, {
+          batch: batch.map(r => ({
+            from: r.from,
+            to: r.to,
+            props: r.properties || {}
+          }))
+        });
+
+        totalRelsCreated += batch.length;
+        process.stdout.write(`\r  ↳ ${totalRelsCreated}/${graph.relationships.length} relationships    `);
+      }
+    }
+    console.log('');
+
+    console.log(`✅ Document ingestion complete!`);
   } finally {
     await client.close();
   }

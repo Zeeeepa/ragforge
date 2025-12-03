@@ -36,5 +36,28 @@ export type {
   ToolGenerationMetadata,
 } from './tools/types/index.js';
 
+// Computed Fields (Phase 3)
+export {
+  evaluateComputedField,
+  evaluateExpression,
+  evaluateComputedFields,
+  generateCypherFragment,
+  validateComputedField
+} from './computed/field-evaluator.js';
+export type {
+  EvaluationContext,
+  EvaluationResult
+}
+from './computed/field-evaluator.js';
+
+// LLM Abstractions
+export * from './llm/index.js';
+
+// Database
+export * from './database/index.js';
+
+// Document Ingestion (temporarily disabled - llamaindex removed)
+// export * from './ingestion';
+
 // Version
 export const VERSION = '0.0.1';

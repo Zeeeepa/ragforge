@@ -155,8 +155,8 @@ const SummarizationLLMConfigSchema = z.object({
 });
 
 const SourceConfigSchema = z.object({
-  type: z.literal('code'),
-  adapter: z.enum(['typescript', 'python']),
+  type: z.enum(['code', 'document']),
+  adapter: z.enum(['typescript', 'python', 'tika']),
   root: z.string().optional(),
   include: z.array(z.string()).min(1, 'source.include must contain at least one pattern'),
   exclude: z.array(z.string()).optional(),

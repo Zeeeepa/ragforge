@@ -7,6 +7,9 @@
 node-glob/
 minimatch/
 
+#repo with example documents
+node-tika
+
 # Luciform XMLL Parser
 LR_XMLParser
 

@@ -198,6 +198,14 @@ export { runEmbeddingPipelines } from './embedding/pipeline.js';
 // Source Adapters
 export * from './adapters/index.js';
 
+// Pattern Matching (for GLOB/REGEX operators in queries)
+export {
+  globToRegex,
+  matchesGlob,
+  isValidRegex,
+  convertPatternOperator
+} from './utils/pattern-matching.js';
+
 // Main factory function
 import { Neo4jClient } from './client/neo4j-client.js';
 import { QueryBuilder } from './query/query-builder.js';

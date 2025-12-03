@@ -22,6 +22,10 @@ export interface RagForgeConfig {
 
   // Multi-provider embedding configuration (via LlamaIndex)
   embedding?: EmbeddingProviderConfig;
+
+  // Topic extraction and management (for Document RAG)
+  topic_extraction?: TopicExtractionConfig;
+  topic_merging?: TopicMergingConfig;
 }
 
 /**
@@ -87,6 +91,7 @@ export interface EntityConfig {
   name: string;
   description?: string;
   searchable_fields: FieldConfig[];
+  computed_fields?: ComputedFieldConfig[];  // Computed fields (read-only, calculated at runtime)
   vector_index?: VectorIndexConfig;  // Legacy - single index
   vector_indexes?: VectorIndexConfig[];  // New - multiple indexes
   relationships?: RelationshipConfig[];
@@ -123,6 +128,32 @@ export interface FieldConfig {
   description?: string;
   values?: string[]; // For enum types
   summarization?: FieldSummarizationConfig;
+}
+
+/**
+ * Configuration for computed fields (read-only, calculated at runtime)
+ */
+export interface ComputedFieldConfig {
+  /** Field name (used in queries and results) */
+  name: string;
+
+  /** Field type */
+  type: FieldType;
+
+  /** Human-readable description */
+  description?: string;
+
+  /** Simple expression for computation (e.g., "endLine - startLine") */
+  expression?: string;
+
+  /** Cypher query for complex computation (e.g., "OPTIONAL MATCH (n)-[:HAS_CHANGE]->...") */
+  cypher?: string;
+
+  /** Cache computed values in Neo4j (default: false) */
+  materialized?: boolean;
+
+  /** Neo4j property name for cached value (required if materialized=true) */
+  cache_property?: string;
 }
 
 /**
@@ -276,14 +307,14 @@ export interface EmbeddingRelationshipConfig {
 }
 
 /**
- * Configuration for source code ingestion
+ * Configuration for source ingestion (code or documents)
  */
 export interface SourceConfig {
-  /** Type of source to ingest (only 'code' is supported currently) */
-  type: 'code';
+  /** Type of source to ingest */
+  type: 'code' | 'document';
 
-  /** Adapter to use for parsing (e.g., 'typescript', 'python') */
-  adapter: 'typescript' | 'python';
+  /** Adapter to use for parsing */
+  adapter: 'typescript' | 'python' | 'tika';
 
   /** Base path for resolving relative paths (optional, defaults to project root) */
   root?: string;
@@ -298,7 +329,21 @@ export interface SourceConfig {
   track_changes?: boolean;
 
   /** Additional options passed to the adapter */
-  options?: Record<string, any>;
+  options?: SourceAdapterOptions;
+}
+
+/**
+ * Options for source adapters
+ */
+export interface SourceAdapterOptions {
+  // Document chunking (for llamaindex adapter)
+  chunk_size?: number;
+  chunk_overlap?: number;
+  chunking_strategy?: 'fixed_size' | 'semantic' | 'sentence' | 'paragraph';
+  preserve_sentences?: boolean;
+
+  // Other adapter-specific options
+  [key: string]: any;
 }
 
 /**
@@ -359,4 +404,104 @@ export interface EmbeddingProviderConfig {
 
   /** Additional provider-specific options */
   options?: Record<string, any>;
+}
+
+/**
+ * Configuration for LLM-based topic extraction from document chunks
+ */
+export interface TopicExtractionConfig {
+  /** Enable topic extraction (default: false) */
+  enabled: boolean;
+
+  /** LLM configuration for extraction */
+  llm: {
+    /** Provider (e.g., 'gemini', 'openai') */
+    provider: string;
+
+    /** Model ID (e.g., 'gemini-1.5-flash' for speed) */
+    model: string;
+
+    /** Temperature (default: 0.3 for more deterministic extraction) */
+    temperature?: number;
+
+    /** API key (optional, can use env var) */
+    api_key?: string;
+  };
+
+  /** Extraction parameters */
+  extraction: {
+    /** Minimum chunk length (chars) to trigger extraction (default: 100) */
+    min_chunk_length?: number;
+
+    /** Maximum topics per chunk (default: 3) */
+    max_topics_per_chunk?: number;
+
+    /** Minimum confidence score to keep topic (0-1, default: 0.6) */
+    min_confidence?: number;
+
+    /** Number of previous chunks to include for context (default: 2) */
+    context_window?: number;
+  };
+
+  /** Topic similarity and deduplication */
+  similarity: {
+    /** Similarity threshold for merging similar topics (default: 0.85) */
+    threshold?: number;
+
+    /** Use embeddings for similarity (default: true) */
+    use_embeddings?: boolean;
+  };
+}
+
+/**
+ * Configuration for LLM-based topic merging and consolidation
+ */
+export interface TopicMergingConfig {
+  /** Enable topic merging (default: false) */
+  enabled: boolean;
+
+  /** LLM configuration for merge decisions */
+  llm: {
+    /** Provider (e.g., 'gemini', 'openai') */
+    provider: string;
+
+    /** Model ID (e.g., 'gemini-1.5-pro' for better reasoning) */
+    model: string;
+
+    /** Temperature (default: 0.2 for conservative decisions) */
+    temperature?: number;
+
+    /** API key (optional, can use env var) */
+    api_key?: string;
+  };
+
+  /** Clustering parameters */
+  clustering: {
+    /** Similarity threshold for clustering topics (default: 0.85) */
+    similarity_threshold?: number;
+
+    /** Minimum cluster size to consider merging (default: 2) */
+    min_cluster_size?: number;
+
+    /** Maximum cluster size (default: 5, don't merge too many at once) */
+    max_cluster_size?: number;
+  };
+
+  /** Merge decision criteria */
+  merge_criteria?: {
+    /** Minimum chunk overlap ratio to merge (0-1, default: 0.3) */
+    min_chunk_overlap?: number;
+
+    /** Require keyword overlap (default: true) */
+    require_keyword_overlap?: boolean;
+  };
+
+  /** Scheduling configuration */
+  schedule: {
+    /** Trigger mode: 'manual', 'auto_after_ingestion', 'periodic' (default: 'manual') */
+    trigger?: 'manual' | 'auto_after_ingestion' | 'periodic';
+
+    /** Batch size - process N clusters at a time (default: 10) */
+    batch_size?: number;
+  };
 }

@@ -1,0 +1,74 @@
+# RagForge Configuration
+# This file has been expanded with default settings for tika
+#
+# Fields marked as "auto-added" come from adapter defaults and can be customized.
+# Your original values are preserved and will not be overwritten.
+#
+# See https://docs.ragforge.dev for more information.
+
+name: my-documents
+version: 1.0.0
+description: Document knowledge base with semantic search
+source:
+  type: document
+  adapter: tika
+  root: ./docs
+  include:
+    - "**/*.pdf"
+    - "**/*.docx"
+    - "**/*.pptx"
+    - "**/*.xlsx"
+    - "**/*.md"
+    - "**/*.txt"
+    - "**/*.epub"
+    - "**/*.html"
+    - "**/*.htm"
+    - "**/*.jpg"
+    - "**/*.png"
+  exclude:
+    # Node.js dependencies
+    - "**/node_modules/**"
+  options:
+    ocr:
+      enabled: true
+      languages:
+        - eng
+        - fra
+    chunking:
+      chunk_size: 1000
+      chunk_overlap: 200
+neo4j:
+  uri: ${NEO4J_URI}
+  database: neo4j
+  username: ${NEO4J_USERNAME}
+  password: ${NEO4J_PASSWORD}
+entities:
+  - name: Document
+    unique_field: path
+    display_name_field: title
+    searchable_fields:
+      - name: title
+        type: string
+      - name: author
+        type: string
+  - name: Chunk
+    unique_field: uuid
+    searchable_fields:
+      - name: content
+        type: string
+    vector_indexes:
+      - name: chunkEmbeddings
+        field: embedding
+        source_field: content
+        dimension: 768
+        similarity: cosine
+        provider: gemini
+        model: text-embedding-004
+embeddings:
+  provider: gemini
+  entities:
+    - entity: Chunk
+      pipelines:
+        - name: chunkEmbeddings
+          source: content
+          target_property: embedding

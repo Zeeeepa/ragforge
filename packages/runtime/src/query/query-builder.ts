@@ -29,7 +29,7 @@ import type {
   FilterOperation,
   ClientFilterOperation
 } from './operations.js';
-import type { EntityContext } from '../types/entity-context.js';
+import type { EntityContext, ComputedFieldConfig } from '../types/entity-context.js';
 import {
   StructuredLLMExecutor,
   type LLMStructuredCallConfig,
@@ -1733,6 +1733,13 @@ export class QueryBuilder<T = any> {
     // Return clause
     cypher += `\nRETURN n`;
 
+    // Add computed fields to return (Phase 3)
+    if (this.entityContext?.computedFields && this.entityContext.computedFields.length > 0) {
+      for (const cf of this.entityContext.computedFields) {
+        cypher += `, ${this.buildComputedFieldExpression(cf)} AS ${cf.name}`;
+      }
+    }
+
     // Add related entities to return
     if (this.expansions.length > 0) {
       for (let i = 0; i < this.expansions.length; i++) {
@@ -1742,12 +1749,77 @@ export class QueryBuilder<T = any> {
 
     // Order by
     if (this._orderBy) {
-      cypher += `\nORDER BY n.${this._orderBy.field} ${this._orderBy.direction}`;
+      cypher += `\nORDER BY ${this.buildOrderByExpression(this._orderBy.field)} ${this._orderBy.direction}`;
     }
 
     // Note: We don't add LIMIT/OFFSET here as we handle that after reranking
 
     return { query: cypher, params };
+  }
+
+  /**
+   * Build ORDER BY expression, supporting both regular and computed fields
+   */
+  private buildOrderByExpression(field: string): string {
+    // Check if this is a computed field
+    const computedField = this.entityContext?.computedFields?.find(cf => cf.name === field);
+
+    if (computedField) {
+      return this.buildComputedFieldExpression(computedField);
+    }
+
+    // Regular field - use property access
+    return `n.${field}`;
+  }
+
+  /**
+   * Build Cypher expression for a computed field
+   */
+  private buildComputedFieldExpression(computedField: ComputedFieldConfig): string {
+    // Handle materialized (cached) computed fields
+    if (computedField.materialized && computedField.cache_property) {
+      return `n.${computedField.cache_property}`;
+    }
+
+    // Handle expression-based computed fields
+    if (computedField.expression) {
+      return this.expressionToCypher(computedField.expression);
+    }
+
+    // Handle custom Cypher computed fields
+    if (computedField.cypher) {
+      // Custom Cypher should return a scalar value
+      return `(${computedField.cypher})`;
+    }
+
+    // Fallback: return null
+    return 'null';
+  }
+
+  /**
+   * Convert a simple expression to Cypher syntax
+   * Example: "endLine - startLine" -> "n.endLine - n.startLine"
+   */
+  private expressionToCypher(expression: string): string {
+    const identifierPattern = /\b([a-zA-Z_][a-zA-Z0-9_]*)(?=\s|[^\w.]|$|\.[a-zA-Z_])/g;
+
+    return expression.replace(identifierPattern, (match) => {
+      // Don't replace Cypher keywords
+      const keywords = new Set([
+        'true', 'false', 'null',
+        'AND', 'OR', 'NOT', 'XOR',
+        'IN', 'IS', 'AS',
+        'COUNT', 'SUM', 'AVG', 'MIN', 'MAX',
+        'CASE', 'WHEN', 'THEN', 'ELSE', 'END'
+      ]);
+
+      if (keywords.has(match.toUpperCase())) {
+        return match;
+      }
+
+      // Replace with node property access
+      return `n.${match}`;
+    });
   }
 
   /**

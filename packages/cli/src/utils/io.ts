@@ -232,6 +232,45 @@ export async function persistGeneratedArtifacts(
   await writeFileIfChanged(path.join(scriptsDir, 'rebuild-agent.ts'), generated.rebuildAgentScript);
   logGenerated('scripts/rebuild-agent.ts');
 
+  // Write text2cypher script (natural language to Cypher)
+  if (generated.text2cypher) {
+    await writeFileIfChanged(path.join(outDir, 'text2cypher.ts'), generated.text2cypher);
+    logGenerated('text2cypher.ts');
+  }
+
+  // Write tool artifacts (Phase 2: Tool Generation)
+  if (generated.tools) {
+    const toolsDir = path.join(outDir, 'tools');
+    await fs.mkdir(toolsDir, { recursive: true });
+
+    // Always regenerate database-tools.ts (auto-generated)
+    await writeFileIfChanged(
+      path.join(toolsDir, 'database-tools.ts'),
+      generated.tools.databaseTools
+    );
+    logGenerated('tools/database-tools.ts');
+
+    // Only write custom-tools.ts if it doesn't exist (user-editable, preserved)
+    const customToolsPath = path.join(toolsDir, 'custom-tools.ts');
+    try {
+      await fs.access(customToolsPath);
+      logSkipped('tools/custom-tools.ts', 'already exists, preserving user edits');
+    } catch {
+      // File doesn't exist, write it
+      await writeFileIfChanged(customToolsPath, generated.tools.customTools);
+      logGenerated('tools/custom-tools.ts');
+    }
+
+    // Always regenerate tools/index.ts
+    await writeFileIfChanged(
+      path.join(toolsDir, 'index.ts'),
+      generated.tools.index
+    );
+    logGenerated('tools/index.ts');
+  } else {
+    logSkipped('tools directory', 'no tools generated');
+  }
+
   // In dev mode, use file: dependency instead of copying runtime
   // No longer copy runtime package, just use file: in package.json
   await writeGeneratedPackageJson(outDir, projectName, dev, generated, rootDir);
@@ -451,7 +490,8 @@ async function writeGeneratedPackageJson(
       : 'ragforge generate --config ./ragforge.config.yaml --out . --force --auto-detect-fields',
     'rebuild:agent': 'tsx ./scripts/rebuild-agent.ts',
     'embeddings:index': 'tsx ./scripts/create-vector-indexes.ts',
-    'embeddings:generate': 'tsx ./scripts/generate-embeddings.ts'
+    'embeddings:generate': 'tsx ./scripts/generate-embeddings.ts',
+    'ask': 'tsx ./text2cypher.ts'
   };
 
   // Add summarization script if enabled

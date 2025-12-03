@@ -5,9 +5,11 @@
  */
 
 import type { Neo4jClient } from '../client/neo4j-client.js';
-import type { ParsedGraph, ParsedNode, ParsedRelationship } from './types.js';
+import type { ParsedGraph, ParsedNode, ParsedRelationship, SourceConfig } from './types.js';
 import type { CodeSourceConfig } from './code-source-adapter.js';
+import type { TikaSourceConfig } from './document/tika-source-adapter.js';
 import { CodeSourceAdapter } from './code-source-adapter.js';
+import { TikaSourceAdapter } from './document/tika-source-adapter.js';
 import { ChangeTracker } from './change-tracker.js';
 
 export interface IncrementalStats {
@@ -15,6 +17,20 @@ export interface IncrementalStats {
   updated: number;
   created: number;
   deleted: number;
+}
+
+/**
+ * Factory function to create appropriate adapter based on source config
+ */
+function createAdapter(config: SourceConfig): CodeSourceAdapter | TikaSourceAdapter {
+  if (config.type === 'code') {
+    const codeConfig = config as CodeSourceConfig;
+    return new CodeSourceAdapter(codeConfig.adapter as 'typescript' | 'python');
+  } else if (config.type === 'document') {
+    return new TikaSourceAdapter();
+  } else {
+    throw new Error(`Unsupported source type: ${config.type}`);
+  }
 }
 
 export class IncrementalIngestionManager {
@@ -344,13 +360,13 @@ export class IncrementalIngestionManager {
   }
 
   /**
-   * High-level method to ingest code from configured paths
+   * High-level method to ingest content from configured source
    *
-   * @param config - Source configuration with paths, languages, etc.
+   * @param config - Source configuration (code, documents, etc.)
    * @param options - Ingestion options
    */
   async ingestFromPaths(
-    config: CodeSourceConfig,
+    config: SourceConfig,
     options: {
       incremental?: boolean;
       verbose?: boolean;
@@ -364,7 +380,8 @@ export class IncrementalIngestionManager {
 
     if (verbose) {
       const pathCount = config.include?.length || 0;
-      console.log(`\n🔄 Ingesting code from ${pathCount} path(s)...`);
+      const sourceType = config.type === 'code' ? 'code' : 'documents';
+      console.log(`\n🔄 Ingesting ${sourceType} from ${pathCount} path(s)...`);
       console.log(`   Base path: ${config.root || '.'}`);
       console.log(`   Mode: ${incremental ? 'incremental' : 'full'}`);
       if (trackChanges) {
@@ -373,15 +390,25 @@ export class IncrementalIngestionManager {
     }
 
     // Create adapter and parse
-    const adapter = new CodeSourceAdapter(config.adapter as 'typescript' | 'python');
+    const adapter = createAdapter(config);
     const parseResult = await adapter.parse({
       source: config,
       onProgress: undefined
     });
 
     if (verbose) {
-      const scopeCount = parseResult.graph.nodes.filter(n => n.labels.includes('Scope')).length;
-      console.log(`\n✅ Parsed ${scopeCount} scopes from source`);
+      // Generic entity count (works for both Scope and Document/Chunk)
+      const entityCounts = new Map<string, number>();
+      for (const node of parseResult.graph.nodes) {
+        for (const label of node.labels) {
+          entityCounts.set(label, (entityCounts.get(label) || 0) + 1);
+        }
+      }
+
+      const countStr = Array.from(entityCounts.entries())
+        .map(([label, count]) => `${count} ${label}${count !== 1 ? 's' : ''}`)
+        .join(', ');
+      console.log(`\n✅ Parsed ${countStr} from source`);
     }
 
     // Ingest
@@ -394,11 +421,11 @@ export class IncrementalIngestionManager {
     } else {
       // Full ingestion
       await this.ingestNodes(parseResult.graph.nodes, parseResult.graph.relationships);
-      const scopeCount = parseResult.graph.nodes.filter(n => n.labels.includes('Scope')).length;
+      const totalNodes = parseResult.graph.nodes.length;
       return {
         unchanged: 0,
         updated: 0,
-        created: scopeCount,
+        created: totalNodes,
         deleted: 0
       };
     }
