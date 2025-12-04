@@ -103,6 +103,9 @@ export interface EntityConfig {
   content_field?: string;       // Field containing the full content to read (e.g., 'source' for code, 'body' for documents)
   example_display_fields?: string[];  // Additional fields to display in examples (default: [])
 
+  // Hierarchical content configuration (for entities where content is split across parent/children)
+  hierarchical_content?: HierarchicalContentConfig;
+
   // Change tracking configuration
   track_changes?: boolean;      // Enable change tracking for this entity (default: false)
   change_tracking?: ChangeTrackingConfig;  // Change tracking configuration
@@ -120,6 +123,18 @@ export interface ChangeTrackingConfig {
 
   /** Field containing the content hash for change detection (default: 'hash') */
   hash_field?: string;
+}
+
+/**
+ * Configuration for hierarchical content (entities where content is split across parent/children)
+ * Example: A class entity only has its signature, methods are child entities linked via HAS_PARENT
+ */
+export interface HierarchicalContentConfig {
+  /** Relationship type that links children to this entity (e.g., 'HAS_PARENT') */
+  children_relationship: string;
+
+  /** Whether to include children content when fetching this entity's full content */
+  include_children: boolean;
 }
 
 export interface FieldConfig {

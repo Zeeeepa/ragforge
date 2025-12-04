@@ -54,12 +54,11 @@ async function main() {
   // Read and display the log file
   console.log('\n📄 Log file content preview:');
   const logContent = fs.readFileSync('./agent-logs.json', 'utf-8');
-  const logs = JSON.parse(logContent);
-  const lastSession = logs[logs.length - 1];
+  const session = JSON.parse(logContent);  // Now a single session, not array
 
   // Show tool calls and results
   console.log('\n🔧 Tool Calls & Results:');
-  for (const entry of lastSession.entries) {
+  for (const entry of session.entries || []) {
     if (entry.type === 'tool_call') {
       console.log(`\n   CALL: ${entry.data.toolName}`);
       console.log(`   Args: ${JSON.stringify(entry.data.arguments)}`);

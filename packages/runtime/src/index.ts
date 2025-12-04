@@ -7,6 +7,9 @@
 // Client
 export { Neo4jClient } from './client/neo4j-client.js';
 
+// Re-export neo4j driver for scripts that need neo4j.int(), etc.
+export { default as neo4j } from 'neo4j-driver';
+
 // Query
 export { QueryBuilder } from './query/query-builder.js';
 

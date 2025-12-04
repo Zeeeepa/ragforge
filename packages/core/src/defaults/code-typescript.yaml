@@ -31,6 +31,10 @@ summarization_llm:
 entities:
   - name: Scope
     unique_field: uuid
+    content_field: source  # Full content field for agent to read
+    hierarchical_content:
+      children_relationship: HAS_PARENT  # Children link to parent via this relationship
+      include_children: true             # Full content includes children
     vector_indexes:
       - name: scopeSourceEmbeddings
         field: source_embedding

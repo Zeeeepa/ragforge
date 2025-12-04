@@ -21,8 +21,9 @@
  * ```
  */
 
-import { generateToolsFromConfig } from '@luciformresearch/ragforge-core';
-import type { RagForgeConfig, ToolGenerationOptions, GeneratedToolDefinition, ToolHandlerGenerator } from '@luciformresearch/ragforge-core';
+import { generateToolsFromConfig } from '../tools/tool-generator.js';
+import type { ToolGenerationOptions, GeneratedToolDefinition, ToolHandlerGenerator } from '../tools/types/index.js';
+import type { RagForgeConfig } from '@luciformresearch/ragforge-core';
 import { StructuredLLMExecutor, BaseToolExecutor, type ToolCallRequest } from '../llm/structured-llm-executor.js';
 import { GeminiAPIProvider } from '../reranking/gemini-api-provider.js';
 import { GeminiNativeToolProvider, type ToolDefinition } from '../llm/native-tool-calling/index.js';
@@ -144,20 +145,8 @@ class AgentLogger {
         fs.mkdirSync(dir, { recursive: true });
       }
 
-      // Append to log file or create new
-      let logs: AgentSessionLog[] = [];
-      if (fs.existsSync(this.logPath)) {
-        try {
-          const content = fs.readFileSync(this.logPath, 'utf-8');
-          logs = JSON.parse(content);
-        } catch {
-          logs = [];
-        }
-      }
-
-      logs.push(this.currentSession);
-
-      fs.writeFileSync(this.logPath, JSON.stringify(logs, null, 2));
+      // Overwrite log file with current session only
+      fs.writeFileSync(this.logPath, JSON.stringify(this.currentSession, null, 2));
     } catch (error) {
       console.error('Failed to write agent log:', error);
     }
@@ -651,7 +640,7 @@ export async function createRagAgent(options: RagAgentOptions): Promise<RagAgent
   // 3. Bind handlers with RagClient
   const boundHandlers: Record<string, (args: Record<string, any>) => Promise<any>> = {};
   for (const [name, handlerGen] of Object.entries(handlers)) {
-    boundHandlers[name] = handlerGen(options.ragClient);
+    boundHandlers[name] = (handlerGen as (rag: any) => (args: Record<string, any>) => Promise<any>)(options.ragClient);
   }
 
   // 4. Create LLM providers

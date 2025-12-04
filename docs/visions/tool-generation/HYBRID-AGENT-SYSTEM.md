@@ -571,6 +571,97 @@ Agent:
 
 ---
 
+## Contenu hiérarchique (classes, documents, etc.)
+
+### Problème
+
+Certaines entités ont un contenu hiérarchique:
+- **Code**: Une classe n'a que sa signature (36 chars), les méthodes sont des scopes enfants
+- **Documents**: Un document peut être découpé en chunks liés par `PART_OF`
+- **Modules**: Contient des fonctions liées par `DEFINED_IN`
+
+```
+StructuredLLMExecutor (class) - 36 chars (juste "export class X {")
+├── constructor (method) - 136 chars
+├── executeLLMBatch (method) - 2287 chars
+├── parseXMLResponse (method) - 5398 chars
+└── ... 50+ méthodes avec leur source complet
+```
+
+### Option 1: Approche simple (actuelle) ✅ COMMENCER PAR LÀ
+
+L'agent découvre la structure via `get_schema`:
+- Voit que `Scope` a une relation `HAS_PARENT` entrante
+- Comprend qu'il peut y avoir des enfants
+- Après `get_entities_by_ids`, si le contenu est court, utilise `explore_relationships` pour chercher les enfants
+
+**Avantages:**
+- Pas de config supplémentaire
+- L'agent apprend à naviguer le graphe
+- Générique pour tous les cas
+
+**Inconvénients:**
+- L'agent doit "deviner" qu'il faut chercher les enfants
+- Plus de round-trips
+
+### Option 2: Config explicite (si Option 1 échoue)
+
+Ajouter un champ `hierarchical_content` dans la config:
+
+```yaml
+entities:
+  Scope:
+    content_field: source
+    # NEW: indique que le contenu complet inclut les enfants
+    hierarchical_content:
+      children_relationship: HAS_PARENT  # relation inverse (enfants → parent)
+      include_children: true
+```
+
+**Ce que `get_schema` retournerait:**
+```json
+{
+  "Scope": {
+    "content_field": "source",
+    "hierarchical_content": {
+      "has_children": true,
+      "children_relationship": "HAS_PARENT",
+      "direction": "incoming"
+    }
+  }
+}
+```
+
+**L'agent saurait explicitement:**
+- Ce scope peut avoir des enfants
+- Pour le contenu complet, fetch les enfants via `HAS_PARENT`
+
+**Avantages:**
+- L'agent sait exactement quoi faire
+- Moins de round-trips potentiels
+- Pourrait permettre un outil `get_entity_with_children`
+
+**Inconvénients:**
+- Config plus complexe
+- Spécifique à certains domaines
+
+### Décision
+
+1. ~~**D'abord tester Option 1** - voir si l'agent navigue correctement~~ ❌ Testé, l'agent ne devine pas
+2. **Implémenter Option 2** avec config explicite ✅ IMPLÉMENTÉ
+
+**Résultat test Option 1:**
+L'agent a fait `semantic_search` → `get_entities_by_ids` mais s'est arrêté quand il a reçu 36 chars de source.
+Il n'a pas pensé à explorer les enfants via `HAS_PARENT`. Les tips génériques ne suffisent pas.
+
+**Implémentation Option 2:**
+- `hierarchical_content` ajouté à `EntityConfig` dans `config.ts`
+- Exposé dans `get_schema` avec un tip explicite
+- L'agent reçoit maintenant: `"hierarchical_content": {"children_relationship":"HAS_PARENT","include_children":true}`
+- Tip généré: `"HIERARCHICAL: Scope content may be split across parent/children. If content_field is short, use explore_relationships with HAS_PARENT (direction: incoming) to fetch children"`
+
+---
+
 ## Future: Outils composés (streamlined)
 
 Actuellement l'agent doit faire 3 appels séparés:
