@@ -9,6 +9,7 @@ export { Neo4jClient } from './client/neo4j-client.js';
 
 // Re-export neo4j driver for scripts that need neo4j.int(), etc.
 export { default as neo4j } from 'neo4j-driver';
+import neo4jDriver from 'neo4j-driver';
 
 // Query
 export { QueryBuilder } from './query/query-builder.js';
@@ -294,9 +295,18 @@ export function createClient(config: RuntimeConfig) {
 
     /**
      * Execute raw Cypher query
+     * Auto-converts whole numbers to neo4j.int() for LIMIT, SKIP, etc.
      */
     async raw(cypher: string, params?: Record<string, any>) {
-      return neo4jClient.run(cypher, params);
+      const convertedParams = params ? Object.fromEntries(
+        Object.entries(params).map(([key, value]) => [
+          key,
+          typeof value === 'number' && Number.isInteger(value)
+            ? neo4jDriver.int(value)
+            : value
+        ])
+      ) : undefined;
+      return neo4jClient.run(cypher, convertedParams);
     },
 
     /**

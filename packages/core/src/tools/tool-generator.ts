@@ -90,6 +90,11 @@ export function generateToolsFromConfig(
   tools.push(getByIds);
   handlers[getByIds.name] = generateGetEntitiesByIdsHandler(context);
 
+  // 4c. glob_search (pattern matching on any field)
+  const globSearch = generateGlobSearchTool(context);
+  tools.push(globSearch);
+  handlers[globSearch.name] = generateGlobSearchHandler(context);
+
   // 5. Change tracking tools (Phase 5 - if change tracking enabled)
   if (opts.includeChangeTracking) {
     const changeTools = generateChangeTrackingTools(context);
@@ -852,5 +857,149 @@ function generateGetEntitiesByIdsHandler(context: ToolGenerationContext): ToolHa
       fields_returned: requestedFields,
       results: filteredResults,
     };
+  };
+}
+
+/**
+ * Generate glob_search tool (pattern matching on any field)
+ */
+function generateGlobSearchTool(context: ToolGenerationContext): GeneratedToolDefinition {
+  const entityNames = context.entities.map(e => e.name);
+
+  // Build field documentation per entity
+  const fieldDocs = context.entities.map(entity => {
+    const stringFields = entity.searchableFields
+      .filter(f => f.type === 'string')
+      .map(f => f.name);
+    return `- ${entity.name}: ${stringFields.join(', ')}`;
+  }).join('\n');
+
+  const description = `Search entities using glob/wildcard patterns on any string field.
+
+Pattern syntax:
+- * matches any sequence of characters
+- ** matches any sequence including path separators (for file paths)
+- ? matches any single character
+- [abc] matches any character in brackets
+- [a-z] matches character range
+
+Examples:
+- glob_search("Scope", "file", "**/chains/*.ts") - find scopes in chains directories
+- glob_search("Scope", "name", "*Service") - find scopes ending with "Service"
+- glob_search("Scope", "file", "libs/langchain-core/**") - find scopes in a specific package
+
+Available entities and string fields:
+${fieldDocs}
+
+Use this for quick pattern-based filtering. Combine with semantic_search for best results.`;
+
+  return {
+    name: 'glob_search',
+    description,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        entity_type: {
+          type: 'string',
+          enum: entityNames,
+          description: 'Entity type to search',
+        },
+        field: {
+          type: 'string',
+          description: 'String field to match against (e.g., "file", "name")',
+        },
+        pattern: {
+          type: 'string',
+          description: 'Glob pattern to match (e.g., "**/chains/*.ts", "*Service")',
+        },
+        limit: {
+          type: 'number',
+          description: 'Max results (default: 20, max: 50)',
+          default: 20,
+        },
+      },
+      required: ['entity_type', 'field', 'pattern'],
+    },
+  };
+}
+
+/**
+ * Convert glob pattern to regex for Neo4j =~ operator
+ */
+function globToRegexSimple(pattern: string): string {
+  // Escape regex special chars except glob chars
+  let regex = pattern
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')  // Escape regex special chars
+    .replace(/\*\*/g, '<<<GLOBSTAR>>>')     // Temp placeholder for **
+    .replace(/\*/g, '[^/]*')                // * matches anything except /
+    .replace(/<<<GLOBSTAR>>>/g, '.*')       // ** matches anything including /
+    .replace(/\?/g, '.');                   // ? matches single char
+
+  // Make it match the whole string
+  return `(?i)${regex}`;  // (?i) for case-insensitive
+}
+
+/**
+ * Generate handler for glob_search
+ */
+function generateGlobSearchHandler(context: ToolGenerationContext): ToolHandlerGenerator {
+  return (rag: any) => async (params: any) => {
+    const { entity_type, field, pattern, limit = 20 } = params;
+
+    const entityMeta = context.entities.find(e => e.name === entity_type);
+    if (!entityMeta) {
+      return { error: `Unknown entity: ${entity_type}` };
+    }
+
+    // Validate field exists and is a string type
+    const fieldMeta = entityMeta.searchableFields.find(f => f.name === field);
+    if (!fieldMeta) {
+      const validFields = entityMeta.searchableFields.map(f => f.name).join(', ');
+      return { error: `Unknown field "${field}" for ${entity_type}. Valid fields: ${validFields}` };
+    }
+    if (fieldMeta.type !== 'string') {
+      return { error: `Field "${field}" is not a string field. Glob patterns only work on string fields.` };
+    }
+
+    // Convert glob to regex
+    const regexPattern = globToRegexSimple(pattern);
+
+    // Execute raw Cypher query
+    const cypher = `
+      MATCH (n:${entity_type})
+      WHERE n.${field} =~ $pattern
+      RETURN n
+      LIMIT $limit
+    `;
+
+    try {
+      const result = await rag.raw(cypher, {
+        pattern: regexPattern,
+        limit: Math.min(limit, 50)
+      });
+
+      const results = result.records.map((record: any) => {
+        const node = record.get('n');
+        const filtered: any = {};
+        for (const [k, v] of Object.entries(node.properties)) {
+          if (!k.includes('embedding') && k !== 'source') {
+            filtered[k] = v;
+          }
+        }
+        return filtered;
+      });
+
+      return {
+        entity_type,
+        field,
+        pattern,
+        regex_used: regexPattern,
+        count: results.length,
+        unique_field: entityMeta.uniqueField,
+        results,
+      };
+    } catch (err: any) {
+      return { error: `Query failed: ${err.message}` };
+    }
   };
 }

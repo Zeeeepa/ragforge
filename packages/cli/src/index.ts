@@ -33,6 +33,11 @@ import {
   runQuickstart,
   printQuickstartHelp
 } from './commands/quickstart.js';
+import {
+  parseCreateOptions,
+  runCreate,
+  printCreateHelp
+} from './commands/create.js';
 
 import { VERSION } from './version.js';
 
@@ -41,6 +46,7 @@ function printRootHelp(): void {
 
 Quick start:
   ragforge quickstart                # New to RagForge? Start here!
+  ragforge create <name>             # Create a new TypeScript project
   ragforge init                      # Introspect Neo4j + generate client (uses .env)
   ragforge init --auto-detect-fields # + LLM field detection (needs GEMINI_API_KEY)
 
@@ -49,6 +55,7 @@ Connection defaults from .env in current directory:
 
 Usage:
   ragforge quickstart [options]      Quick setup for code RAG with defaults
+  ragforge create <name> [options]   Create a new TypeScript project
   ragforge init [options]            Complete setup (introspect + generate)
   ragforge help <command>            Show detailed help for a specific command
 
@@ -112,6 +119,9 @@ async function main(): Promise<void> {
           case 'quickstart':
             printQuickstartHelp();
             break;
+          case 'create':
+            printCreateHelp();
+            break;
           case 'init':
             printInitHelp();
             break;
@@ -132,6 +142,12 @@ async function main(): Promise<void> {
       case 'quickstart': {
         const options = await parseQuickstartOptions(rest);
         await runQuickstart(options);
+        return;
+      }
+
+      case 'create': {
+        const options = parseCreateOptions(rest);
+        await runCreate(options);
         return;
       }
 

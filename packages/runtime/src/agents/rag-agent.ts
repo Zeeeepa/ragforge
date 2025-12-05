@@ -21,9 +21,8 @@
  * ```
  */
 
-import { generateToolsFromConfig } from '../tools/tool-generator.js';
-import type { ToolGenerationOptions, GeneratedToolDefinition, ToolHandlerGenerator } from '../tools/types/index.js';
-import type { RagForgeConfig } from '@luciformresearch/ragforge-core';
+import { generateToolsFromConfig, generateFileTools, IngestionLock, withIngestionLock } from '@luciformresearch/ragforge-core';
+import type { ToolGenerationOptions, GeneratedToolDefinition, ToolHandlerGenerator, RagForgeConfig, FileToolsContext } from '@luciformresearch/ragforge-core';
 import { StructuredLLMExecutor, BaseToolExecutor, type ToolCallRequest } from '../llm/structured-llm-executor.js';
 import { GeminiAPIProvider } from '../reranking/gemini-api-provider.js';
 import { GeminiNativeToolProvider, type ToolDefinition } from '../llm/native-tool-calling/index.js';
@@ -217,6 +216,31 @@ export interface RagAgentOptions {
    * Useful for debugging agent behavior
    */
   logPath?: string;
+
+  /**
+   * Include file tools (read_file, write_file, edit_file)
+   * Enables the agent to read, create, and modify files
+   * Default: false
+   */
+  includeFileTools?: boolean;
+
+  /**
+   * Project root for file tools (required if includeFileTools is true)
+   * File paths will be resolved relative to this directory
+   */
+  projectRoot?: string;
+
+  /**
+   * ChangeTracker instance for tracking file modifications
+   * Optional: if provided, file changes will be tracked in Neo4j
+   */
+  changeTracker?: any;
+
+  /**
+   * Callback when a file is modified
+   * Use this to trigger re-ingestion of the file into the code graph
+   */
+  onFileModified?: (filePath: string, changeType: 'created' | 'updated' | 'deleted') => Promise<void>;
 }
 
 export interface AskResult {
@@ -641,6 +665,56 @@ export async function createRagAgent(options: RagAgentOptions): Promise<RagAgent
   const boundHandlers: Record<string, (args: Record<string, any>) => Promise<any>> = {};
   for (const [name, handlerGen] of Object.entries(handlers)) {
     boundHandlers[name] = (handlerGen as (rag: any) => (args: Record<string, any>) => Promise<any>)(options.ragClient);
+  }
+
+  // 3b. Add file tools if enabled
+  let ingestionLock: IngestionLock | undefined;
+
+  if (options.includeFileTools) {
+    if (!options.projectRoot) {
+      throw new Error('projectRoot is required when includeFileTools is true');
+    }
+
+    // Create ingestion lock for coordinating file tools with RAG queries
+    ingestionLock = new IngestionLock({
+      timeout: 60000, // 60s max for re-ingestion
+      onStatusChange: (status) => {
+        if (options.verbose) {
+          if (status.isLocked) {
+            console.log(`   🔒 Ingestion lock: ${status.currentFile}`);
+          } else {
+            console.log(`   🔓 Ingestion lock released`);
+          }
+        }
+      },
+    });
+
+    const fileToolsCtx: FileToolsContext = {
+      projectRoot: options.projectRoot,
+      changeTracker: options.changeTracker,
+      onFileModified: options.onFileModified,
+      ingestionLock,
+    };
+
+    const fileTools = generateFileTools(fileToolsCtx);
+    tools.push(...fileTools.tools);
+    Object.assign(boundHandlers, fileTools.handlers);
+
+    // Wrap RAG tool handlers with ingestion lock check
+    const ragToolNames = Object.keys(handlers);
+    for (const toolName of ragToolNames) {
+      const originalHandler = boundHandlers[toolName];
+      if (originalHandler) {
+        boundHandlers[toolName] = withIngestionLock(originalHandler, ingestionLock, {
+          waitForUnlock: true,  // Wait up to 5s for ingestion to complete
+          waitTimeout: 5000,
+        });
+      }
+    }
+
+    if (options.verbose) {
+      console.log(`   📁 File tools enabled (projectRoot: ${options.projectRoot})`);
+    }
   }
 
   // 4. Create LLM providers

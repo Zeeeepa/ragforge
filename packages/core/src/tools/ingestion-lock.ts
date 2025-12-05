@@ -1,0 +1,242 @@
+/**
+ * Ingestion Lock - Coordinates file modifications with RAG queries
+ *
+ * When a file is being modified and re-ingested, RAG queries should wait
+ * or be notified that data might be stale.
+ */
+
+export interface IngestionStatus {
+  isLocked: boolean;
+  currentFile?: string;
+  startedAt?: Date;
+  pendingFiles: string[];
+}
+
+export interface IngestionLockOptions {
+  /** Timeout in ms before auto-unlock (safety net). Default: 30000 */
+  timeout?: number;
+  /** Callback when lock state changes */
+  onStatusChange?: (status: IngestionStatus) => void;
+}
+
+/**
+ * Manages ingestion lock state
+ *
+ * Usage:
+ * ```typescript
+ * const lock = new IngestionLock();
+ *
+ * // In file tools
+ * const release = await lock.acquire('src/utils.ts');
+ * try {
+ *   await reIngestFile(...);
+ * } finally {
+ *   release();
+ * }
+ *
+ * // In RAG tools (wrapper)
+ * if (lock.isLocked()) {
+ *   return { error: 'Ingestion in progress...', status: lock.getStatus() };
+ * }
+ * ```
+ */
+export class IngestionLock {
+  private locked: boolean = false;
+  private currentFile?: string;
+  private startedAt?: Date;
+  private pendingFiles: string[] = [];
+  private timeoutHandle?: NodeJS.Timeout;
+  private waitingPromises: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
+  private options: Required<IngestionLockOptions>;
+
+  constructor(options: IngestionLockOptions = {}) {
+    this.options = {
+      timeout: options.timeout ?? 30000,
+      onStatusChange: options.onStatusChange ?? (() => {}),
+    };
+  }
+
+  /**
+   * Check if ingestion is currently in progress
+   */
+  isLocked(): boolean {
+    return this.locked;
+  }
+
+  /**
+   * Get current status
+   */
+  getStatus(): IngestionStatus {
+    return {
+      isLocked: this.locked,
+      currentFile: this.currentFile,
+      startedAt: this.startedAt,
+      pendingFiles: [...this.pendingFiles],
+    };
+  }
+
+  /**
+   * Acquire the lock for a file
+   * Returns a release function to call when done
+   */
+  async acquire(filePath: string): Promise<() => void> {
+    // If already locked, add to pending and wait
+    if (this.locked) {
+      this.pendingFiles.push(filePath);
+      this.notifyStatusChange();
+
+      await new Promise<void>((resolve, reject) => {
+        this.waitingPromises.push({ resolve, reject });
+      });
+
+      // Remove from pending when we get the lock
+      const idx = this.pendingFiles.indexOf(filePath);
+      if (idx >= 0) this.pendingFiles.splice(idx, 1);
+    }
+
+    // Acquire lock
+    this.locked = true;
+    this.currentFile = filePath;
+    this.startedAt = new Date();
+    this.notifyStatusChange();
+
+    // Safety timeout
+    this.timeoutHandle = setTimeout(() => {
+      console.warn(`[IngestionLock] Timeout reached for ${filePath}, force releasing`);
+      this.release();
+    }, this.options.timeout);
+
+    // Return release function
+    return () => this.release();
+  }
+
+  /**
+   * Release the lock
+   */
+  private release(): void {
+    if (this.timeoutHandle) {
+      clearTimeout(this.timeoutHandle);
+      this.timeoutHandle = undefined;
+    }
+
+    this.locked = false;
+    this.currentFile = undefined;
+    this.startedAt = undefined;
+    this.notifyStatusChange();
+
+    // Wake up next waiting promise
+    const next = this.waitingPromises.shift();
+    if (next) {
+      next.resolve();
+    }
+  }
+
+  /**
+   * Wait for the lock to be released
+   * Useful for RAG tools that want to wait instead of failing
+   */
+  async waitForUnlock(timeoutMs: number = 5000): Promise<boolean> {
+    if (!this.locked) return true;
+
+    return new Promise<boolean>((resolve) => {
+      const checkInterval = setInterval(() => {
+        if (!this.locked) {
+          clearInterval(checkInterval);
+          clearTimeout(timeout);
+          resolve(true);
+        }
+      }, 100);
+
+      const timeout = setTimeout(() => {
+        clearInterval(checkInterval);
+        resolve(false);
+      }, timeoutMs);
+    });
+  }
+
+  /**
+   * Get a user-friendly message about the current status
+   */
+  getBlockingMessage(): string {
+    if (!this.locked) {
+      return '';
+    }
+
+    const elapsed = this.startedAt
+      ? Math.round((Date.now() - this.startedAt.getTime()) / 1000)
+      : 0;
+
+    let msg = `⏳ Ingestion in progress for "${this.currentFile}" (${elapsed}s)`;
+
+    if (this.pendingFiles.length > 0) {
+      msg += `\n   Pending: ${this.pendingFiles.join(', ')}`;
+    }
+
+    msg += '\n   RAG queries will return fresh data once complete.';
+    msg += '\n   Please retry your query in a moment.';
+
+    return msg;
+  }
+
+  private notifyStatusChange(): void {
+    this.options.onStatusChange(this.getStatus());
+  }
+}
+
+/**
+ * Singleton instance for global lock coordination
+ */
+let globalLock: IngestionLock | null = null;
+
+export function getGlobalIngestionLock(): IngestionLock {
+  if (!globalLock) {
+    globalLock = new IngestionLock({
+      onStatusChange: (status) => {
+        if (status.isLocked) {
+          console.log(`🔒 Ingestion lock acquired: ${status.currentFile}`);
+        } else {
+          console.log(`🔓 Ingestion lock released`);
+        }
+      },
+    });
+  }
+  return globalLock;
+}
+
+/**
+ * Create a wrapper for RAG tool handlers that checks the lock
+ */
+export function withIngestionLock<T extends (...args: any[]) => Promise<any>>(
+  handler: T,
+  lock: IngestionLock,
+  options: {
+    /** If true, wait for unlock instead of failing immediately */
+    waitForUnlock?: boolean;
+    /** Max wait time in ms */
+    waitTimeout?: number;
+  } = {}
+): T {
+  return (async (...args: Parameters<T>) => {
+    if (lock.isLocked()) {
+      if (options.waitForUnlock) {
+        const unlocked = await lock.waitForUnlock(options.waitTimeout ?? 5000);
+        if (!unlocked) {
+          return {
+            error: 'Ingestion timeout',
+            message: lock.getBlockingMessage(),
+            status: lock.getStatus(),
+          };
+        }
+      } else {
+        return {
+          error: 'Ingestion in progress',
+          message: lock.getBlockingMessage(),
+          status: lock.getStatus(),
+          retry_after_ms: 1000,
+        };
+      }
+    }
+
+    return handler(...args);
+  }) as T;
+}

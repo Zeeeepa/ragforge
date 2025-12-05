@@ -46,6 +46,26 @@ export type {
   SemanticIndexInfo,
 } from './tools/discovery-tools.js';
 
+// File Tools (read, write, edit with change tracking)
+export {
+  generateFileTools,
+  generateReadFileTool,
+  generateWriteFileTool,
+  generateEditFileTool,
+  generateReadFileHandler,
+  generateWriteFileHandler,
+  generateEditFileHandler,
+} from './tools/file-tools.js';
+export type { FileToolsContext, FileToolsResult } from './tools/file-tools.js';
+
+// Ingestion Lock (coordinate file tools with RAG queries)
+export {
+  IngestionLock,
+  getGlobalIngestionLock,
+  withIngestionLock,
+} from './tools/ingestion-lock.js';
+export type { IngestionStatus, IngestionLockOptions } from './tools/ingestion-lock.js';
+
 // Computed Fields (Phase 3)
 export {
   evaluateComputedField,

@@ -41,6 +41,9 @@ Thumbs.db
 generated/
 *.generated.*
 
+# Test projects created by ragforge create
+examples/test-project/
+
 # Testing
 coverage/
 .nyc_output/

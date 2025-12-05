@@ -1,7 +1,14 @@
 import { promises as fs } from 'fs';
 import { spawn } from 'child_process';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import type { GeneratedCode } from '@luciformresearch/ragforge-core';
+
+// Get CLI's directory to find monorepo root in dev mode
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+// CLI is at packages/cli/dist/esm/utils/io.js, so monorepo root is 5 levels up
+const CLI_MONOREPO_ROOT = path.resolve(__dirname, '../../../../..');
 
 export async function prepareOutputDirectory(dir: string, force: boolean): Promise<void> {
   try {
@@ -233,6 +240,10 @@ export async function persistGeneratedArtifacts(
   await writeFileIfChanged(path.join(scriptsDir, 'rebuild-agent.ts'), generated.rebuildAgentScript);
   logGenerated('scripts/rebuild-agent.ts');
 
+  // Write test-agent script
+  await writeFileIfChanged(path.join(scriptsDir, 'test-agent.ts'), generated.testAgentScript);
+  logGenerated('scripts/test-agent.ts');
+
   // Write text2cypher script (natural language to Cypher)
   if (generated.text2cypher) {
     await writeFileIfChanged(path.join(outDir, 'text2cypher.ts'), generated.text2cypher);
@@ -415,34 +426,24 @@ async function writeGeneratedPackageJson(
   let codeparsersDependency = '^0.1.3';
 
   // In dev mode, use local file: dependencies instead of npm packages
-  if (dev && rootDir) {
-    // Find the monorepo root by looking for packages/runtime
-    let monorepoRoot = rootDir;
-    const candidates = [
-      path.join(rootDir, 'packages/runtime'),           // Already at monorepo root
-      path.join(rootDir, '../packages/runtime'),        // One level up
-      path.join(rootDir, '../../packages/runtime'),     // Two levels up
-      path.join(rootDir, '../ragforge/packages/runtime') // Sibling ragforge folder
-    ];
+  if (dev) {
+    // In dev mode, use CLI's own location to find monorepo root
+    // This works regardless of where the generated project is located
+    const runtimePath = path.join(CLI_MONOREPO_ROOT, 'packages/runtime');
 
-    for (const candidate of candidates) {
-      try {
-        await fs.access(candidate);
-        monorepoRoot = path.dirname(path.dirname(candidate)); // Go up to monorepo root
-        break;
-      } catch {
-        continue;
-      }
+    // Verify the runtime exists
+    try {
+      await fs.access(runtimePath);
+      const relativePath = path.relative(outDir, runtimePath);
+      runtimeDependency = `file:${relativePath}`;
+
+      // Also calculate codeparsers path (sibling to ragforge monorepo)
+      const codeparsersPath = path.join(CLI_MONOREPO_ROOT, '../packages/codeparsers');
+      const codeparsersRelativePath = path.relative(outDir, codeparsersPath);
+      codeparsersDependency = `file:${codeparsersRelativePath}`;
+    } catch {
+      console.warn(`⚠️  Dev mode: Could not find runtime at ${runtimePath}, using npm packages`);
     }
-
-    const runtimePath = path.join(monorepoRoot, 'packages/runtime');
-    const relativePath = path.relative(outDir, runtimePath);
-    runtimeDependency = `file:${relativePath}`;
-
-    // Also calculate codeparsers path
-    const codeparsersPath = path.join(monorepoRoot, '../packages/codeparsers');
-    const codeparsersRelativePath = path.relative(outDir, codeparsersPath);
-    codeparsersDependency = `file:${codeparsersRelativePath}`;
   }
 
   const pkg: any = {
@@ -475,28 +476,9 @@ async function writeGeneratedPackageJson(
 
   // Calculate CLI path for dev mode scripts
   let cliCommand = 'ragforge';
-  if (dev && rootDir) {
-    // Find the monorepo root by looking for packages/cli
-    let monorepoRoot = rootDir;
-    const candidates = [
-      path.join(rootDir, 'packages/cli'),           // Already at monorepo root
-      path.join(rootDir, '../packages/cli'),        // One level up
-      path.join(rootDir, '../../packages/cli'),     // Two levels up
-      path.join(rootDir, '../../../packages/cli'),  // Three levels up (examples/foo/generated)
-      path.join(rootDir, '../ragforge/packages/cli') // Sibling ragforge folder
-    ];
-
-    for (const candidate of candidates) {
-      try {
-        await fs.access(candidate);
-        monorepoRoot = path.dirname(path.dirname(candidate)); // Go up to monorepo root
-        break;
-      } catch {
-        continue;
-      }
-    }
-
-    const cliPath = path.join(monorepoRoot, 'packages/cli/dist/esm/index.js');
+  if (dev) {
+    // In dev mode, use CLI's own location
+    const cliPath = path.join(CLI_MONOREPO_ROOT, 'packages/cli/dist/esm/index.js');
     const relativeCli = path.relative(outDir, cliPath);
     cliCommand = `node ${relativeCli}`;
   }
@@ -511,6 +493,7 @@ async function writeGeneratedPackageJson(
       ? `${cliCommand} generate --config ./ragforge.config.yaml --out . --force --auto-detect-fields --dev`
       : 'ragforge generate --config ./ragforge.config.yaml --out . --force --auto-detect-fields',
     'rebuild:agent': 'tsx ./scripts/rebuild-agent.ts',
+    'agent:test': 'tsx ./scripts/test-agent.ts',
     'embeddings:index': 'tsx ./scripts/create-vector-indexes.ts',
     'embeddings:generate': 'tsx ./scripts/generate-embeddings.ts',
     'ask': 'tsx ./text2cypher.ts'

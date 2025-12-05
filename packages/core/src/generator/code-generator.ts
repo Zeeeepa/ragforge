@@ -76,6 +76,7 @@ export interface GeneratedCode {
   };
   examples: Map<string, string>; // example name -> TypeScript example code
   rebuildAgentScript: string;    // Script to rebuild agent documentation
+  testAgentScript: string;       // Script to test agent with domain-specific question
   tools?: {
     databaseTools: string;       // Auto-generated tools (DO NOT EDIT marker)
     customTools: string;         // User-editable tools (preserved across regeneration)
@@ -176,6 +177,10 @@ export class CodeGenerator {
     const rebuildAgentScript = loadTemplate('rebuild-agent.ts');
     const configLoader = loadTemplate('load-config.ts');
 
+    // Load and customize test-agent script with project-specific values
+    const testAgentScript = loadTemplate('scripts/test-agent.ts')
+      .replace(/\{\{PROJECT_NAME\}\}/g, config.name);
+
     // Generate tools (Phase 2: Tool Generation)
     const tools = this.generateToolsArtifacts(config);
 
@@ -204,6 +209,7 @@ export class CodeGenerator {
       scripts: sourceScripts,
       examples,
       rebuildAgentScript,
+      testAgentScript,
       tools,
       text2cypher
     };
@@ -934,6 +940,15 @@ export class CodeGenerator {
     lines.push(`   */`);
     lines.push(`  getFilters() {`);
     lines.push(`    return this.runtime.getFilters();`);
+    lines.push(`  }`);
+    lines.push(``);
+
+    // Add raw Cypher method
+    lines.push(`  /**`);
+    lines.push(`   * Execute raw Cypher query`);
+    lines.push(`   */`);
+    lines.push(`  async raw(cypher: string, params?: Record<string, any>) {`);
+    lines.push(`    return this.runtime.raw(cypher, params);`);
     lines.push(`  }`);
     lines.push(``);
 

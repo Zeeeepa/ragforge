@@ -497,4 +497,222 @@ export class IncrementalIngestionManager {
 
     return result.records[0]?.get('dirty') === true;
   }
+
+  /**
+   * Re-ingest a single file (optimized for file tool modifications)
+   *
+   * This method:
+   * 1. Parses only the specified file
+   * 2. Deletes scopes that were in the old version but not the new
+   * 3. Upserts new/modified scopes
+   * 4. Marks affected scopes as embeddingsDirty
+   *
+   * @param filePath - Absolute path to the file
+   * @param sourceConfig - Source configuration (for adapter type, root path)
+   * @param options - Optional settings
+   */
+  async reIngestFile(
+    filePath: string,
+    sourceConfig: SourceConfig,
+    options: {
+      trackChanges?: boolean;
+      verbose?: boolean;
+    } = {}
+  ): Promise<{
+    scopesCreated: number;
+    scopesUpdated: number;
+    scopesDeleted: number;
+  }> {
+    const verbose = options.verbose ?? false;
+    const fs = await import('fs/promises');
+    const path = await import('path');
+
+    // Resolve relative path from root
+    const root = sourceConfig.root || '.';
+    const relativePath = path.relative(root, filePath);
+
+    if (verbose) {
+      console.log(`🔄 Re-ingesting file: ${relativePath}`);
+    }
+
+    // Check if file exists
+    let fileExists = true;
+    try {
+      await fs.access(filePath);
+    } catch {
+      fileExists = false;
+    }
+
+    // Get existing scopes for this file
+    const existingResult = await this.client.run(
+      `
+      MATCH (s:Scope)
+      WHERE s.file = $relativePath OR s.file = $filePath
+      RETURN s.uuid AS uuid, s.hash AS hash, s.name AS name, s.source AS source
+      `,
+      { relativePath, filePath }
+    );
+
+    const existingScopes = new Map<string, { hash: string; name: string; source?: string }>();
+    for (const record of existingResult.records) {
+      existingScopes.set(record.get('uuid'), {
+        hash: record.get('hash'),
+        name: record.get('name'),
+        source: record.get('source')
+      });
+    }
+
+    if (verbose) {
+      console.log(`   Found ${existingScopes.size} existing scopes for this file`);
+    }
+
+    // If file was deleted, remove all its scopes
+    if (!fileExists) {
+      const deletedUuids = Array.from(existingScopes.keys());
+      if (deletedUuids.length > 0) {
+        await this.deleteNodes(deletedUuids);
+        if (verbose) {
+          console.log(`   ✅ Deleted ${deletedUuids.length} scopes (file removed)`);
+        }
+      }
+      return {
+        scopesCreated: 0,
+        scopesUpdated: 0,
+        scopesDeleted: deletedUuids.length
+      };
+    }
+
+    // Parse the single file
+    const adapter = createAdapter(sourceConfig);
+
+    // Read file content
+    const content = await fs.readFile(filePath, 'utf-8');
+
+    // Create a mini source config for just this file
+    const singleFileConfig: SourceConfig = {
+      ...sourceConfig,
+      include: [relativePath]
+    };
+
+    // Parse the file
+    const parseResult = await adapter.parse({
+      source: singleFileConfig,
+      onProgress: undefined
+    });
+
+    // Get new scopes
+    const newScopes = parseResult.graph.nodes.filter(n => n.labels.includes('Scope'));
+
+    if (verbose) {
+      console.log(`   Parsed ${newScopes.length} scopes from file`);
+    }
+
+    // Classify changes
+    const newScopeIds = new Set(newScopes.map(n => n.id));
+    const existingIds = new Set(existingScopes.keys());
+
+    const created = newScopes.filter(n => !existingIds.has(n.id));
+    const updated = newScopes.filter(n => {
+      const existing = existingScopes.get(n.id);
+      return existing && existing.hash !== n.properties.hash;
+    });
+    const deleted = Array.from(existingIds).filter(id => !newScopeIds.has(id));
+
+    if (verbose) {
+      console.log(`   Changes: +${created.length} created, ~${updated.length} updated, -${deleted.length} deleted`);
+    }
+
+    // Delete removed scopes
+    if (deleted.length > 0) {
+      await this.deleteNodes(deleted);
+    }
+
+    // Upsert created + updated scopes
+    const nodesToUpsert = [...created, ...updated];
+    if (nodesToUpsert.length > 0) {
+      // Include File node for the file
+      const fileNodes = parseResult.graph.nodes.filter(n => n.labels.includes('File'));
+
+      // Get relevant relationships
+      const affectedUuids = new Set(nodesToUpsert.map(n => n.id));
+      const relevantRelationships = parseResult.graph.relationships.filter(rel =>
+        affectedUuids.has(rel.from) || affectedUuids.has(rel.to)
+      );
+
+      await this.ingestNodes(
+        [...nodesToUpsert, ...fileNodes],
+        relevantRelationships,
+        true // Mark as embeddingsDirty
+      );
+    }
+
+    // Track changes if enabled
+    if (options.trackChanges && (created.length > 0 || updated.length > 0 || deleted.length > 0)) {
+      const changesToTrack: Array<{
+        entityType: string;
+        entityUuid: string;
+        entityLabel: string;
+        oldContent: string | null;
+        newContent: string;
+        oldHash: string | null;
+        newHash: string;
+        changeType: 'created' | 'updated' | 'deleted';
+      }> = [];
+
+      for (const node of created) {
+        changesToTrack.push({
+          entityType: 'Scope',
+          entityUuid: node.id,
+          entityLabel: node.properties.name as string,
+          oldContent: null,
+          newContent: node.properties.source as string,
+          oldHash: null,
+          newHash: node.properties.hash as string,
+          changeType: 'created'
+        });
+      }
+
+      for (const node of updated) {
+        const existing = existingScopes.get(node.id);
+        changesToTrack.push({
+          entityType: 'Scope',
+          entityUuid: node.id,
+          entityLabel: node.properties.name as string,
+          oldContent: existing?.source || null,
+          newContent: node.properties.source as string,
+          oldHash: existing?.hash || null,
+          newHash: node.properties.hash as string,
+          changeType: 'updated'
+        });
+      }
+
+      for (const uuid of deleted) {
+        const existing = existingScopes.get(uuid);
+        if (existing) {
+          changesToTrack.push({
+            entityType: 'Scope',
+            entityUuid: uuid,
+            entityLabel: existing.name,
+            oldContent: existing.source || '',
+            newContent: '',
+            oldHash: existing.hash,
+            newHash: '',
+            changeType: 'deleted'
+          });
+        }
+      }
+
+      await this.changeTracker.trackEntityChangesBatch(changesToTrack);
+    }
+
+    if (verbose) {
+      console.log(`   ✅ Re-ingestion complete`);
+    }
+
+    return {
+      scopesCreated: created.length,
+      scopesUpdated: updated.length,
+      scopesDeleted: deleted.length
+    };
+  }
 }
