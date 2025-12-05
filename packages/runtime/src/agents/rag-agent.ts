@@ -23,7 +23,7 @@
 
 import { generateToolsFromConfig, generateFileTools, IngestionLock, withIngestionLock } from '@luciformresearch/ragforge-core';
 import type { ToolGenerationOptions, GeneratedToolDefinition, ToolHandlerGenerator, RagForgeConfig, FileToolsContext } from '@luciformresearch/ragforge-core';
-import { StructuredLLMExecutor, BaseToolExecutor, type ToolCallRequest } from '../llm/structured-llm-executor.js';
+import { StructuredLLMExecutor, BaseToolExecutor, type ToolCallRequest, type ToolExecutionResult } from '../llm/structured-llm-executor.js';
 import { GeminiAPIProvider } from '../reranking/gemini-api-provider.js';
 import { GeminiNativeToolProvider, type ToolDefinition } from '../llm/native-tool-calling/index.js';
 import * as yaml from 'js-yaml';
@@ -260,6 +260,9 @@ export interface AskResult {
  * Tool Executor that uses generated handlers
  * Extends BaseToolExecutor for automatic parallel execution
  */
+// File tools that modify content (need to run before RAG queries)
+const FILE_MODIFICATION_TOOLS = new Set(['write_file', 'edit_file']);
+
 class GeneratedToolExecutor extends BaseToolExecutor {
   private handlers: Record<string, (args: Record<string, any>) => Promise<any>>;
   private verbose: boolean;
@@ -303,7 +306,56 @@ class GeneratedToolExecutor extends BaseToolExecutor {
     return result;
   }
 
-  // executeBatch is inherited from BaseToolExecutor and runs tools in parallel!
+  /**
+   * Override executeBatch to ensure file modification tools run BEFORE other tools.
+   * This prevents race conditions where RAG queries return stale data because
+   * they execute in parallel with file modifications.
+   *
+   * Order of execution:
+   * 1. File modification tools (write_file, edit_file) - sequential
+   * 2. Other tools (RAG queries, read_file, etc.) - parallel
+   */
+  async executeBatch(toolCalls: ToolCallRequest[]): Promise<ToolExecutionResult[]> {
+    // Separate file modification tools from other tools
+    const fileModTools: ToolCallRequest[] = [];
+    const otherTools: ToolCallRequest[] = [];
+
+    for (const toolCall of toolCalls) {
+      if (FILE_MODIFICATION_TOOLS.has(toolCall.tool_name)) {
+        fileModTools.push(toolCall);
+      } else {
+        otherTools.push(toolCall);
+      }
+    }
+
+    // If no file mod tools, run everything in parallel (default behavior)
+    if (fileModTools.length === 0) {
+      return super.executeBatch(toolCalls);
+    }
+
+    // If no other tools, just run file mod tools in parallel
+    if (otherTools.length === 0) {
+      return super.executeBatch(fileModTools);
+    }
+
+    // Mixed batch: run file mod tools FIRST, then other tools
+    if (this.verbose) {
+      console.log(`   ⏱️  Sequencing: ${fileModTools.length} file tool(s) first, then ${otherTools.length} other tool(s)`);
+    }
+
+    // Execute file modification tools first (they acquire locks and do ingestion)
+    const fileResults = await super.executeBatch(fileModTools);
+
+    // Then execute other tools (they can now see fresh data)
+    const otherResults = await super.executeBatch(otherTools);
+
+    // Combine results in original order
+    const resultMap = new Map<ToolCallRequest, ToolExecutionResult>();
+    fileModTools.forEach((tc, i) => resultMap.set(tc, fileResults[i]));
+    otherTools.forEach((tc, i) => resultMap.set(tc, otherResults[i]));
+
+    return toolCalls.map(tc => resultMap.get(tc)!);
+  }
 }
 
 // ============================================

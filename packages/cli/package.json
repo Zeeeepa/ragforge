@@ -52,8 +52,8 @@
   },
   "dependencies": {
     "@google/genai": "^1.28.0",
-    "@luciformresearch/ragforge-core": "^0.2.0",
-    "@luciformresearch/ragforge-runtime": "^0.2.0",
+    "@luciformresearch/ragforge-core": "file:../core",
+    "@luciformresearch/ragforge-runtime": "file:../runtime",
     "@luciformresearch/xmlparser": "^0.2.4",
     "dotenv": "^16.3.1",
     "neo4j-driver": "^5.15.0",

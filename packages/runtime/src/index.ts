@@ -203,6 +203,9 @@ export { runEmbeddingPipelines } from './embedding/pipeline.js';
 // Source Adapters
 export * from './adapters/index.js';
 
+// OCR (Optical Character Recognition)
+export * from './ocr/index.js';
+
 // Pattern Matching (for GLOB/REGEX operators in queries)
 export {
   globToRegex,

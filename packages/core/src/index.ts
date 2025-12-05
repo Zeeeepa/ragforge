@@ -58,6 +58,30 @@ export {
 } from './tools/file-tools.js';
 export type { FileToolsContext, FileToolsResult } from './tools/file-tools.js';
 
+// Image Tools (OCR, describe, list images)
+export {
+  generateImageTools,
+  generateReadImageTool,
+  generateDescribeImageTool,
+  generateListImagesTool,
+  generateReadImageHandler,
+  generateDescribeImageHandler,
+  generateListImagesHandler,
+} from './tools/image-tools.js';
+export type { ImageToolsContext, ImageToolsResult } from './tools/image-tools.js';
+
+// 3D Tools (render, generate from image/text)
+export {
+  generate3DTools,
+  generateRender3DAssetTool,
+  generateGenerate3DFromImageTool,
+  generateGenerate3DFromTextTool,
+  generateRender3DAssetHandler,
+  generateGenerate3DFromImageHandler,
+  generateGenerate3DFromTextHandler,
+} from './tools/threed-tools.js';
+export type { ThreeDToolsContext, ThreeDToolsResult } from './tools/threed-tools.js';
+
 // Ingestion Lock (coordinate file tools with RAG queries)
 export {
   IngestionLock,

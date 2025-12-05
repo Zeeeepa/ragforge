@@ -5,10 +5,12 @@
  * - Collects changes for a configurable interval (default 1 second)
  * - Queues changes while ingestion is in progress
  * - Provides callbacks for ingestion events
+ * - Optionally uses IngestionLock to block RAG queries during ingestion
  */
 
 import type { CodeSourceConfig } from './code-source-adapter.js';
 import type { IncrementalIngestionManager, IncrementalStats } from './incremental-ingestion.js';
+import type { IngestionLock } from '@luciformresearch/ragforge-core';
 
 export interface IngestionQueueConfig {
   /**
@@ -23,6 +25,12 @@ export interface IngestionQueueConfig {
    * @default false
    */
   verbose?: boolean;
+
+  /**
+   * Ingestion lock to coordinate with RAG queries
+   * When provided, RAG queries will wait during ingestion
+   */
+  ingestionLock?: IngestionLock;
 
   /**
    * Callback when batch starts processing
@@ -45,7 +53,7 @@ export class IngestionQueue {
   private batchTimer: NodeJS.Timeout | null = null;
   private isIngesting = false;
   private queuedBatch: Set<string> | null = null;
-  private config: Required<IngestionQueueConfig>;
+  private config: Required<Omit<IngestionQueueConfig, 'ingestionLock'>> & { ingestionLock?: IngestionLock };
 
   constructor(
     private manager: IncrementalIngestionManager,
@@ -55,6 +63,7 @@ export class IngestionQueue {
     this.config = {
       batchInterval: config.batchInterval ?? 1000,
       verbose: config.verbose ?? false,
+      ingestionLock: config.ingestionLock,
       onBatchStart: config.onBatchStart ?? (() => {}),
       onBatchComplete: config.onBatchComplete ?? (() => {}),
       onBatchError: config.onBatchError ?? (() => {})
@@ -166,6 +175,7 @@ export class IngestionQueue {
 
   /**
    * Process the current batch of files
+   * Acquires ingestion lock if configured, blocking RAG queries during ingestion
    */
   private async processBatch(): Promise<IncrementalStats> {
     const filesToProcess = Array.from(this.pendingFiles);
@@ -174,6 +184,14 @@ export class IngestionQueue {
 
     if (this.config.verbose) {
       console.log(`\n🚀 Processing batch of ${filesToProcess.length} file(s)...`);
+    }
+
+    // Acquire lock to block RAG queries during ingestion
+    const lock = this.config.ingestionLock;
+    const release = lock ? await lock.acquire(`batch:${filesToProcess.length} files`) : null;
+
+    if (this.config.verbose && release) {
+      console.log(`   🔒 Ingestion lock acquired (RAG queries will wait)`);
     }
 
     try {
@@ -207,6 +225,14 @@ export class IngestionQueue {
     } catch (error) {
       this.isIngesting = false;
       throw error;
+    } finally {
+      // Release lock to allow RAG queries
+      if (release) {
+        release();
+        if (this.config.verbose) {
+          console.log(`   🔓 Ingestion lock released`);
+        }
+      }
     }
   }
 }

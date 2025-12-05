@@ -61,3 +61,7 @@ temp/
 
 # LangChain.js clone (for extraction reference)
 langchainjs/
+
+
+#replicate token
+replicate/

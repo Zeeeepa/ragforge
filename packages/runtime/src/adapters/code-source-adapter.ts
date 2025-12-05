@@ -12,8 +12,11 @@ import {
   ParserRegistry,
   TypeScriptLanguageParser,
   PythonLanguageParser,
+  HTMLDocumentParser,
   type ScopeFileAnalysis,
-  type ScopeInfo
+  type ScopeInfo,
+  type HTMLParseResult,
+  type DocumentInfo,
 } from '@luciformresearch/codeparsers';
 import {
   SourceAdapter,
@@ -39,7 +42,7 @@ const execAsync = promisify(exec);
  */
 export interface CodeSourceConfig extends SourceConfig {
   type: 'code';
-  adapter: 'typescript' | 'python';
+  adapter: 'typescript' | 'python' | 'html' | 'auto';
   options?: {
     /** Export XML for debugging */
     exportXml?: boolean;
@@ -55,19 +58,39 @@ export interface CodeSourceConfig extends SourceConfig {
 }
 
 /**
- * Adapter for parsing code sources (TypeScript, Python, etc.)
+ * Adapter for parsing code sources (TypeScript, Python, HTML/Vue, etc.)
  */
 export class CodeSourceAdapter extends SourceAdapter {
   readonly type = 'code';
   readonly adapterName: string;
   private registry: ParserRegistry;
+  private htmlParser: HTMLDocumentParser | null = null;
   private uuidCache: Map<string, Map<string, string>>; // filePath -> (key -> uuid)
 
-  constructor(adapterName: 'typescript' | 'python') {
+  constructor(adapterName: 'typescript' | 'python' | 'html' | 'auto') {
     super();
     this.adapterName = adapterName;
     this.registry = this.initializeRegistry();
     this.uuidCache = new Map();
+  }
+
+  /**
+   * Get or initialize HTML parser
+   */
+  private async getHtmlParser(): Promise<HTMLDocumentParser> {
+    if (!this.htmlParser) {
+      this.htmlParser = new HTMLDocumentParser();
+      await this.htmlParser.initialize();
+    }
+    return this.htmlParser;
+  }
+
+  /**
+   * Check if a file is an HTML/Vue/Svelte file
+   */
+  private isHtmlFile(filePath: string): boolean {
+    const ext = path.extname(filePath).toLowerCase();
+    return ['.html', '.htm', '.vue', '.svelte', '.astro'].includes(ext);
   }
 
   /**
@@ -166,7 +189,7 @@ export class CodeSourceAdapter extends SourceAdapter {
     });
 
     // Parse all files
-    const parsedFiles = await this.parseFiles(files, config, (current) => {
+    const { codeFiles, htmlFiles } = await this.parseFiles(files, config, (current) => {
       options.onProgress?.({
         phase: 'parsing',
         currentFile: current,
@@ -185,11 +208,11 @@ export class CodeSourceAdapter extends SourceAdapter {
     });
 
     // Build graph structure
-    const graph = await this.buildGraph(parsedFiles, config, resolver, projectInfo);
+    const graph = await this.buildGraph({ codeFiles, htmlFiles }, config, resolver, projectInfo);
 
     // Export XML if requested
     if (config.options?.exportXml) {
-      await this.exportXml(parsedFiles, config);
+      await this.exportXml(codeFiles, config);
     }
 
     // Report progress: complete
@@ -227,19 +250,33 @@ export class CodeSourceAdapter extends SourceAdapter {
   }
 
   /**
-   * Parse all files
+   * Parse all files (code and HTML)
    */
   private async parseFiles(
     files: string[],
     config: CodeSourceConfig,
     onProgress: (file: string) => void
-  ): Promise<Map<string, ScopeFileAnalysis>> {
-    const results = new Map<string, ScopeFileAnalysis>();
+  ): Promise<{
+    codeFiles: Map<string, ScopeFileAnalysis>;
+    htmlFiles: Map<string, HTMLParseResult>;
+  }> {
+    const codeFiles = new Map<string, ScopeFileAnalysis>();
+    const htmlFiles = new Map<string, HTMLParseResult>();
 
     for (const file of files) {
       onProgress(file);
 
       try {
+        // Handle HTML/Vue/Svelte files separately
+        if (this.isHtmlFile(file)) {
+          const htmlParser = await this.getHtmlParser();
+          const content = await import('fs').then(fs => fs.promises.readFile(file, 'utf-8'));
+          const result = await htmlParser.parseFile(file, content, { parseScripts: true });
+          htmlFiles.set(file, result);
+          continue;
+        }
+
+        // Handle TypeScript/Python files with ParserRegistry
         const parser = this.registry.getParserForFile(file);
         if (!parser) {
           console.warn(`No parser found for file: ${file}`);
@@ -304,13 +341,13 @@ export class CodeSourceAdapter extends SourceAdapter {
           astIssues: universalAnalysis.errors?.map(e => e.message) || []
         };
 
-        results.set(file, analysis);
+        codeFiles.set(file, analysis);
       } catch (error) {
         console.error(`Error parsing file ${file}:`, error);
       }
     }
 
-    return results;
+    return { codeFiles, htmlFiles };
   }
 
   /**
@@ -350,11 +387,15 @@ export class CodeSourceAdapter extends SourceAdapter {
    * Build Neo4j graph structure from parsed files
    */
   private async buildGraph(
-    parsedFiles: Map<string, ScopeFileAnalysis>,
+    parsedFiles: {
+      codeFiles: Map<string, ScopeFileAnalysis>;
+      htmlFiles: Map<string, HTMLParseResult>;
+    },
     config: CodeSourceConfig,
     resolver: ImportResolver,
     projectInfo: { name: string; gitRemote: string | null; rootPath: string }
   ): Promise<ParsedGraph> {
+    const { codeFiles, htmlFiles } = parsedFiles;
     const nodes: ParsedNode[] = [];
     const relationships: ParsedRelationship[] = [];
     const scopeMap = new Map<string, ScopeInfo>(); // uuid -> ScopeInfo
@@ -373,13 +414,13 @@ export class CodeSourceAdapter extends SourceAdapter {
     });
 
     // Build global UUID mapping first (needed for parentUUID)
-    const globalUUIDMapping = this.buildGlobalUUIDMapping(parsedFiles);
+    const globalUUIDMapping = this.buildGlobalUUIDMapping(codeFiles);
 
     // Get project root for relative path calculation
     const projectRoot = config.root || process.cwd();
 
-    // First pass: Create all scope nodes
-    for (const [filePath, analysis] of parsedFiles) {
+    // First pass: Create all scope nodes from code files
+    for (const [filePath, analysis] of codeFiles) {
       // Calculate relative path from project root
       const relPath = path.relative(projectRoot, filePath);
 
@@ -522,7 +563,7 @@ export class CodeSourceAdapter extends SourceAdapter {
     const directories = new Set<string>();
 
     // Extract all unique directories from file paths (using relative paths)
-    for (const [filePath] of parsedFiles) {
+    for (const [filePath] of codeFiles) {
       const relPath = path.relative(projectRoot, filePath);
       let currentPath = relPath;
 
@@ -571,7 +612,7 @@ export class CodeSourceAdapter extends SourceAdapter {
     }
 
     // Second pass: Create scope relationships (CONSUMES, etc.)
-    for (const [filePath, analysis] of parsedFiles) {
+    for (const [filePath, analysis] of codeFiles) {
       for (const scope of analysis.scopes) {
         const sourceUuid = this.generateUUID(scope, filePath);
 
@@ -637,7 +678,7 @@ export class CodeSourceAdapter extends SourceAdapter {
 
     // Phase 3: Create INHERITS_FROM and IMPLEMENTS relationships from heritage clauses
     // This is more reliable than the heuristic-based detection above
-    for (const [filePath, analysis] of parsedFiles) {
+    for (const [filePath, analysis] of codeFiles) {
       for (const scope of analysis.scopes) {
         const tsMetadata = (scope as any).languageSpecific?.typescript;
 
@@ -656,7 +697,7 @@ export class CodeSourceAdapter extends SourceAdapter {
                 targetUuid = this.generateUUID(sameFileScope, filePath);
               } else {
                 // Search in all parsed files
-                for (const [mappedFilePath, mappedAnalysis] of parsedFiles) {
+                for (const [mappedFilePath, mappedAnalysis] of codeFiles) {
                   const foundScope = mappedAnalysis.scopes.find(s => s.name === typeName);
                   if (foundScope) {
                     targetUuid = this.generateUUID(foundScope, mappedFilePath);
@@ -694,7 +735,7 @@ export class CodeSourceAdapter extends SourceAdapter {
     // Create ExternalLibrary nodes and USES_LIBRARY relationships
     const externalLibs = new Map<string, Set<string>>(); // library name -> symbols
 
-    for (const [filePath, analysis] of parsedFiles) {
+    for (const [filePath, analysis] of codeFiles) {
       for (const scope of analysis.scopes) {
         const sourceUuid = this.generateUUID(scope, filePath);
 
@@ -732,11 +773,182 @@ export class CodeSourceAdapter extends SourceAdapter {
       });
     }
 
+    // Create WebDocument nodes for HTML/Vue/Svelte files
+    // (Document is reserved for Tika, MarkupDocument for Markdown)
+    for (const [filePath, htmlResult] of htmlFiles) {
+      const relPath = path.relative(projectRoot, filePath);
+      const doc = htmlResult.document;
+
+      // Create WebDocument node
+      const docId = `webdoc:${doc.uuid}`;
+      nodes.push({
+        labels: ['WebDocument'],
+        id: docId,
+        properties: {
+          uuid: doc.uuid,
+          file: relPath,
+          type: doc.type, // 'html' | 'vue-sfc' | 'svelte' | 'astro'
+          hash: doc.hash,
+          hasTemplate: doc.hasTemplate,
+          hasScript: doc.hasScript,
+          hasStyle: doc.hasStyle,
+          ...(doc.componentName && { componentName: doc.componentName }),
+          ...(doc.scriptLang && { scriptLang: doc.scriptLang }),
+          ...(doc.isScriptSetup !== undefined && { isScriptSetup: doc.isScriptSetup }),
+          ...(doc.imports.length > 0 && { imports: JSON.stringify(doc.imports) }),
+          ...(doc.usedComponents.length > 0 && { usedComponents: JSON.stringify(doc.usedComponents) }),
+          ...(doc.images.length > 0 && { imageCount: doc.images.length })
+        }
+      });
+
+      // Create BELONGS_TO relationship (WebDocument -> Project)
+      relationships.push({
+        type: 'BELONGS_TO',
+        from: docId,
+        to: projectId
+      });
+
+      // Create File node for HTML file
+      const fileName = relPath.split('/').pop() || relPath;
+      const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
+      const extension = fileName.includes('.') ? fileName.substring(fileName.lastIndexOf('.')) : '';
+
+      nodes.push({
+        labels: ['File'],
+        id: `file:${relPath}`,
+        properties: {
+          path: relPath,
+          name: fileName,
+          directory,
+          extension,
+          contentHash: doc.hash
+        }
+      });
+
+      // Create BELONGS_TO relationship (File -> Project)
+      relationships.push({
+        type: 'BELONGS_TO',
+        from: `file:${relPath}`,
+        to: projectId
+      });
+
+      // Create DEFINED_IN relationship (WebDocument -> File)
+      relationships.push({
+        type: 'DEFINED_IN',
+        from: docId,
+        to: `file:${relPath}`
+      });
+
+      // Create Image nodes and relationships
+      for (const img of doc.images) {
+        const imgId = `img:${doc.uuid}:${img.line}`;
+        nodes.push({
+          labels: ['Image'],
+          id: imgId,
+          properties: {
+            src: img.src,
+            alt: img.alt || null,
+            line: img.line
+          }
+        });
+
+        // Create HAS_IMAGE relationship (WebDocument -> Image)
+        relationships.push({
+          type: 'HAS_IMAGE',
+          from: docId,
+          to: imgId
+        });
+      }
+
+      // Add directory to set for HTML files too
+      let currentPath = relPath;
+      while (true) {
+        const dir = currentPath.includes('/') ? currentPath.substring(0, currentPath.lastIndexOf('/')) : '';
+        if (!dir || dir === '.' || dir === '') break;
+
+        if (!directories.has(dir)) {
+          directories.add(dir);
+          const depth = dir.split('/').filter(p => p.length > 0).length;
+          nodes.push({
+            labels: ['Directory'],
+            id: `dir:${dir}`,
+            properties: {
+              path: dir,
+              depth
+            }
+          });
+        }
+
+        // Create IN_DIRECTORY relationship (File -> Directory)
+        if (currentPath === relPath) {
+          relationships.push({
+            type: 'IN_DIRECTORY',
+            from: `file:${relPath}`,
+            to: `dir:${dir}`
+          });
+        }
+
+        currentPath = dir;
+      }
+
+      // If HTML has embedded scripts that were parsed, create Scope nodes for them
+      if (htmlResult.scopes && htmlResult.scopes.length > 0) {
+        for (const scope of htmlResult.scopes) {
+          const scopeUuid = this.generateUUID(scope, filePath);
+          scopeMap.set(scopeUuid, scope);
+
+          nodes.push({
+            labels: ['Scope'],
+            id: scopeUuid,
+            properties: {
+              uuid: scopeUuid,
+              name: scope.name,
+              type: scope.type,
+              file: relPath,
+              language: 'typescript', // Embedded scripts are typically TS/JS
+              startLine: scope.startLine,
+              endLine: scope.endLine,
+              linesOfCode: scope.linesOfCode || (scope.endLine - scope.startLine + 1),
+              source: scope.content || '',
+              signature: this.extractSignature(scope),
+              hash: this.hashScope(scope),
+              ...(scope.returnType && { returnType: scope.returnType }),
+              ...(scope.parameters && scope.parameters.length > 0 && {
+                parameters: JSON.stringify(scope.parameters)
+              }),
+              ...(scope.parent && { parent: scope.parent })
+            }
+          });
+
+          // Create BELONGS_TO relationship (Scope -> Project)
+          relationships.push({
+            type: 'BELONGS_TO',
+            from: scopeUuid,
+            to: projectId
+          });
+
+          // Create DEFINED_IN relationship (Scope -> File)
+          relationships.push({
+            type: 'DEFINED_IN',
+            from: scopeUuid,
+            to: `file:${relPath}`
+          });
+
+          // Create SCRIPT_OF relationship (Scope -> WebDocument)
+          relationships.push({
+            type: 'SCRIPT_OF',
+            from: scopeUuid,
+            to: docId
+          });
+        }
+      }
+    }
+
     return {
       nodes,
       relationships,
       metadata: {
-        filesProcessed: parsedFiles.size,
+        filesProcessed: codeFiles.size + htmlFiles.size,
         nodesGenerated: nodes.length,
         relationshipsGenerated: relationships.length,
         parseTimeMs: 0 // Will be set by caller
