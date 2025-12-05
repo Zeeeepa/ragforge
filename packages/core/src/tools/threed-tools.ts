@@ -70,6 +70,10 @@ Example: render_3d_asset({
           type: 'string',
           description: 'Background color hex (e.g., "#ffffff") or "transparent"',
         },
+        precise_framing: {
+          type: 'boolean',
+          description: 'Use vertex projection for precise framing (slower but more accurate). Default: false (uses bbox corners)',
+        },
       },
       required: ['model_path', 'output_dir'],
     },
@@ -215,6 +219,7 @@ export function generateRender3DAssetHandler(ctx: ThreeDToolsContext): (args: an
       width = 1024,
       height = 1024,
       background = 'transparent',
+      precise_framing = false,
     } = params;
 
     const fs = await import('fs/promises');
@@ -257,7 +262,8 @@ export function generateRender3DAssetHandler(ctx: ThreeDToolsContext): (args: an
         views,
         width,
         height,
-        background
+        background,
+        precise_framing
       );
 
       return {
@@ -288,7 +294,8 @@ async function renderModelWithThreeJS(
   views: string[],
   width: number,
   height: number,
-  background: string
+  background: string,
+  preciseFraming: boolean = false
 ): Promise<Array<{ view: string; path: string }>> {
   const fs = await import('fs/promises');
   const pathModule = await import('path');
@@ -297,28 +304,64 @@ async function renderModelWithThreeJS(
   const renders: Array<{ view: string; path: string }> = [];
   const modelName = pathModule.basename(modelPath, pathModule.extname(modelPath));
 
-  // Read model file as base64
+  // Read model file
   const modelBuffer = await fs.readFile(modelPath);
-  const modelBase64 = modelBuffer.toString('base64');
-  const modelDataUrl = `data:application/octet-stream;base64,${modelBase64}`;
 
-  // Build the HTML page with Three.js
-  const html = buildThreeJSPage(width, height, background, modelDataUrl, views);
+  // Build the HTML page with Three.js (model served via route intercept)
+  const modelUrl = 'http://localhost/__model__.glb';
+  const html = buildThreeJSPage(width, height, background, modelUrl, views, preciseFraming);
 
-  // Launch browser
-  const browser = await chromium.launch({ headless: true });
+  // Launch browser with WebGL support for headless
+  const browser = await chromium.launch({
+    headless: true,
+    args: [
+      '--enable-webgl',
+      '--use-gl=angle',
+      '--use-angle=swiftshader',
+      '--enable-gpu-rasterization',
+    ],
+  });
   const context = await browser.newContext({
     viewport: { width, height },
     deviceScaleFactor: 1,
   });
   const page = await context.newPage();
 
+  // Intercept request for model file and serve it directly
+  await page.route('**/__model__.glb', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'model/gltf-binary',
+      body: modelBuffer,
+    });
+  });
+
   try {
+    // Capture console errors for debugging
+    const consoleErrors: string[] = [];
+    page.on('console', msg => {
+      if (msg.type() === 'error') {
+        consoleErrors.push(msg.text());
+      }
+    });
+    page.on('pageerror', err => {
+      consoleErrors.push(err.message);
+    });
+
     // Load the page
     await page.setContent(html, { waitUntil: 'domcontentloaded' });
 
     // Wait for Three.js to load and render
     await page.waitForFunction('window.rendersReady === true', { timeout: 30000 });
+
+    // Check for errors
+    const pageError = await page.evaluate('window.renderError') as string | undefined;
+    if (pageError) {
+      throw new Error(`Page render error: ${pageError}`);
+    }
+    if (consoleErrors.length > 0) {
+      console.warn('Console errors during render:', consoleErrors);
+    }
 
     // Get the render results from the page
     const renderResults = await page.evaluate('window.renderResults') as Array<{ view: string; dataUrl: string }>;
@@ -352,7 +395,8 @@ function buildThreeJSPage(
   height: number,
   background: string,
   modelDataUrl: string,
-  views: string[]
+  views: string[],
+  preciseFraming: boolean = false
 ): string {
   const viewConfigsJson = JSON.stringify(VIEW_CONFIGS);
   const viewsJson = JSON.stringify(views);
@@ -385,6 +429,7 @@ function buildThreeJSPage(
     const height = ${height};
     const bgColor = ${bgColor};
     const modelDataUrl = "${modelDataUrl}";
+    const preciseFraming = ${preciseFraming};
 
     window.renderResults = [];
     window.rendersReady = false;
@@ -418,37 +463,59 @@ function buildThreeJSPage(
       backLight.position.set(-5, -5, -5);
       scene.add(backLight);
 
-      // Load model from data URL
+      // Load model from URL (served via Playwright route intercept)
       const loader = new GLTFLoader();
-      const response = await fetch(modelDataUrl);
-      const arrayBuffer = await response.arrayBuffer();
-
       const gltf = await new Promise((resolve, reject) => {
-        loader.parse(arrayBuffer, '', resolve, reject);
+        loader.load(modelDataUrl, resolve, undefined, reject);
       });
 
       scene.add(gltf.scene);
 
-      // Calculate world bounding box
+      // Calculate world bounding box (model stays in place, camera will target center)
       const worldBox = new THREE.Box3().setFromObject(gltf.scene);
       const worldCenter = worldBox.getCenter(new THREE.Vector3());
       const worldSize = worldBox.getSize(new THREE.Vector3());
-
-      // Center the model at origin
-      gltf.scene.position.sub(worldCenter);
-
-      // Get the 8 corners of the bounding box (now centered at origin)
       const halfSize = worldSize.clone().multiplyScalar(0.5);
+
+      // Get the 8 corners of the bounding box in world space
       const boxCorners = [
-        new THREE.Vector3(-halfSize.x, -halfSize.y, -halfSize.z),
-        new THREE.Vector3(-halfSize.x, -halfSize.y, halfSize.z),
-        new THREE.Vector3(-halfSize.x, halfSize.y, -halfSize.z),
-        new THREE.Vector3(-halfSize.x, halfSize.y, halfSize.z),
-        new THREE.Vector3(halfSize.x, -halfSize.y, -halfSize.z),
-        new THREE.Vector3(halfSize.x, -halfSize.y, halfSize.z),
-        new THREE.Vector3(halfSize.x, halfSize.y, -halfSize.z),
-        new THREE.Vector3(halfSize.x, halfSize.y, halfSize.z),
+        new THREE.Vector3(worldCenter.x - halfSize.x, worldCenter.y - halfSize.y, worldCenter.z - halfSize.z),
+        new THREE.Vector3(worldCenter.x - halfSize.x, worldCenter.y - halfSize.y, worldCenter.z + halfSize.z),
+        new THREE.Vector3(worldCenter.x - halfSize.x, worldCenter.y + halfSize.y, worldCenter.z - halfSize.z),
+        new THREE.Vector3(worldCenter.x - halfSize.x, worldCenter.y + halfSize.y, worldCenter.z + halfSize.z),
+        new THREE.Vector3(worldCenter.x + halfSize.x, worldCenter.y - halfSize.y, worldCenter.z - halfSize.z),
+        new THREE.Vector3(worldCenter.x + halfSize.x, worldCenter.y - halfSize.y, worldCenter.z + halfSize.z),
+        new THREE.Vector3(worldCenter.x + halfSize.x, worldCenter.y + halfSize.y, worldCenter.z - halfSize.z),
+        new THREE.Vector3(worldCenter.x + halfSize.x, worldCenter.y + halfSize.y, worldCenter.z + halfSize.z),
       ];
+
+      // Extract all vertices from meshes for precise framing (if needed)
+      function getAllVertices(object) {
+        const vertices = [];
+        object.traverse((child) => {
+          if (child.isMesh && child.geometry) {
+            const geo = child.geometry;
+            const posAttr = geo.attributes.position;
+            if (posAttr) {
+              child.updateWorldMatrix(true, false);
+              const worldMatrix = child.matrixWorld;
+              for (let i = 0; i < posAttr.count; i++) {
+                const vertex = new THREE.Vector3(
+                  posAttr.getX(i),
+                  posAttr.getY(i),
+                  posAttr.getZ(i)
+                );
+                vertex.applyMatrix4(worldMatrix);
+                vertices.push(vertex);
+              }
+            }
+          }
+        });
+        return vertices;
+      }
+
+      // Get points to project (vertices if precise, bbox corners otherwise)
+      const allVertices = preciseFraming ? getAllVertices(gltf.scene) : null;
 
       const aspect = width / height;
 
@@ -511,47 +578,129 @@ function buildThreeJSPage(
 
         } else {
           // === PERSPECTIVE VIEW ===
+          // Project points to 2D, find bounding rect, adjust camera to fit & center
           const fov = 45;
           const fovRad = (fov * Math.PI) / 180;
 
+          // Camera direction (from center toward camera position)
           const viewDir = new THREE.Vector3(...viewConfig.direction).normalize();
-          const upDir = new THREE.Vector3(...viewConfig.up);
-          const rightDir = new THREE.Vector3().crossVectors(viewDir, upDir).normalize();
-          const adjustedUp = new THREE.Vector3().crossVectors(rightDir, viewDir).normalize();
 
-          let minX = Infinity, maxX = -Infinity;
-          let minY = Infinity, maxY = -Infinity;
-          let maxDepth = -Infinity;
+          // Initial distance estimate (will be refined)
+          const initialDistance = halfSize.length() * 3;
 
-          for (const corner of boxCorners) {
-            const camX = corner.dot(rightDir);
-            const camY = corner.dot(adjustedUp);
-            const camZ = corner.dot(viewDir);
-            minX = Math.min(minX, camX); maxX = Math.max(maxX, camX);
-            minY = Math.min(minY, camY); maxY = Math.max(maxY, camY);
-            maxDepth = Math.max(maxDepth, camZ);
+          // Create camera at initial position, looking at model center
+          camera = new THREE.PerspectiveCamera(fov, aspect, 0.1, initialDistance * 10);
+          camera.position.copy(worldCenter).add(viewDir.clone().multiplyScalar(initialDistance));
+          camera.up.set(0, 1, 0);
+          camera.lookAt(worldCenter);
+          camera.updateMatrixWorld();
+          camera.updateProjectionMatrix();
+
+          // Project points to NDC (normalized device coordinates: -1 to 1)
+          // Use all vertices for precise framing, or just bbox corners for fast mode
+          const pointsToProject = allVertices && allVertices.length > 0 ? allVertices : boxCorners;
+
+          let minNdcX = Infinity, maxNdcX = -Infinity;
+          let minNdcY = Infinity, maxNdcY = -Infinity;
+
+          for (const point of pointsToProject) {
+            const projected = point.clone().project(camera);
+            minNdcX = Math.min(minNdcX, projected.x);
+            maxNdcX = Math.max(maxNdcX, projected.x);
+            minNdcY = Math.min(minNdcY, projected.y);
+            maxNdcY = Math.max(maxNdcY, projected.y);
           }
 
-          const bboxWidthCam = maxX - minX;
-          const bboxHeightCam = maxY - minY;
-          const bboxCenterX = (minX + maxX) / 2;
-          const bboxCenterY = (minY + maxY) / 2;
+          // Current 2D bounding rect in NDC
+          const ndcWidth = maxNdcX - minNdcX;
+          const ndcHeight = maxNdcY - minNdcY;
 
-          const distanceForHeight = (bboxHeightCam / 2) / Math.tan(fovRad / 2);
-          const distanceForWidth = (bboxWidthCam / 2) / Math.tan((fovRad * aspect) / 2);
-          let optimalDistance = Math.max(distanceForHeight, distanceForWidth);
-          optimalDistance = optimalDistance * 1.1 + maxDepth;
+          // Scale factor to fit in view (target: fill 90% of frame)
+          const targetSize = 1.8; // NDC range is -1 to 1, so 2 total, 1.8 = 90%
+          const scaleFactor = targetSize / Math.max(ndcWidth, ndcHeight);
 
-          camera = new THREE.PerspectiveCamera(fov, aspect, 0.1, optimalDistance * 10);
-          camera.position.copy(viewDir.clone().multiplyScalar(optimalDistance));
-          camera.position.add(rightDir.clone().multiplyScalar(bboxCenterX));
-          camera.position.add(adjustedUp.clone().multiplyScalar(bboxCenterY));
-          camera.up.copy(adjustedUp);
-          camera.lookAt(0, 0, 0);
+          // New distance
+          const newDistance = initialDistance / scaleFactor;
+
+          // Step 1: Move camera to new distance
+          camera.position.copy(worldCenter).add(viewDir.clone().multiplyScalar(newDistance));
+          camera.lookAt(worldCenter);
+          camera.updateMatrixWorld();
+
+          // Step 2: Transform points to camera space and compute angle-based bounds (Thales)
+          // In camera space: point at (x, y, z) projects with tan(angle_x) = x/z, tan(angle_y) = y/z
+          const viewMatrix = camera.matrixWorldInverse;
+
+          let minTanX = Infinity, maxTanX = -Infinity;
+          let minTanY = Infinity, maxTanY = -Infinity;
+          let minDepth = Infinity, maxDepth = -Infinity;
+
+          for (const point of pointsToProject) {
+            // Transform to camera space
+            const camSpacePoint = point.clone().applyMatrix4(viewMatrix);
+            // In Three.js camera space: -Z is forward, so depth = -z
+            const depth = -camSpacePoint.z;
+            if (depth > 0) {
+              const tanX = camSpacePoint.x / depth;
+              const tanY = camSpacePoint.y / depth;
+              minTanX = Math.min(minTanX, tanX);
+              maxTanX = Math.max(maxTanX, tanX);
+              minTanY = Math.min(minTanY, tanY);
+              maxTanY = Math.max(maxTanY, tanY);
+              minDepth = Math.min(minDepth, depth);
+              maxDepth = Math.max(maxDepth, depth);
+            }
+          }
+
+          // Center of the tangent bounds = the angle offset needed
+          const tanCenterX = (minTanX + maxTanX) / 2;
+          const tanCenterY = (minTanY + maxTanY) / 2;
+
+          // Get camera axes
+          const camRight = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
+          const camUp = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion);
+
+          // Translate camera to center the view (not rotate)
+          // Moving camera by -offset shifts the projected image by +offset
+          const offsetX = tanCenterX * newDistance;
+          const offsetY = tanCenterY * newDistance;
+
+          camera.position.add(camRight.clone().multiplyScalar(offsetX));
+          camera.position.add(camUp.clone().multiplyScalar(offsetY));
+
+          // Update lookAt to maintain same view direction (target also shifts)
+          const newLookAt = worldCenter.clone()
+            .add(camRight.clone().multiplyScalar(offsetX))
+            .add(camUp.clone().multiplyScalar(offsetY));
+          camera.lookAt(newLookAt);
+          camera.updateMatrixWorld();
+
+          // Recalculate near/far after final camera position
+          let finalMinDepth = Infinity, finalMaxDepth = -Infinity;
+          const finalViewMatrix = camera.matrixWorldInverse;
+          for (const point of pointsToProject) {
+            const camSpacePoint = point.clone().applyMatrix4(finalViewMatrix);
+            const depth = -camSpacePoint.z;
+            if (depth > 0) {
+              finalMinDepth = Math.min(finalMinDepth, depth);
+              finalMaxDepth = Math.max(finalMaxDepth, depth);
+            }
+          }
+
+          // Add margin to avoid clipping
+          camera.near = Math.max(0.001, finalMinDepth * 0.5);
+          camera.far = finalMaxDepth * 2;
         }
 
         camera.updateProjectionMatrix();
+
+        // Clear and render
+        gltf.scene.updateWorldMatrix(true, true);
+        renderer.clear();
         renderer.render(scene, camera);
+
+        const gl = renderer.getContext();
+        gl.finish();
 
         // Capture as data URL
         const dataUrl = renderer.domElement.toDataURL('image/png');
@@ -563,6 +712,7 @@ function buildThreeJSPage(
 
     main().catch(err => {
       console.error('Render error:', err);
+      window.renderError = err.message || String(err);
       window.rendersReady = true;
     });
   </script>
