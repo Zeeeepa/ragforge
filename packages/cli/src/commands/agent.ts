@@ -18,6 +18,7 @@ import path from 'path';
 import process from 'process';
 import { promises as fs, readFileSync } from 'fs';
 import dotenv from 'dotenv';
+import yaml from 'js-yaml';
 import {
   createRagAgent,
   createClient,
@@ -28,6 +29,8 @@ import {
   type SetupProjectParams,
   type IngestCodeParams,
   type GenerateEmbeddingsParams,
+  type ToolGenerationContext,
+  type RagForgeConfig,
 } from '@luciformresearch/ragforge';
 import { runCreate, type CreateOptions } from './create.js';
 import { runQuickstart, type QuickstartOptions } from './quickstart.js';
@@ -434,6 +437,105 @@ function createDirectRagClient(generatedPath: string): ReturnType<typeof createC
 }
 
 /**
+ * Extract ToolGenerationContext from RagForgeConfig
+ * This mirrors the logic in tool-generator.ts extractMetadata
+ */
+function extractToolContext(config: RagForgeConfig): ToolGenerationContext {
+  const entities: ToolGenerationContext['entities'] = [];
+  const allRelationships: ToolGenerationContext['relationships'] = [];
+  const allVectorIndexes: ToolGenerationContext['vectorIndexes'] = [];
+
+  for (const entityConfig of config.entities || []) {
+    const uniqueField = entityConfig.unique_field || 'uuid';
+
+    const searchableFields = (entityConfig.searchable_fields || []).map((f: any) => ({
+      name: f.name,
+      type: f.type,
+      description: f.description,
+      indexed: f.indexed,
+      computed: false,
+      values: f.values,
+    }));
+
+    const computedFields = (entityConfig.computed_fields || []).map((cf: any) => ({
+      name: cf.name,
+      type: cf.type,
+      description: cf.description,
+      expression: cf.expression,
+      cypher: cf.cypher,
+      materialized: cf.materialized,
+    }));
+
+    const vectorIndexes: ToolGenerationContext['vectorIndexes'] = [];
+    if (entityConfig.vector_indexes) {
+      for (const vi of entityConfig.vector_indexes) {
+        vectorIndexes.push({
+          name: vi.name,
+          entityType: entityConfig.name,
+          sourceField: vi.source_field,
+          dimension: vi.dimension,
+          provider: vi.provider,
+          model: vi.model,
+        });
+      }
+    } else if (entityConfig.vector_index) {
+      const vi = entityConfig.vector_index;
+      vectorIndexes.push({
+        name: vi.name,
+        entityType: entityConfig.name,
+        sourceField: vi.source_field,
+        dimension: vi.dimension,
+        provider: vi.provider,
+        model: vi.model,
+      });
+    }
+
+    const relationships = (entityConfig.relationships || []).map((r: any) => ({
+      type: r.type,
+      sourceEntity: entityConfig.name,
+      targetEntity: r.target,
+      direction: r.direction,
+      description: r.description,
+    }));
+
+    entities.push({
+      name: entityConfig.name,
+      description: entityConfig.description,
+      uniqueField,
+      displayNameField: entityConfig.display_name_field || 'name',
+      queryField: entityConfig.query_field || 'name',
+      contentField: entityConfig.content_field,
+      exampleDisplayFields: entityConfig.example_display_fields,
+      searchableFields,
+      computedFields: computedFields.length > 0 ? computedFields : undefined,
+      vectorIndexes,
+      relationships,
+      changeTracking: entityConfig.track_changes
+        ? {
+            enabled: true,
+            contentField: entityConfig.change_tracking?.content_field || 'source',
+          }
+        : undefined,
+      hierarchicalContent: entityConfig.hierarchical_content
+        ? {
+            childrenRelationship: entityConfig.hierarchical_content.children_relationship,
+            includeChildren: entityConfig.hierarchical_content.include_children,
+          }
+        : undefined,
+    });
+
+    allRelationships.push(...relationships);
+    allVectorIndexes.push(...vectorIndexes);
+  }
+
+  return {
+    entities,
+    relationships: allRelationships,
+    vectorIndexes: allVectorIndexes,
+  };
+}
+
+/**
  * Create a RagForge agent with all tools and mutable context
  */
 export async function createRagForgeAgent(options: AgentOptions) {
@@ -452,6 +554,61 @@ export async function createRagForgeAgent(options: AgentOptions) {
     rootDir,
   };
 
+  // Cache for the current project config (updated when project changes)
+  let cachedConfig: RagForgeConfig | null = null;
+  let cachedContext: ToolGenerationContext | null = null;
+
+  /**
+   * Context getter for dynamic tool resolution
+   * This is called by RAG tool handlers at execution time to get the current context
+   * Returns null if no project is loaded, triggering helpful error messages
+   */
+  const getToolContext = (): ToolGenerationContext | null => {
+    if (!ctx.isProjectLoaded || !ctx.currentProjectPath) {
+      return null;
+    }
+
+    // Config is at .ragforge/ragforge.config.yaml (NOT in generated/)
+    // Also check generated/ as fallback for compatibility
+    const configPaths = [
+      path.join(ctx.currentProjectPath, '.ragforge', 'ragforge.config.yaml'),
+      path.join(ctx.currentProjectPath, '.ragforge', 'generated', 'ragforge.config.yaml'),
+    ];
+
+    // Try to load config synchronously (cached for performance)
+    let configPath: string | null = null;
+    for (const p of configPaths) {
+      try {
+        readFileSync(p, 'utf-8');
+        configPath = p;
+        break;
+      } catch {
+        // Try next path
+      }
+    }
+
+    if (!configPath) {
+      return null;
+    }
+
+    try {
+      const configContent = readFileSync(configPath, 'utf-8');
+
+      // Parse YAML config
+      const config = yaml.load(configContent) as RagForgeConfig;
+
+      // Only re-extract if config changed
+      if (config !== cachedConfig) {
+        cachedConfig = config;
+        cachedContext = extractToolContext(config);
+      }
+
+      return cachedContext;
+    } catch {
+      return null;
+    }
+  };
+
   // Try to load initial project if it exists
   const configPath = options.config || path.join(initialProjectPath, '.ragforge', 'generated', 'ragforge.config.yaml');
   const generatedPath = path.join(initialProjectPath, '.ragforge', 'generated');
@@ -466,6 +623,10 @@ export async function createRagForgeAgent(options: AgentOptions) {
 
     // Load project into context
     await loadProjectIntoContext(ctx, initialProjectPath);
+
+    // Pre-cache the initial context
+    cachedConfig = projectConfig;
+    cachedContext = extractToolContext(projectConfig);
 
   } catch {
     console.log('📋 No project loaded. Project management and file tools available.');
@@ -512,6 +673,11 @@ export async function createRagForgeAgent(options: AgentOptions) {
     model: options.model || 'gemini-2.0-flash',
     verbose,
     logPath, // Enable logging to file
+
+    // CRITICAL: Pass context getter for dynamic tool resolution
+    // This enables RAG tools (get_schema, query_entities, etc.) to see
+    // newly created/loaded projects instead of using stale static context
+    contextGetter: getToolContext,
 
     // File tools always enabled, with dynamic projectRoot from context
     includeFileTools: true,

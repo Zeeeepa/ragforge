@@ -10,7 +10,9 @@ import type {
   GeneratedToolDefinition,
   ToolHandlerGenerator,
   EntityMetadata,
+  ToolGenerationContextGetter,
 } from './types/index.js';
+import { EMPTY_CONTEXT } from './types/index.js';
 
 /**
  * Schema representation returned by get_schema tool
@@ -77,20 +79,27 @@ export interface SemanticIndexInfo {
 
 /**
  * Generate discovery tools from context
+ *
+ * @param staticContext - Static context for tool definition generation
+ * @param getContext - Optional context getter for dynamic resolution at execution time
  */
 export function generateDiscoveryTools(
-  context: ToolGenerationContext
+  staticContext: ToolGenerationContext,
+  getContext?: ToolGenerationContextGetter
 ): { tools: GeneratedToolDefinition[]; handlers: Record<string, ToolHandlerGenerator> } {
   const tools: GeneratedToolDefinition[] = [];
   const handlers: Record<string, ToolHandlerGenerator> = {};
 
-  // 1. get_schema tool
-  const getSchema = generateGetSchemaTool(context);
+  // If no getter provided, create one that returns the static context
+  const contextGetter: ToolGenerationContextGetter = getContext || (() => staticContext);
+
+  // 1. get_schema tool - uses static context for definition, dynamic for handler
+  const getSchema = generateGetSchemaTool(staticContext, contextGetter);
   tools.push(getSchema.definition);
   handlers[getSchema.definition.name] = getSchema.handler;
 
   // 2. describe_entity tool (optional, more detailed per-entity)
-  const describeEntity = generateDescribeEntityTool(context);
+  const describeEntity = generateDescribeEntityTool(staticContext, contextGetter);
   tools.push(describeEntity.definition);
   handlers[describeEntity.definition.name] = describeEntity.handler;
 
@@ -99,25 +108,30 @@ export function generateDiscoveryTools(
 
 /**
  * Generate get_schema tool
+ * Uses context getter for dynamic resolution at execution time
  */
-function generateGetSchemaTool(context: ToolGenerationContext): {
+function generateGetSchemaTool(
+  staticContext: ToolGenerationContext,
+  getContext: ToolGenerationContextGetter
+): {
   definition: GeneratedToolDefinition;
   handler: ToolHandlerGenerator;
 } {
-  const entityNames = context.entities.map(e => e.name);
-  const hasSemanticSearch = context.vectorIndexes.length > 0;
-  const hasRelationships = context.relationships.length > 0;
+  // Use static context for tool definition (entity names in description)
+  const entityNames = staticContext.entities.map(e => e.name);
+  const entityListText = entityNames.length > 0 ? entityNames.join(', ') : '(none - no project loaded yet)';
 
   const description = `Get the complete database schema to understand what data is available.
 
 Returns:
-- All entity types (${entityNames.join(', ')})
+- All entity types (${entityListText})
 - Fields for each entity (with types)
 - Relationships between entities
 - Semantic search indexes (for natural language queries)
 - Usage tips
 
-Call this FIRST when you need to understand what data exists and how to query it.`;
+Call this FIRST when you need to understand what data exists and how to query it.
+NOTE: If no project is loaded, this will return an empty schema. Use create_project or load_project first.`;
 
   const definition: GeneratedToolDefinition = {
     name: 'get_schema',
@@ -133,8 +147,10 @@ Call this FIRST when you need to understand what data exists and how to query it
     },
   };
 
-  // Handler returns the schema (doesn't need RagClient, just context)
+  // Handler returns the schema - uses DYNAMIC context getter
   const handler: ToolHandlerGenerator = (_rag: any) => async (args: Record<string, any>) => {
+    // Resolve context dynamically at execution time
+    const context = getContext() || EMPTY_CONTEXT;
     const includeTips = args.include_tips !== false;
     return buildSchemaInfo(context, includeTips);
   };
@@ -144,16 +160,22 @@ Call this FIRST when you need to understand what data exists and how to query it
 
 /**
  * Generate describe_entity tool
+ * Uses context getter for dynamic resolution at execution time
  */
-function generateDescribeEntityTool(context: ToolGenerationContext): {
+function generateDescribeEntityTool(
+  staticContext: ToolGenerationContext,
+  getContext: ToolGenerationContextGetter
+): {
   definition: GeneratedToolDefinition;
   handler: ToolHandlerGenerator;
 } {
-  const entityNames = context.entities.map(e => e.name);
+  // Use static context for tool definition
+  const entityNames = staticContext.entities.map(e => e.name);
+  const entityListText = entityNames.length > 0 ? entityNames.join(', ') : '(none - no project loaded yet)';
 
   const description = `Get detailed information about a specific entity type.
 
-Available entities: ${entityNames.join(', ')}
+Available entities: ${entityListText}
 
 Returns all fields, relationships, and semantic indexes for the requested entity.
 Use this when you need detailed info about one entity after calling get_schema.`;
@@ -166,7 +188,7 @@ Use this when you need detailed info about one entity after calling get_schema.`
       properties: {
         entity_name: {
           type: 'string',
-          enum: entityNames,
+          // Don't use enum when entities might be empty - allow any string
           description: 'Name of the entity to describe',
         },
       },
@@ -174,12 +196,16 @@ Use this when you need detailed info about one entity after calling get_schema.`
     },
   };
 
+  // Handler uses DYNAMIC context getter
   const handler: ToolHandlerGenerator = (_rag: any) => async (args: Record<string, any>) => {
+    // Resolve context dynamically at execution time
+    const context = getContext() || EMPTY_CONTEXT;
     const { entity_name } = args;
     const entity = context.entities.find(e => e.name === entity_name);
 
     if (!entity) {
-      return { error: `Unknown entity: ${entity_name}. Available: ${entityNames.join(', ')}` };
+      const available = context.entities.map(e => e.name).join(', ') || '(none - no project loaded)';
+      return { error: `Unknown entity: ${entity_name}. Available entities: ${available}` };
     }
 
     return buildEntitySchemaInfo(entity, context);

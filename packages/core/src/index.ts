@@ -23,19 +23,21 @@ export { ConfigGenerator, type DomainPattern } from './generator/config-generato
 export { CodeGenerator, type GeneratedCode } from './generator/code-generator.js';
 
 // Tool Generation (Phase 1)
-export { generateToolsFromConfig } from './tools/tool-generator.js';
+export { generateToolsFromConfig, type ExtendedToolGenerationOptions } from './tools/tool-generator.js';
 export type {
   ToolGenerationOptions,
   GeneratedTools,
   GeneratedToolDefinition,
   ToolHandlerGenerator,
   ToolGenerationContext,
+  ToolGenerationContextGetter,
   EntityMetadata,
   FieldMetadata,
   VectorIndexMetadata,
   RelationshipMetadata,
   ToolGenerationMetadata,
 } from './tools/types/index.js';
+export { EMPTY_CONTEXT } from './tools/types/index.js';
 
 // Discovery Tools (schema for agents)
 export { generateDiscoveryTools } from './tools/discovery-tools.js';

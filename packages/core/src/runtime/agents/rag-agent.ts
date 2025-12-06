@@ -307,6 +307,18 @@ export interface RagAgentOptions {
    * Required if includeProjectTools is true
    */
   projectToolsContext?: Omit<ProjectToolsContext, 'workingDirectory' | 'verbose'>;
+
+  /**
+   * Context getter for dynamic tool context resolution
+   * When provided, RAG tools will call this getter at execution time
+   * to get the current ToolGenerationContext. This enables dynamic
+   * project switching (create_project, load_project) to work correctly.
+   *
+   * The getter should return:
+   * - The current project's ToolGenerationContext if a project is loaded
+   * - null if no project is loaded (tools will return helpful errors)
+   */
+  contextGetter?: () => import('../../tools/types/index.js').ToolGenerationContext | null;
 }
 
 export interface AskResult {
@@ -840,11 +852,15 @@ export async function createRagAgent(options: RagAgentOptions): Promise<RagAgent
   }
 
   // 2. Generate tools from config
+  // If contextGetter is provided, pass it to enable dynamic context resolution
+  // This is essential for agents that can create/load projects dynamically
   const { tools, handlers } = generateToolsFromConfig(config, {
     includeDiscovery: true,
     includeSemanticSearch: true,
     includeRelationships: true,
     ...options.toolOptions,
+    // Pass context getter for dynamic resolution (if provided)
+    contextGetter: options.contextGetter,
   });
 
   // 3. Bind handlers with RagClient

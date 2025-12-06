@@ -2070,11 +2070,8 @@ export class StructuredLLMExecutor {
         });
       }
 
-      if (hasSuccessfulToolResults && hasOutput) {
-        // We have successful results and LLM provided output - task is complete
-        console.log(`      → Final output (tools succeeded)`);
-        return { ...item, ...output } as TInput & TOutput;
-      } else if (hasToolCalls) {
+      // Priority: if LLM wants to call tools, let it (even if previous tools succeeded)
+      if (hasToolCalls) {
         console.log(`      → ${toolCalls.length} tool call(s)`);
 
         // Execute tools

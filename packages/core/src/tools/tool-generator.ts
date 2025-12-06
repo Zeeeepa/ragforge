@@ -17,23 +17,60 @@ import type {
   GeneratedToolDefinition,
   ToolHandlerGenerator,
   ToolGenerationContext,
+  ToolGenerationContextGetter,
 } from './types/index.js';
+import { EMPTY_CONTEXT } from './types/index.js';
 import { generateChangeTrackingTools, generateAggregationTools } from './advanced/index.js';
 import { generateDiscoveryTools } from './discovery-tools.js';
+
+/**
+ * Extended options for generateToolsFromConfig with dynamic context support
+ */
+export interface ExtendedToolGenerationOptions extends ToolGenerationOptions {
+  /**
+   * Optional context getter for dynamic resolution.
+   * When provided, handlers will call this getter at execution time
+   * instead of using static context from config.
+   *
+   * This is essential for agents that can create/load projects dynamically.
+   */
+  contextGetter?: ToolGenerationContextGetter;
+}
 
 /**
  * Generate database query tools from RagForge config
  *
  * @param config - RagForge configuration (parsed YAML or loaded config object)
- * @param options - Customization options
+ * @param options - Customization options (can include contextGetter for dynamic resolution)
  * @returns Tool definitions and handlers ready for ToolRegistry
+ *
+ * @example Static config (traditional usage)
+ * ```typescript
+ * const tools = generateToolsFromConfig(config);
+ * ```
+ *
+ * @example Dynamic context (for agents that switch projects)
+ * ```typescript
+ * const tools = generateToolsFromConfig(standaloneConfig, {
+ *   contextGetter: () => loadCurrentProjectContext(),
+ * });
+ * ```
  */
 export function generateToolsFromConfig(
   config: RagForgeConfig,
-  options: ToolGenerationOptions = {}
+  options: ExtendedToolGenerationOptions = {}
 ): GeneratedTools {
-  // Extract metadata from config first
-  const context = extractMetadata(config);
+  // Extract static context from config (used for tool definition generation)
+  const staticContext = extractMetadata(config);
+
+  // Create context getter - either uses provided getter or returns static context
+  const getContext: ToolGenerationContextGetter = options.contextGetter
+    ? options.contextGetter
+    : () => staticContext;
+
+  // For tool definitions, use static context (defines available entities, etc.)
+  // For handlers, use dynamic context getter (resolves at execution time)
+  const context = staticContext;
 
   // Auto-detect change tracking (Phase 5)
   const hasChangeTracking = context.entities.some(e => e.changeTracking?.enabled);
@@ -55,45 +92,49 @@ export function generateToolsFromConfig(
   const handlers: Record<string, ToolHandlerGenerator> = {};
 
   // 0. Discovery tools (get_schema, describe_entity) - always first so agent can discover the schema
+  // Pass context getter for dynamic resolution
   if (opts.includeDiscovery) {
-    const discoveryTools = generateDiscoveryTools(context);
+    const discoveryTools = generateDiscoveryTools(context, getContext);
     tools.push(...discoveryTools.tools);
     Object.assign(handlers, discoveryTools.handlers);
   }
 
   // 1. query_entities (always included)
+  // Tool definition uses static context, but handler uses dynamic getter
   const queryEntities = generateQueryEntitiesTool(context);
   tools.push(queryEntities);
-  handlers[queryEntities.name] = generateQueryEntitiesHandler(context);
+  handlers[queryEntities.name] = generateQueryEntitiesHandler(getContext);
 
-  // 2. semantic_search (if vector indexes exist)
+  // 2. semantic_search (if vector indexes exist in static context)
+  // Note: We always include these tools when starting with a project,
+  // but handler will check dynamic context at execution time
   if (opts.includeSemanticSearch && context.vectorIndexes.length > 0) {
     const semanticSearch = generateSemanticSearchTool(context);
     tools.push(semanticSearch);
-    handlers[semanticSearch.name] = generateSemanticSearchHandler(context);
+    handlers[semanticSearch.name] = generateSemanticSearchHandler(getContext);
   }
 
   // 3. explore_relationships (if relationships exist)
   if (opts.includeRelationships && context.relationships.length > 0) {
     const exploreRels = generateExploreRelationshipsTool(context);
     tools.push(exploreRels);
-    handlers[exploreRels.name] = generateExploreRelationshipsHandler(context);
+    handlers[exploreRels.name] = generateExploreRelationshipsHandler(getContext);
   }
 
   // 4. get_entity_by_id (always included)
   const getById = generateGetEntityByIdTool(context);
   tools.push(getById);
-  handlers[getById.name] = generateGetEntityByIdHandler(context);
+  handlers[getById.name] = generateGetEntityByIdHandler(getContext);
 
   // 4b. get_entities_by_ids (batch fetch - always included)
   const getByIds = generateGetEntitiesByIdsTool(context);
   tools.push(getByIds);
-  handlers[getByIds.name] = generateGetEntitiesByIdsHandler(context);
+  handlers[getByIds.name] = generateGetEntitiesByIdsHandler(getContext);
 
   // 4c. glob_search (pattern matching on any field)
   const globSearch = generateGlobSearchTool(context);
   tools.push(globSearch);
-  handlers[globSearch.name] = generateGlobSearchHandler(context);
+  handlers[globSearch.name] = generateGlobSearchHandler(getContext);
 
   // 5. Change tracking tools (Phase 5 - if change tracking enabled)
   if (opts.includeChangeTracking) {
@@ -550,19 +591,24 @@ Returns complete entity with all properties.`;
 }
 
 // ============================================
-// Handler Generators
+// Handler Generators (with dynamic context support)
 // ============================================
 
 /**
  * Generate handler for query_entities
+ * Uses context getter for dynamic resolution at execution time
  */
-function generateQueryEntitiesHandler(context: ToolGenerationContext): ToolHandlerGenerator {
+function generateQueryEntitiesHandler(getContext: ToolGenerationContextGetter): ToolHandlerGenerator {
   return (rag: any) => async (params: any) => {
+    // Resolve context dynamically at execution time
+    const context = getContext() || EMPTY_CONTEXT;
     const { entity_type, conditions = [], limit = 10, order_by } = params;
 
     const entityMeta = context.entities.find(e => e.name === entity_type);
     if (!entityMeta) {
-      return { error: `Unknown entity: ${entity_type}` };
+      // Provide helpful error message with available entities
+      const available = context.entities.map(e => e.name).join(', ') || '(none - no project loaded)';
+      return { error: `Unknown entity: ${entity_type}. Available entities: ${available}` };
     }
 
     let query = rag.get(entity_type);
@@ -603,14 +649,18 @@ function generateQueryEntitiesHandler(context: ToolGenerationContext): ToolHandl
 
 /**
  * Generate handler for semantic_search
+ * Uses context getter for dynamic resolution at execution time
  */
-function generateSemanticSearchHandler(context: ToolGenerationContext): ToolHandlerGenerator {
+function generateSemanticSearchHandler(getContext: ToolGenerationContextGetter): ToolHandlerGenerator {
   return (rag: any) => async (params: any) => {
+    // Resolve context dynamically at execution time
+    const context = getContext() || EMPTY_CONTEXT;
     const { entity_type, query, top_k = 5, min_score = 0.7 } = params;
 
     const entityMeta = context.entities.find(e => e.name === entity_type);
     if (!entityMeta) {
-      return { error: `Unknown entity: ${entity_type}` };
+      const available = context.entities.map(e => e.name).join(', ') || '(none - no project loaded)';
+      return { error: `Unknown entity: ${entity_type}. Available entities: ${available}` };
     }
 
     const vectorIndex = entityMeta.vectorIndexes[0];
@@ -661,9 +711,12 @@ function generateSemanticSearchHandler(context: ToolGenerationContext): ToolHand
 
 /**
  * Generate handler for explore_relationships
+ * Uses context getter for dynamic resolution at execution time
  */
-function generateExploreRelationshipsHandler(context: ToolGenerationContext): ToolHandlerGenerator {
+function generateExploreRelationshipsHandler(getContext: ToolGenerationContextGetter): ToolHandlerGenerator {
   return (rag: any) => async (params: any) => {
+    // Resolve context dynamically at execution time
+    const context = getContext() || EMPTY_CONTEXT;
     const {
       start_entity_type,
       start_conditions = [],
@@ -675,7 +728,8 @@ function generateExploreRelationshipsHandler(context: ToolGenerationContext): To
 
     const startMeta = context.entities.find(e => e.name === start_entity_type);
     if (!startMeta) {
-      return { error: `Unknown entity: ${start_entity_type}` };
+      const available = context.entities.map(e => e.name).join(', ') || '(none - no project loaded)';
+      return { error: `Unknown entity: ${start_entity_type}. Available entities: ${available}` };
     }
 
     let query = rag.get(start_entity_type);
@@ -713,14 +767,18 @@ function generateExploreRelationshipsHandler(context: ToolGenerationContext): To
 
 /**
  * Generate handler for get_entity_by_id
+ * Uses context getter for dynamic resolution at execution time
  */
-function generateGetEntityByIdHandler(context: ToolGenerationContext): ToolHandlerGenerator {
+function generateGetEntityByIdHandler(getContext: ToolGenerationContextGetter): ToolHandlerGenerator {
   return (rag: any) => async (params: any) => {
+    // Resolve context dynamically at execution time
+    const context = getContext() || EMPTY_CONTEXT;
     const { entity_type, id_value } = params;
 
     const entityMeta = context.entities.find(e => e.name === entity_type);
     if (!entityMeta) {
-      return { error: `Unknown entity: ${entity_type}` };
+      const available = context.entities.map(e => e.name).join(', ') || '(none - no project loaded)';
+      return { error: `Unknown entity: ${entity_type}. Available entities: ${available}` };
     }
 
     const results = await rag
@@ -836,14 +894,18 @@ Example workflow:
 
 /**
  * Generate handler for get_entities_by_ids
+ * Uses context getter for dynamic resolution at execution time
  */
-function generateGetEntitiesByIdsHandler(context: ToolGenerationContext): ToolHandlerGenerator {
+function generateGetEntitiesByIdsHandler(getContext: ToolGenerationContextGetter): ToolHandlerGenerator {
   return (rag: any) => async (params: any) => {
+    // Resolve context dynamically at execution time
+    const context = getContext() || EMPTY_CONTEXT;
     const { entity_type, ids, fields, with_children } = params;
 
     const entityMeta = context.entities.find(e => e.name === entity_type);
     if (!entityMeta) {
-      return { error: `Unknown entity: ${entity_type}` };
+      const available = context.entities.map(e => e.name).join(', ') || '(none - no project loaded)';
+      return { error: `Unknown entity: ${entity_type}. Available entities: ${available}` };
     }
 
     if (!ids || !Array.isArray(ids) || ids.length === 0) {
@@ -1043,14 +1105,18 @@ function globToRegexSimple(pattern: string): string {
 
 /**
  * Generate handler for glob_search
+ * Uses context getter for dynamic resolution at execution time
  */
-function generateGlobSearchHandler(context: ToolGenerationContext): ToolHandlerGenerator {
+function generateGlobSearchHandler(getContext: ToolGenerationContextGetter): ToolHandlerGenerator {
   return (rag: any) => async (params: any) => {
+    // Resolve context dynamically at execution time
+    const context = getContext() || EMPTY_CONTEXT;
     const { entity_type, field, pattern, limit = 20 } = params;
 
     const entityMeta = context.entities.find(e => e.name === entity_type);
     if (!entityMeta) {
-      return { error: `Unknown entity: ${entity_type}` };
+      const available = context.entities.map(e => e.name).join(', ') || '(none - no project loaded)';
+      return { error: `Unknown entity: ${entity_type}. Available entities: ${available}` };
     }
 
     // Validate field exists and is a string type

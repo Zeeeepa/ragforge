@@ -155,6 +155,21 @@ export interface GeneratedTools {
 export type ToolHandlerGenerator = (rag: any) => (args: Record<string, any>) => Promise<any>;
 
 /**
+ * Getter function for dynamic context resolution
+ * Returns the current context or null if no project is loaded
+ */
+export type ToolGenerationContextGetter = () => ToolGenerationContext | null;
+
+/**
+ * Empty context constant for when no project is loaded
+ */
+export const EMPTY_CONTEXT: ToolGenerationContext = {
+  entities: [],
+  relationships: [],
+  vectorIndexes: [],
+};
+
+/**
  * Metadata about generated tools
  */
 export interface ToolGenerationMetadata {
