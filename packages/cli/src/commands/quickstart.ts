@@ -192,9 +192,9 @@ export async function parseQuickstartOptions(args: string[]): Promise<Quickstart
     throw new Error(`Invalid --source-type: ${options.sourceType}. Must be one of: code, documents, chat`);
   }
 
-  // Get API keys - in dev mode, try monorepo .env if not found locally
-  let geminiKey = getEnv(['GEMINI_API_KEY'], true);
-  let replicateToken = getEnv(['REPLICATE_API_TOKEN'], true);
+  // Get API keys - prefer passed options, then env, then monorepo .env in dev mode
+  let geminiKey = options.geminiKey || getEnv(['GEMINI_API_KEY'], true);
+  let replicateToken = options.replicateToken || getEnv(['REPLICATE_API_TOKEN'], true);
 
   if (options.dev) {
     // Try to find keys in the monorepo .env
@@ -320,101 +320,23 @@ async function checkExistingConfig(projectPath: string): Promise<{ exists: boole
 }
 
 /**
- * Detect if source path is a monorepo
- */
-async function isMonorepo(sourcePath: string): Promise<boolean> {
-  // Check for monorepo indicators in source path or parent
-  const indicators = [
-    'lerna.json',
-    'pnpm-workspace.yaml',
-    'nx.json',
-    'turbo.json'
-  ];
-
-  // Check in source path
-  for (const indicator of indicators) {
-    try {
-      await fs.access(path.join(sourcePath, indicator));
-      return true;
-    } catch {
-      // File doesn't exist
-    }
-  }
-
-  // Check in parent directory
-  const parentDir = path.dirname(sourcePath);
-  for (const indicator of indicators) {
-    try {
-      await fs.access(path.join(parentDir, indicator));
-      return true;
-    } catch {
-      // File doesn't exist
-    }
-  }
-
-  // Check if sourcePath itself contains multiple package.json files (direct monorepo)
-  try {
-    const entries = await fs.readdir(sourcePath, { withFileTypes: true });
-    const subdirs = entries.filter(e => e.isDirectory() && !e.name.startsWith('.'));
-
-    let packageCount = 0;
-    for (const dir of subdirs) {
-      try {
-        await fs.access(path.join(sourcePath, dir.name, 'package.json'));
-        packageCount++;
-        if (packageCount >= 2) {
-          return true; // Found 2+ packages, it's a monorepo
-        }
-      } catch {
-        // No package.json in this directory
-      }
-    }
-  } catch {
-    // Can't read directory
-  }
-
-  // Check if there's a "packages" subdirectory with multiple packages
-  try {
-    const packagesDir = path.join(sourcePath, 'packages');
-    await fs.access(packagesDir);
-    const entries = await fs.readdir(packagesDir, { withFileTypes: true });
-    const subdirs = entries.filter(e => e.isDirectory());
-    // If there are multiple subdirectories, likely a monorepo
-    return subdirs.length >= 2;
-  } catch {
-    // No packages directory
-  }
-
-  return false;
-}
-
-/**
  * Create minimal config for new projects
+ *
+ * NOTE: Include patterns are NOT specified here - they come from the adapter defaults
+ * in packages/core/src/defaults/code-typescript.yaml (and similar for other adapters).
+ * This ensures HTML, CSS, and other web assets are included automatically.
  */
 async function createMinimalConfig(
   projectName: string,
   adapter: string,
   sourcePath: string
 ): Promise<Partial<RagForgeConfig>> {
-  // Check if this is a monorepo
-  const monorepo = await isMonorepo(sourcePath);
-
-  // Patterns for simple projects (src at root)
-  const simplePatterns: { [key: string]: string[] } = {
-    typescript: ['src/**/*.ts', 'lib/**/*.ts'],
-    javascript: ['src/**/*.js', 'lib/**/*.js'],
-    python: ['src/**/*.py', '**/*.py']
-  };
-
-  // Patterns for monorepos (src anywhere in tree)
-  const monorepoPatterns: { [key: string]: string[] } = {
-    typescript: ['**/src/**/*.ts', '**/lib/**/*.ts'],
-    javascript: ['**/src/**/*.js', '**/lib/**/*.js'],
-    python: ['**/src/**/*.py', '**/*.py']
-  };
-
-  const includePatterns = monorepo ? monorepoPatterns : simplePatterns;
-
+  // Minimal config - adapter defaults (code-typescript.yaml, etc.) provide:
+  // - include patterns (*.ts, *.tsx, *.html, *.css, package.json, etc.)
+  // - exclude patterns (node_modules, dist, test files, etc.)
+  // - watch config
+  // - entity schema
+  // - embeddings config
   return {
     name: projectName,
     version: '1.0.0',
@@ -422,8 +344,8 @@ async function createMinimalConfig(
     source: {
       type: 'code',
       adapter: adapter as 'typescript' | 'python',
-      root: sourcePath, // Absolute path to source code
-      include: includePatterns[adapter] || (monorepo ? ['**/*.ts'] : ['src/**/*'])
+      root: sourcePath // Absolute path to source code
+      // NOTE: include/exclude patterns come from adapter defaults (code-typescript.yaml)
     },
     neo4j: {
       uri: '${NEO4J_URI}',

@@ -62,6 +62,9 @@ export interface AgentOptions {
 
   /** Development mode */
   dev?: boolean;
+
+  /** Agent persona for conversational responses */
+  persona?: string;
 }
 
 /**
@@ -86,6 +89,10 @@ export interface AgentProjectContext {
 
   /** Root directory for CLI */
   rootDir: string;
+
+  /** API keys for embeddings and media generation */
+  geminiKey?: string;
+  replicateToken?: string;
 }
 
 // ============================================
@@ -189,6 +196,8 @@ function createProjectHandler(
         path: targetPath,
         dev: params.dev ?? ctx.dev,
         rag: params.rag !== false,
+        geminiKey: ctx.geminiKey,
+        replicateToken: ctx.replicateToken,
       };
 
       await runCreate(createOptions);
@@ -544,6 +553,10 @@ export async function createRagForgeAgent(options: AgentOptions) {
   const verbose = options.verbose || false;
   const rootDir = ensureEnvLoaded(import.meta.url);
 
+  // Get API keys for passing to sub-commands (create, quickstart, etc.)
+  const geminiKey = getEnv(['GEMINI_API_KEY'], true) || process.env.GEMINI_API_KEY;
+  const replicateToken = getEnv(['REPLICATE_API_TOKEN'], true) || process.env.REPLICATE_API_TOKEN;
+
   // Create mutable context - this is shared by all tools
   const ctx: AgentProjectContext = {
     currentProjectPath: null,
@@ -552,6 +565,8 @@ export async function createRagForgeAgent(options: AgentOptions) {
     isProjectLoaded: false,
     dev,
     rootDir,
+    geminiKey,
+    replicateToken,
   };
 
   // Cache for the current project config (updated when project changes)
@@ -629,8 +644,7 @@ export async function createRagForgeAgent(options: AgentOptions) {
     cachedContext = extractToolContext(projectConfig);
 
   } catch {
-    console.log('📋 No project loaded. Project management and file tools available.');
-    console.log('   Use create_project or load_project to start working on a project.');
+    // No project loaded - will be shown in runAgent() output
   }
 
   // Get API key (check both local .env and environment variables)
@@ -690,6 +704,9 @@ export async function createRagForgeAgent(options: AgentOptions) {
       onEmbeddings: createEmbeddingsHandler(ctx),
       onLoadProject: createLoadProjectHandler(ctx),
     },
+
+    // Agent persona for conversational responses
+    persona: options.persona,
   });
 
   return {
@@ -772,6 +789,7 @@ Options:
   --ask <question>   Ask a single question and exit
   --model <model>    LLM model to use (default: gemini-2.0-flash)
   --config <path>    Path to ragforge.config.yaml
+  --persona <text>   Agent personality (e.g., "A friendly assistant named RagForge")
   --verbose          Enable verbose output
   --dev              Development mode (use local dependencies)
   -h, --help         Show this help
@@ -819,6 +837,9 @@ export function parseAgentOptions(args: string[]): AgentOptions {
       case '--dev':
         options.dev = true;
         break;
+      case '--persona':
+        options.persona = args[++i];
+        break;
       case '-h':
       case '--help':
         printAgentHelp();
@@ -835,14 +856,13 @@ export function parseAgentOptions(args: string[]): AgentOptions {
 }
 
 export async function runAgent(options: AgentOptions): Promise<void> {
-  console.log('🤖 RagForge Agent');
-  console.log('═'.repeat(50));
-
-  // Create agent with mutable context
+  // Create agent with mutable context (before header so we have log path)
   const { agent, context, hasProject, projectPath, logPath } = await createRagForgeAgent(options);
 
-  // Show log path FIRST so user can access logs during execution
+  // Log path FIRST - user only sees first 2 lines during execution
   console.log(`📝 Logs: ${logPath}`);
+  console.log('🤖 RagForge Agent');
+  console.log('═'.repeat(50));
   console.log(`📁 Project: ${hasProject ? projectPath : '(no project loaded)'}`);
   console.log(`🔧 Tools: ${agent.getTools().map(t => t.name).join(', ')}`);
   console.log('');

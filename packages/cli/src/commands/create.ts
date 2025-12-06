@@ -27,6 +27,8 @@ export interface CreateOptions {
   path: string;
   dev: boolean;
   rag: boolean;
+  geminiKey?: string;
+  replicateToken?: string;
 }
 
 export function printCreateHelp(): void {
@@ -258,7 +260,9 @@ export async function runCreate(options: CreateOptions): Promise<void> {
         force: false,
         rootDir,
         dev,
-        debug: false
+        debug: false,
+        geminiKey: options.geminiKey,
+        replicateToken: options.replicateToken,
       };
 
       await runQuickstart(quickstartOptions);

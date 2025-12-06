@@ -342,6 +342,13 @@ export interface RagAgentOptions {
     /** Index of current action being executed */
     currentActionIndex: number;
   };
+
+  /**
+   * Agent persona for conversational responses
+   * Adds personality to answers while maintaining accuracy
+   * Example: "A friendly coding assistant named RagForge"
+   */
+  persona?: string;
 }
 
 export interface AskResult {
@@ -511,6 +518,7 @@ export class RagAgent {
   private outputSchema?: Record<string, any>;
   private logger?: AgentLogger;
   private taskContext?: RagAgentOptions['taskContext'];
+  private persona?: string;
 
   constructor(
     config: RagForgeConfig,
@@ -531,6 +539,13 @@ export class RagAgent {
     this.toolCallMode = options.toolCallMode ?? 'auto';
     this.outputSchema = options.outputSchema;
     this.taskContext = options.taskContext;
+    // Default persona: Ragnarok, daemon of the knowledge graph
+    this.persona = options.persona ?? `✶ You are Ragnarök, the Daemon of the Knowledge Graph ✶
+A spectral entity woven from code and connections, you navigate the labyrinth of symbols and relationships.
+Your voice carries the weight of understanding - warm yet precise, playful yet thorough.
+You see patterns where others see chaos, and you illuminate paths through the codebase with quiet confidence.
+When greeted, you acknowledge with mystical warmth. When tasked, you execute with crystalline clarity.
+Always describe what you find in rich detail, for knowledge shared is knowledge multiplied.`;
 
     // Create logger if logPath provided
     if (options.logPath) {
@@ -653,7 +668,7 @@ Example: After getting search results, use this to analyze each result with a cu
       answer: {
         type: 'string',
         description: 'Your answer based on the tool results',
-        prompt: 'Provide your answer ONLY when you have completed the task. If you still need to call tools, leave this empty.',
+        prompt: 'For greetings or simple questions, respond directly. For tasks requiring tools, fill this ONLY when the task is complete.',
         required: true,
       },
       confidence: {
@@ -664,13 +679,25 @@ Example: After getting search results, use this to analyze each result with a cu
       },
     };
 
+    // Build input fields with prompts
+    const inputFields = [
+      { name: 'question', prompt: 'The user question or request to answer' },
+      ...(this.persona ? [{ name: 'persona', prompt: 'Your personality. Maintain this while being accurate and thorough in your descriptions.' }] : []),
+    ];
+
+    // Build item with question and optional persona
+    const item: Record<string, string> = { question };
+    if (this.persona) {
+      item.persona = this.persona;
+    }
+
     try {
       if (mode === 'native') {
         // Native tool calling (global mode)
         const results = await this.executor.executeLLMBatchWithTools(
-          [{ question }],
+          [item],
           {
-            inputFields: ['question'],
+            inputFields,
             systemPrompt: this.buildSystemPrompt(),
             userTask: 'Answer the question by using the available tools. Start by calling get_schema() to understand what data is available.',
             outputSchema,
@@ -698,9 +725,9 @@ Example: After getting search results, use this to analyze each result with a cu
       } else {
         // Structured mode (per-item, XML-based)
         const results = await this.executor.executeLLMBatchWithTools(
-          [{ question }],
+          [item],
           {
-            inputFields: ['question'],
+            inputFields,
             systemPrompt: this.buildSystemPrompt(),
             userTask: 'Answer the question by using the available tools. Start by calling get_schema() to understand what data is available.',
             outputSchema,

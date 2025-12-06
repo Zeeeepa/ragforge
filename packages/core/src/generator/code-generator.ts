@@ -2003,12 +2003,15 @@ export class CodeGenerator {
       lines.push(`  type: ${config.source.type}`);
       lines.push(`  adapter: ${config.source.adapter}`);
       lines.push(`  root: ${config.source.root || '.'}`);
-      lines.push('  include:');
-      for (const pattern of config.source.include.slice(0, 2)) {
-        lines.push(`    - "${pattern}"`);
-      }
-      if (config.source.include.length > 2) {
-        lines.push(`    # ... and ${config.source.include.length - 2} more`);
+      const includePatterns = config.source.include ?? [];
+      if (includePatterns.length > 0) {
+        lines.push('  include:');
+        for (const pattern of includePatterns.slice(0, 2)) {
+          lines.push(`    - "${pattern}"`);
+        }
+        if (includePatterns.length > 2) {
+          lines.push(`    # ... and ${includePatterns.length - 2} more`);
+        }
       }
       if (config.source.exclude && config.source.exclude.length > 0) {
         lines.push('  exclude:');
@@ -4066,7 +4069,7 @@ ${cleanupSections}
       return undefined;
     }
 
-    const { include, adapter, exclude = [], root = '.' } = config.source;
+    const { include = [], adapter, exclude = [], root = '.' } = config.source;
     const hasEmbeddings = !!config.embeddings;
     const hasSummarization = !!config.summarization_strategies;
     const hasWatch = !!config.watch?.enabled;

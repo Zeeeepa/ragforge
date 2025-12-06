@@ -339,8 +339,8 @@ export interface SourceConfig {
   /** Base path for resolving relative paths (optional, defaults to project root) */
   root?: string;
 
-  /** Glob patterns to include (relative to root) */
-  include: string[];
+  /** Glob patterns to include (relative to root). Optional - defaults come from adapter YAML config. */
+  include?: string[];
 
   /** Glob patterns to exclude (optional) */
   exclude?: string[];
