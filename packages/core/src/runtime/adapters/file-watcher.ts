@@ -38,6 +38,8 @@ export class FileWatcher {
   private queue: IngestionQueue;
   private config: FileWatcherConfig;
   private logger?: AgentLogger;
+  private paused = false;
+  private pausedEvents: Array<{ path: string; type: 'add' | 'change' | 'unlink' }> = [];
 
   constructor(
     private manager: IncrementalIngestionManager,
@@ -168,9 +170,65 @@ export class FileWatcher {
   }
 
   /**
+   * Check if watcher is paused
+   */
+  isPaused(): boolean {
+    return this.paused;
+  }
+
+  /**
+   * Pause the watcher - events are ignored (not queued)
+   * Use this before agent-triggered file edits to prevent double ingestion
+   */
+  pause(): void {
+    if (!this.watcher) {
+      return;
+    }
+    this.paused = true;
+    if (this.config.verbose) {
+      console.log('⏸️ File watcher paused');
+    }
+  }
+
+  /**
+   * Resume the watcher - start processing events again
+   * Does NOT replay events that occurred while paused (they're ignored, not queued)
+   */
+  resume(): void {
+    if (!this.watcher) {
+      return;
+    }
+    this.paused = false;
+    if (this.config.verbose) {
+      console.log('▶️ File watcher resumed');
+    }
+  }
+
+  /**
+   * Pause, execute a function, then resume
+   * Useful for agent-triggered edits that should bypass the watcher
+   */
+  async withPause<T>(fn: () => Promise<T>): Promise<T> {
+    this.pause();
+    try {
+      return await fn();
+    } finally {
+      this.resume();
+    }
+  }
+
+  /**
    * Handle file system events
    */
   private handleFileEvent(filePath: string, eventType: 'add' | 'change' | 'unlink'): void {
+    // Ignore events while paused (agent-triggered edits handle their own ingestion)
+    if (this.paused) {
+      if (this.config.verbose) {
+        console.log(`⏸️ Ignoring ${eventType} (paused): ${filePath}`);
+      }
+      return;
+    }
+
     if (this.config.verbose) {
       const emoji = eventType === 'add' ? '➕' : eventType === 'change' ? '✏️' : '➖';
       console.log(`${emoji} ${eventType.toUpperCase()}: ${filePath}`);

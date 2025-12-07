@@ -180,6 +180,12 @@ export interface ParseOptions {
 
   /** Progress callback */
   onProgress?: (progress: ParseProgress) => void;
+
+  /**
+   * Files to skip (relative paths).
+   * Used for incremental ingestion - skip files that haven't changed.
+   */
+  skipFiles?: Set<string>;
 }
 
 /**

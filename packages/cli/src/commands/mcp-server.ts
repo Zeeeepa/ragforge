@@ -31,6 +31,9 @@ import {
   BrainManager,
   generateBrainTools,
   generateBrainToolHandlers,
+  // Setup tools (set_api_key, get_brain_status)
+  generateSetupTools,
+  generateSetupToolHandlers,
   // Web tools (search, fetch)
   webToolDefinitions,
   createWebToolHandlers,
@@ -216,29 +219,15 @@ async function prepareToolsForMcp(
   };
 
   // Try to initialize BrainManager (for brain tools)
+  // BrainManager handles its own Docker container and .env file in ~/.ragforge/
   try {
-    const neo4jUri = getEnv(['NEO4J_URI']);
-    const neo4jUser = getEnv(['NEO4J_USERNAME', 'NEO4J_USER']);
-    const neo4jPassword = getEnv(['NEO4J_PASSWORD']);
-    const geminiKey = getEnv(['GEMINI_API_KEY']);
-
-    if (neo4jUri && neo4jUser && neo4jPassword) {
-      ctx.brainManager = await BrainManager.getInstance({
-        neo4j: {
-          type: 'external',
-          uri: neo4jUri,
-          username: neo4jUser,
-          password: neo4jPassword,
-          database: getEnv(['NEO4J_DATABASE']) || 'neo4j',
-        },
-      });
-      await ctx.brainManager.initialize();
-      log('info', 'BrainManager initialized');
-    } else {
-      log('debug', 'BrainManager not initialized (missing NEO4J_* env vars)');
-    }
+    log('info', 'Initializing BrainManager...');
+    ctx.brainManager = await BrainManager.getInstance();
+    await ctx.brainManager.initialize();
+    log('info', 'BrainManager initialized (Docker container managed automatically)');
   } catch (error: any) {
     log('debug', `BrainManager init failed: ${error.message}`);
+    log('debug', 'Brain tools will be disabled');
   }
 
   // Cached config for dynamic context
@@ -379,6 +368,15 @@ async function prepareToolsForMcp(
       allHandlers[name] = handler;
     }
     log('debug', 'Brain tools enabled');
+
+    // Add setup tools (set_api_key, get_brain_status) - for MCP users
+    const setupToolDefs = generateSetupTools();
+    const setupHandlers = generateSetupToolHandlers({ brain: ctx.brainManager });
+    allTools.push(...setupToolDefs);
+    for (const [name, handler] of Object.entries(setupHandlers)) {
+      allHandlers[name] = handler;
+    }
+    log('debug', 'Setup tools enabled');
   } else {
     log('debug', 'Brain tools disabled (BrainManager not initialized)');
   }
@@ -397,7 +395,8 @@ async function prepareToolsForMcp(
   }
 
   // Add web tools (search, fetch) - if Gemini API key available
-  const webGeminiKey = getEnv(['GEMINI_API_KEY']);
+  // Try BrainManager first, then fallback to env
+  const webGeminiKey = ctx.brainManager?.getGeminiKey() || getEnv(['GEMINI_API_KEY']);
   if (webGeminiKey) {
     const webToolsCtx: WebToolsContext = {
       geminiApiKey: webGeminiKey,
@@ -409,7 +408,7 @@ async function prepareToolsForMcp(
     }
     log('debug', 'Web tools enabled');
   } else {
-    log('debug', 'Web tools disabled (no GEMINI_API_KEY)');
+    log('debug', 'Web tools disabled (no GEMINI_API_KEY in ~/.ragforge/.env)');
   }
 
   // Add image tools

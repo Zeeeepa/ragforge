@@ -1,15 +1,13 @@
 /**
  * Incremental Ingestion Module
  *
- * Provides utilities for incremental code ingestion based on content hashes
+ * Provides utilities for incremental code ingestion based on content hashes.
+ * Uses UniversalSourceAdapter for all file types (code, documents, media, data).
  */
 
 import type { Neo4jClient } from '../client/neo4j-client.js';
-import type { ParsedGraph, ParsedNode, ParsedRelationship, SourceConfig } from './types.js';
-import type { CodeSourceConfig } from './code-source-adapter.js';
-import type { TikaSourceConfig } from './document/tika-source-adapter.js';
-import { CodeSourceAdapter } from './code-source-adapter.js';
-import { TikaSourceAdapter } from './document/tika-source-adapter.js';
+import type { ParsedGraph, ParsedNode, ParsedRelationship, SourceConfig, SourceAdapter } from './types.js';
+import { UniversalSourceAdapter } from './universal-source-adapter.js';
 import { ChangeTracker } from './change-tracker.js';
 import { isStructuralNode } from '../../utils/node-schema.js';
 
@@ -20,18 +18,30 @@ export interface IncrementalStats {
   deleted: number;
 }
 
+export interface IngestionOptions {
+  /** Project ID to scope the ingestion */
+  projectId?: string;
+  /** Dry run - don't actually modify the database */
+  dryRun?: boolean;
+  /** Verbose logging */
+  verbose?: boolean;
+  /** Enable change tracking with diffs */
+  trackChanges?: boolean;
+  /** Clean up orphaned relationships */
+  cleanupRelationships?: boolean;
+}
+
+// Singleton adapter instance (reused across calls)
+let universalAdapter: UniversalSourceAdapter | null = null;
+
 /**
- * Factory function to create appropriate adapter based on source config
+ * Get or create the universal source adapter
  */
-function createAdapter(config: SourceConfig): CodeSourceAdapter | TikaSourceAdapter {
-  if (config.type === 'code') {
-    const codeConfig = config as CodeSourceConfig;
-    return new CodeSourceAdapter(codeConfig.adapter as 'typescript' | 'python');
-  } else if (config.type === 'document') {
-    return new TikaSourceAdapter();
-  } else {
-    throw new Error(`Unsupported source type: ${config.type}`);
+function getAdapter(): SourceAdapter {
+  if (!universalAdapter) {
+    universalAdapter = new UniversalSourceAdapter();
   }
+  return universalAdapter;
 }
 
 export class IncrementalIngestionManager {
@@ -49,24 +59,33 @@ export class IncrementalIngestionManager {
    * - Scope, DataFile, MediaFile, DocumentFile
    * - VueSFC, SvelteComponent, Stylesheet
    * - MarkupDocument, CodeBlock, DataSection
+   *
+   * @param nodeIds - UUIDs to look up
+   * @param projectId - Optional project ID to filter by
    */
   async getExistingHashes(
-    nodeIds: string[]
+    nodeIds: string[],
+    projectId?: string
   ): Promise<Map<string, { uuid: string; hash: string; source?: string; name?: string; file?: string; labels?: string[] }>> {
     if (nodeIds.length === 0) {
       return new Map();
     }
 
     // Query ALL nodes by UUID (not just Scope)
-    // This works for any content node type
-    const result = await this.client.run(
-      `
-      MATCH (n)
-      WHERE n.uuid IN $nodeIds
-      RETURN n.uuid AS uuid, n.hash AS hash, n.source AS source, n.name AS name, n.file AS file, labels(n) AS labels
-      `,
-      { nodeIds }
-    );
+    // Optionally filter by projectId
+    const query = projectId
+      ? `
+        MATCH (n)
+        WHERE n.uuid IN $nodeIds AND n.projectId = $projectId
+        RETURN n.uuid AS uuid, n.hash AS hash, n.source AS source, n.name AS name, n.file AS file, labels(n) AS labels
+        `
+      : `
+        MATCH (n)
+        WHERE n.uuid IN $nodeIds
+        RETURN n.uuid AS uuid, n.hash AS hash, n.source AS source, n.name AS name, n.file AS file, labels(n) AS labels
+        `;
+
+    const result = await this.client.run(query, { nodeIds, projectId });
 
     const hashes = new Map<string, { uuid: string; hash: string; source?: string; name?: string; file?: string; labels?: string[] }>();
     for (const record of result.records) {
@@ -297,14 +316,23 @@ export class IncrementalIngestionManager {
    */
   async ingestIncremental(
     graph: ParsedGraph,
-    options: { dryRun?: boolean; verbose?: boolean; trackChanges?: boolean; cleanupRelationships?: boolean } = {}
+    options: IngestionOptions = {}
   ): Promise<IncrementalStats> {
-    const verbose = options.verbose ?? false;
-    const cleanupRelationships = options.cleanupRelationships ?? true;
+    const { projectId, dryRun, verbose = false, trackChanges, cleanupRelationships = true } = options;
     const { nodes, relationships } = graph;
 
     if (verbose) {
       console.log('🔍 Analyzing changes...');
+      if (projectId) {
+        console.log(`   Project: ${projectId}`);
+      }
+    }
+
+    // Add projectId to all nodes if specified
+    if (projectId) {
+      for (const node of nodes) {
+        node.properties.projectId = projectId;
+      }
     }
 
     // 1. Get ALL content nodes (not just Scope)
@@ -314,7 +342,7 @@ export class IncrementalIngestionManager {
       !isStructuralNode(n)
     );
     const nodeIds = contentNodes.map(n => n.id);
-    const existingHashes = await this.getExistingHashes(nodeIds);
+    const existingHashes = await this.getExistingHashes(nodeIds, projectId);
 
     if (verbose) {
       console.log(`   Found ${existingHashes.size} existing content nodes in database`);
@@ -359,7 +387,7 @@ export class IncrementalIngestionManager {
       deleted: deleted.length
     };
 
-    if (options.dryRun) {
+    if (dryRun) {
       return stats;
     }
 
@@ -491,34 +519,32 @@ export class IncrementalIngestionManager {
    * High-level method to ingest content from configured source
    *
    * @param config - Source configuration (code, documents, etc.)
-   * @param options - Ingestion options
+   * @param options - Ingestion options including projectId
    */
   async ingestFromPaths(
     config: SourceConfig,
-    options: {
-      incremental?: boolean;
-      verbose?: boolean;
-      dryRun?: boolean;
-      trackChanges?: boolean;
-    } = {}
+    options: IngestionOptions & { incremental?: boolean } = {}
   ): Promise<IncrementalStats> {
-    const verbose = options.verbose ?? false;
+    const { projectId, verbose = false, dryRun, trackChanges: optTrackChanges } = options;
     const incremental = options.incremental ?? true;
-    const trackChanges = options.trackChanges ?? config.track_changes ?? false;
+    const trackChanges = optTrackChanges ?? config.track_changes ?? false;
 
     if (verbose) {
       const pathCount = config.include?.length || 0;
-      const sourceType = config.type === 'code' ? 'code' : 'documents';
+      const sourceType = config.type === 'code' ? 'code' : 'files';
       console.log(`\n🔄 Ingesting ${sourceType} from ${pathCount} path(s)...`);
       console.log(`   Base path: ${config.root || '.'}`);
       console.log(`   Mode: ${incremental ? 'incremental' : 'full'}`);
+      if (projectId) {
+        console.log(`   Project: ${projectId}`);
+      }
       if (trackChanges) {
         console.log(`   Change tracking: enabled`);
       }
     }
 
     // Create adapter and parse
-    const adapter = createAdapter(config);
+    const adapter = getAdapter();
     const parseResult = await adapter.parse({
       source: config,
       onProgress: undefined
@@ -539,15 +565,21 @@ export class IncrementalIngestionManager {
       console.log(`\n✅ Parsed ${countStr} from source`);
     }
 
-    // Ingest
+    // Ingest with projectId
     if (incremental) {
       return await this.ingestIncremental(parseResult.graph, {
+        projectId,
         verbose,
-        dryRun: options.dryRun,
+        dryRun,
         trackChanges
       });
     } else {
-      // Full ingestion
+      // Full ingestion - add projectId to nodes
+      if (projectId) {
+        for (const node of parseResult.graph.nodes) {
+          node.properties.projectId = projectId;
+        }
+      }
       await this.ingestNodes(parseResult.graph.nodes, parseResult.graph.relationships);
       const totalNodes = parseResult.graph.nodes.length;
       return {
@@ -627,6 +659,113 @@ export class IncrementalIngestionManager {
   }
 
   /**
+   * Re-ingest multiple files at once (for batch processing agent edits)
+   *
+   * More efficient than calling reIngestFile in a loop.
+   * Handles both creates, updates, and deletes.
+   *
+   * @param changes - Array of file changes (path + changeType)
+   * @param rootPath - Root path for relative path calculation
+   * @param options - Ingestion options including projectId
+   */
+  async reIngestFiles(
+    changes: Array<{ path: string; changeType: 'created' | 'updated' | 'deleted' }>,
+    rootPath: string,
+    options: IngestionOptions = {}
+  ): Promise<IncrementalStats> {
+    const { projectId, verbose = false, trackChanges } = options;
+    const path = await import('path');
+
+    if (changes.length === 0) {
+      return { unchanged: 0, updated: 0, created: 0, deleted: 0 };
+    }
+
+    if (verbose) {
+      console.log(`🔄 Re-ingesting ${changes.length} files...`);
+    }
+
+    // Separate deletes from creates/updates
+    const deletes = changes.filter(c => c.changeType === 'deleted');
+    const upserts = changes.filter(c => c.changeType !== 'deleted');
+
+    let stats: IncrementalStats = { unchanged: 0, updated: 0, created: 0, deleted: 0 };
+
+    // Handle deletes
+    if (deletes.length > 0) {
+      const relPaths = deletes.map(d => path.relative(rootPath, d.path));
+
+      // Delete all nodes for these files (filtered by projectId if provided)
+      const query = projectId
+        ? `
+          MATCH (n)
+          WHERE n.projectId = $projectId
+            AND (n.path IN $relPaths OR n.filePath IN $relPaths OR n.file IN $relPaths)
+          DETACH DELETE n
+          RETURN count(n) AS deleted
+          `
+        : `
+          MATCH (n)
+          WHERE n.path IN $relPaths OR n.filePath IN $relPaths OR n.file IN $relPaths
+          DETACH DELETE n
+          RETURN count(n) AS deleted
+          `;
+
+      const result = await this.client.run(query, { projectId, relPaths });
+      stats.deleted = result.records[0]?.get('deleted')?.toNumber() || 0;
+
+      if (verbose) {
+        console.log(`   Deleted ${stats.deleted} nodes for ${deletes.length} files`);
+      }
+    }
+
+    // Handle creates/updates
+    if (upserts.length > 0) {
+      const relPaths = upserts.map(u => path.relative(rootPath, u.path));
+
+      // For updates, delete existing nodes first
+      const updates = upserts.filter(u => u.changeType === 'updated');
+      if (updates.length > 0) {
+        const updatePaths = updates.map(u => path.relative(rootPath, u.path));
+
+        const deleteQuery = projectId
+          ? `
+            MATCH (n)
+            WHERE n.projectId = $projectId
+              AND (n.path IN $updatePaths OR n.filePath IN $updatePaths OR n.file IN $updatePaths)
+            DETACH DELETE n
+            `
+          : `
+            MATCH (n)
+            WHERE n.path IN $updatePaths OR n.filePath IN $updatePaths OR n.file IN $updatePaths
+            DETACH DELETE n
+            `;
+
+        await this.client.run(deleteQuery, { projectId, updatePaths });
+      }
+
+      // Parse and ingest the files
+      const ingestStats = await this.ingestFromPaths(
+        {
+          type: 'files',
+          root: rootPath,
+          include: relPaths,
+        },
+        {
+          projectId,
+          verbose,
+          trackChanges,
+          incremental: false, // We already handled incremental logic above
+        }
+      );
+
+      stats.created = ingestStats.created;
+      stats.updated = updates.length; // Files we deleted then re-created
+    }
+
+    return stats;
+  }
+
+  /**
    * Re-ingest a single file (optimized for file tool modifications)
    *
    * This method:
@@ -637,15 +776,12 @@ export class IncrementalIngestionManager {
    *
    * @param filePath - Absolute path to the file
    * @param sourceConfig - Source configuration (for adapter type, root path)
-   * @param options - Optional settings
+   * @param options - Optional settings including projectId
    */
   async reIngestFile(
     filePath: string,
     sourceConfig: SourceConfig,
-    options: {
-      trackChanges?: boolean;
-      verbose?: boolean;
-    } = {}
+    options: IngestionOptions = {}
   ): Promise<{
     scopesCreated: number;
     scopesUpdated: number;
@@ -711,7 +847,7 @@ export class IncrementalIngestionManager {
     }
 
     // Parse the single file
-    const adapter = createAdapter(sourceConfig);
+    const adapter = getAdapter();
 
     // Read file content
     const content = await fs.readFile(filePath, 'utf-8');

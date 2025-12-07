@@ -195,6 +195,14 @@ export interface ThreeDToolsContext {
    * Used for automatic ingestion
    */
   onFileCreated?: (filePath: string, fileType: 'image' | '3d' | 'document') => Promise<void>;
+  /**
+   * Callback to register rendered views in the knowledge graph
+   * Creates ImageFile nodes with RENDERED_AS relationships
+   */
+  onRenderedViews?: (
+    modelPath: string,
+    renders: Array<{ view: string; path: string }>
+  ) => Promise<{ threeDFileUuid: string; imageUuids: string[] }>;
 }
 
 /**
@@ -285,11 +293,23 @@ export function generateRender3DAssetHandler(ctx: ThreeDToolsContext): (args: an
         }
       }
 
+      // Register rendered views in knowledge graph (creates RENDERED_AS relationships)
+      let registrationResult: { threeDFileUuid?: string; imageUuids?: string[] } = {};
+      if (ctx.onRenderedViews) {
+        try {
+          registrationResult = await ctx.onRenderedViews(model_path, renders);
+        } catch (err: any) {
+          console.warn(`[render_3d_asset] Failed to register views: ${err.message}`);
+        }
+      }
+
       return {
         model_path,
         output_dir,
         views_rendered: views,
         renders,
+        threeDFileUuid: registrationResult.threeDFileUuid,
+        imageUuids: registrationResult.imageUuids,
       };
     } catch (err: any) {
       return {
@@ -941,6 +961,184 @@ export function generateGenerate3DFromTextHandler(ctx: ThreeDToolsContext): (arg
   };
 }
 
+/**
+ * Generate analyze_3d_model tool
+ *
+ * Full workflow: render → describe views → synthesize description → embed
+ */
+export function generateAnalyze3DModelTool(): GeneratedToolDefinition {
+  return {
+    name: 'analyze_3d_model',
+    section: 'media_ops',
+    description: `Fully analyze a 3D model: render views, describe each view, synthesize global description.
+
+This tool performs the complete 3D analysis workflow:
+1. Renders the model from multiple viewpoints (front, right, back, perspective)
+2. Generates descriptions for each view using Gemini Vision
+3. Synthesizes a global description combining all views
+4. Generates embeddings for semantic search
+
+Use this to make 3D models searchable and understandable.
+
+Parameters:
+- model_path: Path to 3D model file (.glb, .gltf)
+- output_dir: Directory to save rendered images (optional, uses temp if not specified)
+- views: Array of view angles (default: ['front', 'right', 'back', 'perspective'])
+
+Note: Requires GEMINI_API_KEY for descriptions.
+
+Example: analyze_3d_model({
+  model_path: "assets/models/character.glb"
+})`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        model_path: {
+          type: 'string',
+          description: 'Path to 3D model file (.glb, .gltf)',
+        },
+        output_dir: {
+          type: 'string',
+          description: 'Directory to save rendered images (optional)',
+        },
+        views: {
+          type: 'array',
+          items: {
+            type: 'string',
+            enum: ['front', 'back', 'left', 'right', 'top', 'bottom', 'perspective'],
+          },
+          description: 'View angles to render (default: front, right, back, perspective)',
+        },
+      },
+      required: ['model_path'],
+    },
+  };
+}
+
+/**
+ * Extended context for analyze_3d_model (needs ThreeDService)
+ */
+export interface ThreeDAnalyzeContext extends ThreeDToolsContext {
+  /** ThreeDService instance for full analysis */
+  threeDService?: {
+    registerRenderedViews: (
+      modelPath: string,
+      projectId: string,
+      renders: Array<{ view: string; path: string }>
+    ) => Promise<{ threeDFileUuid: string; imageUuids: string[] }>;
+    describeRenderedViews: (
+      threeDFileUuid: string,
+      projectId: string
+    ) => Promise<Array<{ imageUuid: string; view: string; description: string }>>;
+    synthesizeGlobalDescription: (
+      threeDFileUuid: string
+    ) => Promise<string | null>;
+  };
+  /** Project ID for Neo4j */
+  projectId?: string;
+}
+
+/**
+ * Generate handler for analyze_3d_model
+ */
+export function generateAnalyze3DModelHandler(ctx: ThreeDAnalyzeContext): (args: any) => Promise<any> {
+  return async (params: any) => {
+    const {
+      model_path,
+      output_dir,
+      views = ['front', 'right', 'back', 'perspective'],
+    } = params;
+
+    const fs = await import('fs/promises');
+    const pathModule = await import('path');
+    const os = await import('os');
+
+    if (!ctx.threeDService) {
+      return { error: 'ThreeDService not configured. Cannot analyze 3D models.' };
+    }
+
+    if (!ctx.projectId) {
+      return { error: 'Project ID not configured.' };
+    }
+
+    const startTime = Date.now();
+
+    // Determine output directory
+    const actualOutputDir = output_dir
+      ? (pathModule.isAbsolute(output_dir) ? output_dir : pathModule.join(ctx.projectRoot, output_dir))
+      : pathModule.join(os.tmpdir(), `ragforge-3d-analyze-${Date.now()}`);
+
+    await fs.mkdir(actualOutputDir, { recursive: true });
+
+    try {
+      console.log('📷 Step 1/3: Rendering 3D model views...');
+
+      // Step 1: Render the model
+      const renderHandler = generateRender3DAssetHandler(ctx);
+      const renderResult = await renderHandler({
+        model_path,
+        output_dir: actualOutputDir,
+        views,
+        width: 1024,
+        height: 1024,
+        background: 'transparent',
+      });
+
+      if (renderResult.error) {
+        return {
+          error: `Rendering failed: ${renderResult.error}`,
+          step: 'render',
+        };
+      }
+
+      console.log(`✅ Rendered ${renderResult.renders.length} views`);
+
+      // Step 2: Register views and create relationships
+      console.log('🔗 Step 2/3: Registering views in knowledge graph...');
+
+      const { threeDFileUuid, imageUuids } = await ctx.threeDService.registerRenderedViews(
+        model_path,
+        ctx.projectId,
+        renderResult.renders
+      );
+
+      console.log(`✅ Created ${imageUuids.length} ImageFile nodes with RENDERED_AS relationships`);
+
+      // Step 3: Describe views
+      console.log('🔍 Step 3/3: Generating descriptions...');
+
+      const descriptions = await ctx.threeDService.describeRenderedViews(
+        threeDFileUuid,
+        ctx.projectId
+      );
+
+      console.log(`✅ Generated ${descriptions.length} view descriptions`);
+
+      // Step 4: Synthesize global description
+      console.log('📝 Synthesizing global description...');
+
+      const globalDescription = await ctx.threeDService.synthesizeGlobalDescription(threeDFileUuid);
+
+      console.log('✅ Analysis complete!');
+
+      return {
+        model_path,
+        threeDFileUuid,
+        views_analyzed: views,
+        renders: renderResult.renders,
+        descriptions: descriptions.map(d => ({
+          view: d.view,
+          description: d.description,
+        })),
+        global_description: globalDescription,
+        processing_time_ms: Date.now() - startTime,
+      };
+    } catch (err: any) {
+      return { error: `Analysis failed: ${err.message}` };
+    }
+  };
+}
+
 // ============================================
 // Export All 3D Tools
 // ============================================
@@ -959,11 +1157,13 @@ export function generate3DTools(ctx: ThreeDToolsContext): ThreeDToolsResult {
       generateRender3DAssetTool(),
       generateGenerate3DFromImageTool(),
       generateGenerate3DFromTextTool(),
+      generateAnalyze3DModelTool(),
     ],
     handlers: {
       render_3d_asset: generateRender3DAssetHandler(ctx),
       generate_3d_from_image: generateGenerate3DFromImageHandler(ctx),
       generate_3d_from_text: generateGenerate3DFromTextHandler(ctx),
+      analyze_3d_model: generateAnalyze3DModelHandler(ctx as ThreeDAnalyzeContext),
     },
   };
 }

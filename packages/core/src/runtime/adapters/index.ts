@@ -18,11 +18,9 @@ export {
   ValidationResult,
 } from './types.js';
 export * from './code-source-adapter.js';
-// Deprecated: LlamaIndex-based adapter replaced by TikaSourceAdapter
-// export * from './document-source-adapter.js';
-// Note: document/ module exports TikaSourceAdapter, TikaParser, Chunker
-// TikaParser requires Java installed locally
-export * from './document/index.js';
+// Document parsing is now handled by document-file-parser.ts (web-compatible)
+// TikaSourceAdapter (Java-based) has been removed
+export * from './document-file-parser.js';
 export * from './incremental-ingestion.js';
 export * from './ingestion-queue.js';
 export * from './file-watcher.js';

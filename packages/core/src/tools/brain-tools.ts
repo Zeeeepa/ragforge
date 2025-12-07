@@ -10,7 +10,7 @@
  * @since 2025-12-07
  */
 
-import type { BrainManager, QuickIngestOptions, BrainSearchOptions, QuickIngestResult, UnifiedSearchResult } from '../brain/index.js';
+import { BrainManager, type QuickIngestOptions, type BrainSearchOptions, type QuickIngestResult, type UnifiedSearchResult } from '../brain/index.js';
 import type { GeneratedToolDefinition } from './types/index.js';
 import { getGlobalFetchCache, type CachedFetchResult } from './web-tools.js';
 
@@ -154,6 +154,15 @@ Example usage:
           type: 'boolean',
           description: 'Use semantic/embedding-based search (default: false, uses text matching)',
         },
+        embedding_type: {
+          type: 'string',
+          enum: ['name', 'content', 'description', 'all'],
+          description: `Which embedding to use for semantic search:
+- "name": search by file names, function signatures (for "find the auth function")
+- "content": search by code/text content (for "code that validates JWT")
+- "description": search by docstrings, descriptions (for "documented as authentication")
+- "all": search all embeddings and merge results (default)`,
+        },
         limit: {
           type: 'number',
           description: 'Maximum number of results (default: 20)',
@@ -173,12 +182,14 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
     projects?: string[];
     types?: string[];
     semantic?: boolean;
+    embedding_type?: 'name' | 'content' | 'description' | 'all';
     limit?: number;
   }): Promise<UnifiedSearchResult> => {
     const options: BrainSearchOptions = {
       projects: params.projects,
       nodeTypes: params.types,
       semantic: params.semantic,
+      embeddingType: params.embedding_type,
       limit: params.limit,
     };
 
@@ -649,5 +660,359 @@ export function generateBrainToolHandlers(ctx: BrainToolsContext): Record<string
     brain_search: generateBrainSearchHandler(ctx),
     forget_path: generateForgetPathHandler(ctx),
     list_brain_projects: generateListBrainProjectsHandler(ctx),
+  };
+}
+
+// ============================================
+// Setup Tools (for MCP users, not agents)
+// ============================================
+
+/**
+ * Generate set_api_key tool definition
+ * This tool is for MCP server users to configure their API keys.
+ * Not intended for automated agents.
+ */
+export function generateSetApiKeyTool(): GeneratedToolDefinition {
+  return {
+    name: 'set_api_key',
+    description: `Set an API key in the brain's configuration.
+
+⚠️ THIS TOOL IS FOR USERS, NOT AUTOMATED AGENTS.
+
+Use this to configure your API keys for various services:
+- gemini: Required for embeddings, web search, image analysis
+- replicate: Optional, for 3D model generation
+
+The key is stored in ~/.ragforge/.env and persists across sessions.
+
+Example:
+  set_api_key({ key_name: "gemini", key_value: "AIza..." })
+  set_api_key({ key_name: "replicate", key_value: "r8_..." })`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        key_name: {
+          type: 'string',
+          enum: ['gemini', 'replicate'],
+          description: 'Which API key to set (gemini or replicate)',
+        },
+        key_value: {
+          type: 'string',
+          description: 'The API key value',
+        },
+      },
+      required: ['key_name', 'key_value'],
+    },
+  };
+}
+
+/**
+ * Generate handler for set_api_key
+ */
+export function generateSetApiKeyHandler(ctx: BrainToolsContext) {
+  return async (params: {
+    key_name: 'gemini' | 'replicate';
+    key_value: string;
+  }): Promise<{ success: boolean; message: string }> => {
+    const { key_name, key_value } = params;
+
+    // Map key names to env var names
+    const envVarNames: Record<string, string> = {
+      gemini: 'GEMINI_API_KEY',
+      replicate: 'REPLICATE_API_TOKEN',
+    };
+
+    const envVarName = envVarNames[key_name];
+    if (!envVarName) {
+      return {
+        success: false,
+        message: `Unknown key name: ${key_name}. Use 'gemini' or 'replicate'.`,
+      };
+    }
+
+    // Read current .env
+    const fs = await import('fs/promises');
+    const path = await import('path');
+    const envPath = path.join(ctx.brain.getBrainPath(), '.env');
+
+    let envContent: string;
+    try {
+      envContent = await fs.readFile(envPath, 'utf-8');
+    } catch {
+      // .env doesn't exist, create it
+      envContent = `# RagForge Brain Configuration\n\n`;
+    }
+
+    // Check if the key already exists
+    const regex = new RegExp(`^${envVarName}=.*$`, 'm');
+    const commentRegex = new RegExp(`^#\\s*${envVarName}=.*$`, 'm');
+
+    if (regex.test(envContent)) {
+      // Update existing key
+      envContent = envContent.replace(regex, `${envVarName}=${key_value}`);
+    } else if (commentRegex.test(envContent)) {
+      // Replace commented key with actual value
+      envContent = envContent.replace(commentRegex, `${envVarName}=${key_value}`);
+    } else {
+      // Add new key
+      envContent = envContent.trimEnd() + `\n${envVarName}=${key_value}\n`;
+    }
+
+    // Write back
+    await fs.writeFile(envPath, envContent, 'utf-8');
+
+    // Update in-memory config
+    const config = ctx.brain.getConfig();
+    if (key_name === 'gemini') {
+      config.apiKeys.gemini = key_value;
+    } else if (key_name === 'replicate') {
+      config.apiKeys.replicate = key_value;
+    }
+
+    return {
+      success: true,
+      message: `${envVarName} has been set in ~/.ragforge/.env`,
+    };
+  };
+}
+
+/**
+ * Generate get_brain_status tool definition
+ */
+export function generateGetBrainStatusTool(): GeneratedToolDefinition {
+  return {
+    name: 'get_brain_status',
+    description: `Get the current status of the brain configuration.
+
+Shows:
+- Neo4j connection status
+- Configured API keys (masked)
+- Brain path
+- Container status
+
+Use this to check if everything is configured correctly.`,
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: [],
+    },
+  };
+}
+
+/**
+ * Generate handler for get_brain_status
+ */
+export function generateGetBrainStatusHandler(ctx: BrainToolsContext) {
+  return async (): Promise<{
+    brainPath: string;
+    neo4j: { connected: boolean; uri?: string };
+    apiKeys: { gemini: boolean; replicate: boolean };
+    projects: number;
+  }> => {
+    const config = ctx.brain.getConfig();
+    const neo4jClient = ctx.brain.getNeo4jClient();
+
+    return {
+      brainPath: config.path,
+      neo4j: {
+        connected: neo4jClient !== null,
+        uri: config.neo4j.uri,
+      },
+      apiKeys: {
+        gemini: !!config.apiKeys.gemini,
+        replicate: !!config.apiKeys.replicate,
+      },
+      projects: ctx.brain.listProjects().length,
+    };
+  };
+}
+
+/**
+ * Generate cleanup_brain tool definition
+ */
+export function generateCleanupBrainTool(): GeneratedToolDefinition {
+  return {
+    name: 'cleanup_brain',
+    description: `Clean up the brain's data and optionally reset everything.
+
+⚠️ THIS TOOL IS DESTRUCTIVE - USE WITH CAUTION.
+
+Options:
+- data_only: Only clear Neo4j data (keeps config and credentials)
+- full: Remove everything including Docker container, volumes, and ~/.ragforge
+
+After cleanup with 'full', you'll need to restart the MCP server to reinitialize.
+
+Example:
+  cleanup_brain({ mode: "data_only" })  // Clear just the graph data
+  cleanup_brain({ mode: "full" })        // Complete reset`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        mode: {
+          type: 'string',
+          enum: ['data_only', 'full'],
+          description: 'Cleanup mode: data_only (clear Neo4j data) or full (remove everything)',
+        },
+        confirm: {
+          type: 'boolean',
+          description: 'Must be true to proceed with cleanup',
+        },
+      },
+      required: ['mode', 'confirm'],
+    },
+  };
+}
+
+/**
+ * Generate handler for cleanup_brain
+ */
+export function generateCleanupBrainHandler(ctx: BrainToolsContext) {
+  return async (params: {
+    mode: 'data_only' | 'full';
+    confirm: boolean;
+  }): Promise<{ success: boolean; message: string; details?: string[] }> => {
+    const { mode, confirm } = params;
+
+    if (!confirm) {
+      return {
+        success: false,
+        message: 'Cleanup requires confirm: true to proceed.',
+      };
+    }
+
+    const details: string[] = [];
+    const { exec } = await import('child_process');
+    const { promisify } = await import('util');
+    const execAsync = promisify(exec);
+    const fs = await import('fs/promises');
+    const path = await import('path');
+
+    const brainPath = ctx.brain.getBrainPath();
+
+    if (mode === 'data_only') {
+      // Just clear Neo4j data
+      const neo4jClient = ctx.brain.getNeo4jClient();
+      if (neo4jClient) {
+        try {
+          await neo4jClient.run('MATCH (n) DETACH DELETE n');
+          details.push('Cleared all Neo4j nodes and relationships');
+        } catch (err: any) {
+          return {
+            success: false,
+            message: `Failed to clear Neo4j data: ${err.message}`,
+          };
+        }
+      }
+
+      // Clear projects registry
+      const registryPath = path.join(brainPath, 'projects.yaml');
+      try {
+        await fs.writeFile(registryPath, 'version: 1\nprojects: []\n', 'utf-8');
+        details.push('Cleared projects registry');
+      } catch {
+        // File might not exist
+      }
+
+      return {
+        success: true,
+        message: 'Brain data cleared successfully. Config and credentials preserved.',
+        details,
+      };
+    }
+
+    // Full cleanup
+    if (mode === 'full') {
+      // Stop and remove Docker container
+      try {
+        await execAsync('docker compose down -v', { cwd: brainPath });
+        details.push('Stopped Docker container and removed volumes');
+      } catch {
+        // Container might not be running
+        try {
+          await execAsync('docker rm -f ragforge-brain-neo4j');
+          details.push('Removed Docker container');
+        } catch {
+          // Container might not exist
+        }
+      }
+
+      // Remove Docker volumes
+      try {
+        await execAsync('docker volume rm ragforge_brain_data ragforge_brain_logs 2>/dev/null || true');
+        details.push('Removed Docker volumes');
+      } catch {
+        // Volumes might not exist
+      }
+
+      // Remove ~/.ragforge directory
+      try {
+        await fs.rm(brainPath, { recursive: true, force: true });
+        details.push(`Removed ${brainPath}`);
+      } catch (err: any) {
+        return {
+          success: false,
+          message: `Failed to remove brain directory: ${err.message}`,
+          details,
+        };
+      }
+
+      // Reset the singleton and reinitialize fresh
+      BrainManager.resetInstance();
+      details.push('Reset BrainManager singleton');
+
+      // Get a fresh instance and reinitialize
+      try {
+        const newBrain = await BrainManager.getInstance();
+        await newBrain.initialize();
+        // Update the context so all handlers use the new instance
+        ctx.brain = newBrain;
+        details.push('Reinitialized fresh BrainManager');
+      } catch (err: any) {
+        details.push(`Failed to reinitialize: ${err.message}`);
+        return {
+          success: true,
+          message: 'Full cleanup complete but failed to reinitialize. Restart MCP server to fix.',
+          details,
+        };
+      }
+
+      return {
+        success: true,
+        message: 'Full cleanup complete. Brain has been reinitialized fresh.',
+        details,
+      };
+    }
+
+    return {
+      success: false,
+      message: `Unknown mode: ${mode}`,
+    };
+  };
+}
+
+// ============================================
+// Setup Tools Export
+// ============================================
+
+/**
+ * Generate all setup tool definitions (for MCP users, not agents)
+ */
+export function generateSetupTools(): GeneratedToolDefinition[] {
+  return [
+    generateSetApiKeyTool(),
+    generateGetBrainStatusTool(),
+    generateCleanupBrainTool(),
+  ];
+}
+
+/**
+ * Generate all setup tool handlers
+ */
+export function generateSetupToolHandlers(ctx: BrainToolsContext): Record<string, (params: any) => Promise<any>> {
+  return {
+    set_api_key: generateSetApiKeyHandler(ctx),
+    get_brain_status: generateGetBrainStatusHandler(ctx),
+    cleanup_brain: generateCleanupBrainHandler(ctx),
   };
 }

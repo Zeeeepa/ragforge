@@ -16,3 +16,25 @@ export {
   type UnifiedSearchResult,
   type GCStats,
 } from './brain-manager.js';
+
+export {
+  EmbeddingService,
+  hashContent,
+  DEFAULT_EMBED_CONFIGS,
+  MULTI_EMBED_CONFIGS,
+  type EmbeddingType,
+  type EmbeddingFieldConfig,
+  type MultiEmbedNodeTypeConfig,
+  type EmbedNodeTypeConfig,
+  type EmbeddingResult,
+  type GenerateEmbeddingsOptions,
+  type GenerateMultiEmbeddingsOptions,
+  type MultiEmbeddingResult,
+} from './embedding-service.js';
+
+export {
+  ThreeDService,
+  type ThreeDServiceConfig,
+  type RenderAndAnalyzeOptions,
+  type RenderAndAnalyzeResult,
+} from './threed-service.js';

@@ -3,25 +3,40 @@
  *
  * Central manager for the agent's persistent knowledge base.
  * Manages:
- * - Neo4j connection (embedded or external)
+ * - Dedicated Neo4j Docker container (ragforge-brain-neo4j)
+ * - .env file with credentials (generated once, reused)
  * - Project registry (loaded projects)
  * - Quick ingest (ad-hoc directories)
  * - Cross-project search
  *
- * Default location: ~/.ragforge/brain/
+ * Default location: ~/.ragforge/
  */
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import * as yaml from 'js-yaml';
+import * as crypto from 'crypto';
+import { exec } from 'child_process';
+import { promisify } from 'util';
 import { Neo4jClient } from '../runtime/client/neo4j-client.js';
 import { ProjectRegistry, type LoadedProject, type ProjectType } from '../runtime/projects/project-registry.js';
 import { ConfigLoader } from '../config/loader.js';
 import { createClient } from '../runtime/index.js';
 import type { RagForgeConfig } from '../types/config.js';
-import { UniversalSourceAdapter, detectIncludePatterns } from '../runtime/adapters/universal-source-adapter.js';
+import { UniversalSourceAdapter } from '../runtime/adapters/universal-source-adapter.js';
 import type { ParseResult } from '../runtime/adapters/types.js';
+import { formatLocalDate } from '../runtime/utils/timestamp.js';
+import { EmbeddingService } from './embedding-service.js';
+import { FileWatcher, type FileWatcherConfig } from '../runtime/adapters/file-watcher.js';
+import { IncrementalIngestionManager } from '../runtime/adapters/incremental-ingestion.js';
+import { IngestionLock, getGlobalIngestionLock } from '../tools/ingestion-lock.js';
+import neo4j from 'neo4j-driver';
+
+const execAsync = promisify(exec);
+
+// Brain container name (fixed, not per-project)
+const BRAIN_CONTAINER_NAME = 'ragforge-brain-neo4j';
 
 // ============================================
 // Types
@@ -31,18 +46,28 @@ export interface BrainConfig {
   /** Path to brain directory (default: ~/.ragforge) */
   path: string;
 
-  /** Neo4j configuration */
+  /** Neo4j configuration (loaded from .env, not persisted in config.yaml) */
   neo4j: {
-    /** Use embedded or external Neo4j */
-    type: 'embedded' | 'external';
-    /** URI for external Neo4j */
+    /** URI for Neo4j (from .env) */
     uri?: string;
-    /** Username for external Neo4j */
+    /** Username for Neo4j (from .env) */
     username?: string;
-    /** Password for external Neo4j */
+    /** Password for Neo4j (from .env) */
     password?: string;
     /** Database name */
     database?: string;
+    /** Bolt port (persisted, used for Docker) */
+    boltPort?: number;
+    /** HTTP port (persisted, used for Docker) */
+    httpPort?: number;
+  };
+
+  /** API Keys (loaded from .env) */
+  apiKeys: {
+    /** Gemini API key (required for embeddings, web search, image analysis) */
+    gemini?: string;
+    /** Replicate API token (optional, for 3D generation) */
+    replicate?: string;
   };
 
   /** Embedding configuration */
@@ -118,6 +143,14 @@ export interface BrainSearchOptions {
   nodeTypes?: string[];
   /** Use semantic search */
   semantic?: boolean;
+  /**
+   * Which embedding to use for semantic search:
+   * - 'name': search by file names, function signatures (for "find X")
+   * - 'content': search by code/text content (for "code that does X")
+   * - 'description': search by docstrings, descriptions (for "documented as X")
+   * - 'all': search all embeddings and merge results (default)
+   */
+  embeddingType?: 'name' | 'content' | 'description' | 'all';
   /** Text pattern match */
   textMatch?: string;
   /** Result limit */
@@ -155,11 +188,16 @@ const DEFAULT_BRAIN_PATH = path.join(os.homedir(), '.ragforge');
 const DEFAULT_BRAIN_CONFIG: BrainConfig = {
   path: DEFAULT_BRAIN_PATH,
   neo4j: {
-    type: 'external', // For now, require external Neo4j
-    uri: 'bolt://localhost:7687',
-    username: 'neo4j',
-    password: 'password',
+    // Credentials will be loaded from .env (not persisted in config.yaml)
     database: 'neo4j',
+    // Ports are persisted so we can reuse them
+    boltPort: undefined, // Will be found dynamically
+    httpPort: undefined,
+  },
+  apiKeys: {
+    // Loaded from .env
+    gemini: undefined,
+    replicate: undefined,
   },
   embeddings: {
     provider: 'gemini',
@@ -189,6 +227,10 @@ export class BrainManager {
   private registeredProjects: Map<string, RegisteredProject> = new Map();
   private initialized = false;
   private sourceAdapter: UniversalSourceAdapter;
+  private ingestionManager: IncrementalIngestionManager | null = null;
+  private embeddingService: EmbeddingService | null = null;
+  private ingestionLock: IngestionLock;
+  private activeWatchers: Map<string, FileWatcher> = new Map();
 
   private constructor(config: BrainConfig) {
     this.config = config;
@@ -199,6 +241,7 @@ export class BrainManager {
       },
     });
     this.sourceAdapter = new UniversalSourceAdapter();
+    this.ingestionLock = getGlobalIngestionLock();
   }
 
   /**
@@ -210,6 +253,7 @@ export class BrainManager {
         ...DEFAULT_BRAIN_CONFIG,
         ...config,
         neo4j: { ...DEFAULT_BRAIN_CONFIG.neo4j, ...config?.neo4j },
+        apiKeys: { ...DEFAULT_BRAIN_CONFIG.apiKeys, ...config?.apiKeys },
         embeddings: { ...DEFAULT_BRAIN_CONFIG.embeddings, ...config?.embeddings },
         cleanup: { ...DEFAULT_BRAIN_CONFIG.cleanup, ...config?.cleanup },
       };
@@ -219,24 +263,50 @@ export class BrainManager {
   }
 
   /**
-   * Initialize the brain (create directories, load registry, connect to Neo4j)
+   * Reset the singleton instance (used after full cleanup)
+   * Next call to getInstance() will create a fresh instance
+   */
+  static resetInstance(): void {
+    if (BrainManager.instance) {
+      // Close Neo4j connection if open
+      if (BrainManager.instance.neo4jClient) {
+        BrainManager.instance.neo4jClient.close().catch(() => {});
+      }
+      BrainManager.instance = null;
+    }
+  }
+
+  /**
+   * Initialize the brain (create directories, load registry, ensure Docker, connect to Neo4j)
    */
   async initialize(): Promise<void> {
     if (this.initialized) return;
 
+    console.log('[Brain] Initializing...');
+
     // 1. Create brain directory structure
     await this.ensureBrainDirectories();
 
-    // 2. Load or create config
+    // 2. Load or create config (ports, embeddings config, cleanup config)
     await this.loadOrCreateConfig();
 
-    // 3. Load projects registry
+    // 3. Load or create .env (credentials - generated once, reused)
+    await this.ensureBrainEnv();
+
+    // 4. Ensure Docker container is running
+    await this.ensureDockerContainer();
+
+    // 5. Wait for Neo4j to be ready
+    await this.waitForNeo4j();
+
+    // 6. Load projects registry
     await this.loadProjectsRegistry();
 
-    // 4. Connect to Neo4j
+    // 7. Connect to Neo4j
     await this.connectNeo4j();
 
     this.initialized = true;
+    console.log('[Brain] Initialized successfully');
   }
 
   /**
@@ -256,7 +326,7 @@ export class BrainManager {
   }
 
   /**
-   * Load or create brain config file
+   * Load or create brain config file (ports, embeddings, cleanup - NOT credentials)
    */
   private async loadOrCreateConfig(): Promise<void> {
     const configPath = path.join(this.config.path, 'config.yaml');
@@ -265,7 +335,7 @@ export class BrainManager {
       const content = await fs.readFile(configPath, 'utf-8');
       const loadedConfig = yaml.load(content) as Partial<BrainConfig>;
 
-      // Merge loaded config with defaults
+      // Merge loaded config with defaults (neo4j ports come from config)
       this.config = {
         ...this.config,
         ...loadedConfig,
@@ -273,19 +343,390 @@ export class BrainManager {
         embeddings: { ...this.config.embeddings, ...loadedConfig?.embeddings },
         cleanup: { ...this.config.cleanup, ...loadedConfig?.cleanup },
       };
+      console.log('[Brain] Config loaded from', configPath);
     } catch {
-      // Config doesn't exist, create it
-      await this.saveConfig();
+      // Config doesn't exist, will be created after port discovery
+      console.log('[Brain] No existing config, will create new one');
     }
   }
 
   /**
-   * Save brain config to file
+   * Save brain config to file (excludes credentials - those go in .env)
    */
   private async saveConfig(): Promise<void> {
     const configPath = path.join(this.config.path, 'config.yaml');
-    const content = yaml.dump(this.config, { indent: 2 });
+
+    // Only persist non-sensitive config (no credentials)
+    const configToSave = {
+      path: this.config.path,
+      neo4j: {
+        database: this.config.neo4j.database,
+        boltPort: this.config.neo4j.boltPort,
+        httpPort: this.config.neo4j.httpPort,
+      },
+      embeddings: this.config.embeddings,
+      cleanup: this.config.cleanup,
+    };
+
+    const content = yaml.dump(configToSave, { indent: 2 });
     await fs.writeFile(configPath, content, 'utf-8');
+  }
+
+  // ============================================
+  // .env Management
+  // ============================================
+
+  /**
+   * Ensure .env exists with Neo4j credentials and API keys (generate once, reuse if exists)
+   */
+  private async ensureBrainEnv(): Promise<void> {
+    const envPath = path.join(this.config.path, '.env');
+
+    try {
+      // Try to load existing .env
+      const content = await fs.readFile(envPath, 'utf-8');
+      const env = this.parseEnvFile(content);
+
+      // Load Neo4j credentials from .env
+      this.config.neo4j.uri = env.NEO4J_URI;
+      this.config.neo4j.username = env.NEO4J_USERNAME || 'neo4j';
+      this.config.neo4j.password = env.NEO4J_PASSWORD;
+      this.config.neo4j.database = env.NEO4J_DATABASE || 'neo4j';
+
+      // Load API keys from .env
+      this.config.apiKeys.gemini = env.GEMINI_API_KEY;
+      this.config.apiKeys.replicate = env.REPLICATE_API_TOKEN;
+
+      // Extract port from URI if not in config
+      if (this.config.neo4j.uri && !this.config.neo4j.boltPort) {
+        const match = this.config.neo4j.uri.match(/:(\d+)$/);
+        if (match) {
+          this.config.neo4j.boltPort = parseInt(match[1]);
+        }
+      }
+
+      console.log('[Brain] Loaded credentials from .env');
+
+      // Validate required API keys
+      this.validateApiKeys();
+    } catch {
+      // .env doesn't exist, generate new credentials
+      console.log('[Brain] Generating new .env...');
+      await this.generateBrainEnv();
+    }
+  }
+
+  /**
+   * Validate that required API keys are present
+   */
+  private validateApiKeys(): void {
+    if (!this.config.apiKeys.gemini) {
+      console.warn('[Brain] ⚠️  GEMINI_API_KEY not found in ~/.ragforge/.env');
+      console.warn('[Brain] Please add your Gemini API key to enable:');
+      console.warn('[Brain]   - Embeddings generation');
+      console.warn('[Brain]   - Web search');
+      console.warn('[Brain]   - Image analysis');
+      console.warn('[Brain] Add to ~/.ragforge/.env: GEMINI_API_KEY=your-key-here');
+    }
+
+    if (!this.config.apiKeys.replicate) {
+      console.log('[Brain] ℹ️  REPLICATE_API_TOKEN not found (optional, needed for 3D generation)');
+    }
+  }
+
+  /**
+   * Generate new .env file with random password and API keys
+   */
+  private async generateBrainEnv(): Promise<void> {
+    // Find available ports if not already set
+    if (!this.config.neo4j.boltPort || !this.config.neo4j.httpPort) {
+      const ports = await this.findAvailablePorts();
+      this.config.neo4j.boltPort = ports.bolt;
+      this.config.neo4j.httpPort = ports.http;
+    }
+
+    // Generate random password
+    const password = this.generatePassword();
+
+    // Set config
+    this.config.neo4j.uri = `bolt://localhost:${this.config.neo4j.boltPort}`;
+    this.config.neo4j.username = 'neo4j';
+    this.config.neo4j.password = password;
+    this.config.neo4j.database = 'neo4j';
+
+    // Check for API keys from environment variables (fallback)
+    const geminiKey = this.config.apiKeys.gemini || process.env.GEMINI_API_KEY;
+    const replicateToken = this.config.apiKeys.replicate || process.env.REPLICATE_API_TOKEN;
+
+    // Update config with found keys
+    if (geminiKey) this.config.apiKeys.gemini = geminiKey;
+    if (replicateToken) this.config.apiKeys.replicate = replicateToken;
+
+    // Write .env
+    const envContent = `# RagForge Brain Configuration
+# Auto-generated - Credentials are used by Docker
+
+# Neo4j Database
+NEO4J_URI=bolt://localhost:${this.config.neo4j.boltPort}
+NEO4J_DATABASE=neo4j
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=${password}
+
+# API Keys
+${geminiKey ? `GEMINI_API_KEY=${geminiKey}` : '# GEMINI_API_KEY=your-api-key (required for embeddings, web search, image analysis)'}
+${replicateToken ? `REPLICATE_API_TOKEN=${replicateToken}` : '# REPLICATE_API_TOKEN=your-token (optional, for 3D generation)'}
+`;
+
+    const envPath = path.join(this.config.path, '.env');
+    await fs.writeFile(envPath, envContent, 'utf-8');
+    console.log('[Brain] Generated .env');
+
+    // Save config with ports
+    await this.saveConfig();
+
+    // Validate after generation
+    this.validateApiKeys();
+  }
+
+  /**
+   * Parse .env file content into key-value pairs
+   */
+  private parseEnvFile(content: string): Record<string, string> {
+    const env: Record<string, string> = {};
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed && !trimmed.startsWith('#')) {
+        const [key, ...valueParts] = trimmed.split('=');
+        if (key && valueParts.length > 0) {
+          env[key] = valueParts.join('=');
+        }
+      }
+    }
+    return env;
+  }
+
+  /**
+   * Generate random password
+   */
+  private generatePassword(): string {
+    const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    let password = '';
+    for (let i = 0; i < 16; i++) {
+      password += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return password;
+  }
+
+  // ============================================
+  // Docker Container Management
+  // ============================================
+
+  /**
+   * Ensure the brain's Docker container is running
+   */
+  private async ensureDockerContainer(): Promise<void> {
+    // Check if Docker is available
+    const dockerAvailable = await this.checkDockerAvailable();
+    if (!dockerAvailable) {
+      throw new Error(
+        'Docker is not installed or not running.\n' +
+        'The brain requires Docker to run Neo4j.\n' +
+        'Please install Docker and try again.'
+      );
+    }
+
+    // Check if container exists
+    const containerExists = await this.checkContainerExists();
+    const containerRunning = containerExists ? await this.checkContainerRunning() : false;
+
+    if (containerExists && containerRunning) {
+      console.log(`[Brain] Container ${BRAIN_CONTAINER_NAME} is running`);
+      return;
+    }
+
+    if (containerExists && !containerRunning) {
+      // Start existing container
+      console.log(`[Brain] Starting existing container ${BRAIN_CONTAINER_NAME}...`);
+      try {
+        await execAsync(`docker start ${BRAIN_CONTAINER_NAME}`);
+        console.log('[Brain] Container started');
+        return;
+      } catch (error: any) {
+        console.warn(`[Brain] Failed to start container: ${error.message}`);
+        console.log('[Brain] Removing and recreating container...');
+        await execAsync(`docker rm -f ${BRAIN_CONTAINER_NAME}`);
+      }
+    }
+
+    // Create new container
+    await this.createDockerContainer();
+  }
+
+  /**
+   * Create and start a new Docker container for the brain
+   */
+  private async createDockerContainer(): Promise<void> {
+    console.log('[Brain] Creating Docker container...');
+
+    const boltPort = this.config.neo4j.boltPort!;
+    const httpPort = this.config.neo4j.httpPort!;
+    const password = this.config.neo4j.password!;
+
+    // Generate docker-compose.yml
+    const dockerComposePath = path.join(this.config.path, 'docker-compose.yml');
+    const dockerComposeContent = `version: '3.8'
+
+services:
+  neo4j:
+    image: neo4j:5.23-community
+    container_name: ${BRAIN_CONTAINER_NAME}
+    environment:
+      NEO4J_AUTH: neo4j/${password}
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 2G
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+    ports:
+      - "${boltPort}:7687"
+      - "${httpPort}:7474"
+    volumes:
+      - ragforge_brain_data:/data
+      - ragforge_brain_logs:/logs
+
+volumes:
+  ragforge_brain_data:
+  ragforge_brain_logs:
+`;
+
+    await fs.writeFile(dockerComposePath, dockerComposeContent, 'utf-8');
+    console.log('[Brain] Generated docker-compose.yml');
+
+    // Start with docker compose
+    try {
+      await execAsync('docker compose up -d', { cwd: this.config.path });
+      console.log(`[Brain] Container ${BRAIN_CONTAINER_NAME} created and started`);
+      console.log(`[Brain] Neo4j Browser: http://localhost:${httpPort}`);
+      console.log(`[Brain] Neo4j Bolt: bolt://localhost:${boltPort}`);
+    } catch (error: any) {
+      throw new Error(`Failed to start Docker container: ${error.message}`);
+    }
+  }
+
+  /**
+   * Check if Docker is available
+   */
+  private async checkDockerAvailable(): Promise<boolean> {
+    try {
+      await execAsync('docker --version');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Check if the brain container exists
+   */
+  private async checkContainerExists(): Promise<boolean> {
+    try {
+      const { stdout } = await execAsync(
+        `docker ps -a --filter name=^${BRAIN_CONTAINER_NAME}$ --format "{{.Names}}"`
+      );
+      return stdout.trim() === BRAIN_CONTAINER_NAME;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Check if the brain container is running
+   */
+  private async checkContainerRunning(): Promise<boolean> {
+    try {
+      const { stdout } = await execAsync(
+        `docker ps --filter name=^${BRAIN_CONTAINER_NAME}$ --format "{{.Names}}"`
+      );
+      return stdout.trim() === BRAIN_CONTAINER_NAME;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Find available ports for Neo4j
+   */
+  private async findAvailablePorts(): Promise<{ bolt: number; http: number }> {
+    const startBolt = 7687;
+    const startHttp = 7474;
+
+    for (let i = 0; i < 20; i++) {
+      const boltPort = startBolt + i;
+      const httpPort = startHttp + i;
+
+      const boltAvailable = await this.isPortAvailable(boltPort);
+      const httpAvailable = await this.isPortAvailable(httpPort);
+
+      if (boltAvailable && httpAvailable) {
+        return { bolt: boltPort, http: httpPort };
+      }
+    }
+
+    throw new Error(
+      'Could not find available ports for Neo4j.\n' +
+      'Please free up ports 7687-7706 or 7474-7493.'
+    );
+  }
+
+  /**
+   * Check if a port is available
+   */
+  private async isPortAvailable(port: number): Promise<boolean> {
+    try {
+      // Check with ss (more reliable than lsof)
+      const { stdout: ssOut } = await execAsync(`ss -tuln | grep ':${port} ' || echo ""`);
+      if (ssOut.trim().length > 0) {
+        return false;
+      }
+
+      // Check Docker port bindings
+      const { stdout: dockerOut } = await execAsync(
+        `docker ps -a --format "{{.ID}}" | xargs -I {} docker inspect {} --format '{{.HostConfig.PortBindings}}' 2>/dev/null | grep -E " ${port}\\}" || echo ""`
+      );
+      if (dockerOut.trim().length > 0) {
+        return false;
+      }
+
+      return true;
+    } catch {
+      return true; // Assume available if check fails
+    }
+  }
+
+  /**
+   * Wait for Neo4j to be ready
+   */
+  private async waitForNeo4j(maxRetries = 30): Promise<void> {
+    console.log('[Brain] Waiting for Neo4j to be ready...');
+
+    const port = this.config.neo4j.boltPort!;
+
+    for (let i = 0; i < maxRetries; i++) {
+      try {
+        await execAsync(`timeout 1 bash -c 'cat < /dev/null > /dev/tcp/localhost/${port}'`);
+        console.log('[Brain] Neo4j is ready');
+
+        // Extra wait for auth system to stabilize
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        return;
+      } catch {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
+
+    throw new Error(
+      'Neo4j did not become ready in time.\n' +
+      `Check Docker logs: docker logs ${BRAIN_CONTAINER_NAME}`
+    );
   }
 
   /**
@@ -313,6 +754,9 @@ export class BrainManager {
    * Save projects registry to file
    */
   private async saveProjectsRegistry(): Promise<void> {
+    // Ensure directory exists (may have been deleted by cleanup)
+    await fs.mkdir(this.config.path, { recursive: true });
+
     const registryPath = path.join(this.config.path, 'projects.yaml');
     const registry: ProjectsRegistry = {
       version: 1,
@@ -329,19 +773,26 @@ export class BrainManager {
    * Connect to Neo4j
    */
   private async connectNeo4j(): Promise<void> {
-    if (this.config.neo4j.type === 'external') {
-      this.neo4jClient = new Neo4jClient({
-        uri: this.config.neo4j.uri!,
-        username: this.config.neo4j.username!,
-        password: this.config.neo4j.password!,
-        database: this.config.neo4j.database,
-      });
+    this.neo4jClient = new Neo4jClient({
+      uri: this.config.neo4j.uri!,
+      username: this.config.neo4j.username!,
+      password: this.config.neo4j.password!,
+      database: this.config.neo4j.database,
+    });
 
-      // Verify connection
-      await this.neo4jClient.verifyConnectivity();
-    } else {
-      // TODO: Support embedded Neo4j in the future
-      throw new Error('Embedded Neo4j not yet supported. Use external Neo4j.');
+    // Verify connection
+    await this.neo4jClient.verifyConnectivity();
+    console.log('[Brain] Connected to Neo4j');
+
+    // Initialize ingestion manager (with change tracking)
+    this.ingestionManager = new IncrementalIngestionManager(this.neo4jClient);
+    console.log('[Brain] IncrementalIngestionManager initialized');
+
+    // Initialize embedding service
+    const geminiKey = this.config.apiKeys?.gemini || process.env.GEMINI_API_KEY;
+    this.embeddingService = new EmbeddingService(this.neo4jClient, geminiKey);
+    if (this.embeddingService.canGenerateEmbeddings()) {
+      console.log('[Brain] EmbeddingService initialized');
     }
   }
 
@@ -434,258 +885,115 @@ export class BrainManager {
 
   /**
    * Quick ingest a directory into the brain
+   *
+   * Uses IncrementalIngestionManager for:
+   * - Hash-based incremental detection (content changes)
+   * - Change tracking with diffs
+   * - Proper cleanup of orphaned nodes
    */
   async quickIngest(dirPath: string, options: QuickIngestOptions = {}): Promise<QuickIngestResult> {
     const absolutePath = path.resolve(dirPath);
+    const startTime = Date.now();
+
+    if (!this.ingestionManager) {
+      throw new Error('Brain not initialized. Call initialize() first.');
+    }
 
     // Generate project ID
     const projectId = options.projectName
       ? options.projectName.toLowerCase().replace(/\s+/g, '-')
       : ProjectRegistry.generateId(absolutePath);
 
-    // Create .ragforge directory with brain-link
-    const ragforgeDir = path.join(absolutePath, '.ragforge');
-    await fs.mkdir(ragforgeDir, { recursive: true });
+    // Use provided patterns or sensible defaults
+    const includePatterns = options.include || [
+      '**/*.ts', '**/*.tsx', '**/*.js', '**/*.jsx',
+      '**/*.py',
+      '**/*.vue', '**/*.svelte',
+      '**/*.html', '**/*.css', '**/*.scss',
+      '**/*.md', '**/*.json', '**/*.yaml', '**/*.yml',
+      '**/*.pdf', '**/*.docx', '**/*.xlsx',
+      '**/*.png', '**/*.jpg', '**/*.jpeg', '**/*.gif',
+      '**/*.glb', '**/*.gltf',
+    ];
 
-    // Create brain-link.yaml
-    const brainLinkPath = path.join(ragforgeDir, 'brain-link.yaml');
-    await fs.writeFile(brainLinkPath, yaml.dump({
-      brainPath: this.config.path,
-      projectId,
-      linkedAt: new Date().toISOString(),
-    }), 'utf-8');
+    const excludePatterns = options.exclude || [
+      '**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**',
+      '**/__pycache__/**', '**/target/**', '**/.ragforge/**',
+      '**/coverage/**', '**/.next/**', '**/.nuxt/**',
+    ];
 
-    // Auto-detect file patterns using UniversalFileAdapter
-    const detectedPatterns = options.include || await detectIncludePatterns(absolutePath);
-    const detected = await this.detectFileTypes(absolutePath);
+    console.log(`[QuickIngest] Starting ingestion of ${absolutePath}`);
+    console.log(`[QuickIngest] Project: ${projectId}`);
+    console.log(`[QuickIngest] Patterns: ${includePatterns.length} include, ${excludePatterns.length} exclude`);
 
-    // Create source config
-    const sourceConfig = {
-      type: 'files' as const,
-      root: absolutePath,
-      include: detectedPatterns,
-      exclude: options.exclude || ['node_modules', '.git', 'dist', '__pycache__', 'target', '.ragforge'],
-    };
+    // Acquire ingestion lock
+    const release = await this.ingestionLock.acquire(`quickIngest:${projectId}`);
 
-    // Create auto-config for reference
-    const autoConfig = this.generateAutoConfig(detected, options);
-    const autoConfigPath = path.join(ragforgeDir, 'auto-config.yaml');
-    await fs.writeFile(autoConfigPath, yaml.dump(autoConfig), 'utf-8');
-
-    // Perform actual ingestion using UniversalSourceAdapter
-    let parseResult: ParseResult;
     try {
-      parseResult = await this.sourceAdapter.parse({
-        source: sourceConfig,
-        onProgress: (progress) => {
-          // Could emit events here for progress tracking
-          console.log(`[QuickIngest] ${progress.phase}: ${progress.filesProcessed}/${progress.totalFiles} files`);
+      // Use IncrementalIngestionManager for unified ingestion with change tracking
+      const stats = await this.ingestionManager.ingestFromPaths(
+        {
+          type: 'files',
+          root: absolutePath,
+          include: includePatterns,
+          exclude: excludePatterns,
+          track_changes: true, // Enable change tracking by default
         },
-      });
-    } catch (error) {
-      console.error('[QuickIngest] Parse error:', error);
-      throw error;
-    }
-
-    // Write nodes to Neo4j with projectId tag
-    let nodesCreated = 0;
-    if (this.neo4jClient && parseResult.graph.nodes.length > 0) {
-      // Add projectId to all nodes
-      const nodesWithProjectId = parseResult.graph.nodes.map(node => ({
-        ...node,
-        properties: {
-          ...node.properties,
+        {
           projectId,
+          incremental: true,
+          verbose: true,
+          trackChanges: true,
+        }
+      );
+
+      const nodesCreated = stats.created + stats.updated;
+      console.log(`[QuickIngest] Ingestion stats: +${stats.created} created, ~${stats.updated} updated, -${stats.deleted} deleted, =${stats.unchanged} unchanged`);
+
+      // Generate embeddings if requested
+      let embeddingsGenerated = 0;
+      if (options.generateEmbeddings && this.embeddingService) {
+        if (!this.embeddingService.canGenerateEmbeddings()) {
+          console.warn('[QuickIngest] ⚠️ GEMINI_API_KEY not found, skipping embeddings');
+        } else {
+          try {
+            const embeddingResult = await this.embeddingService.generateEmbeddings({
+              projectId,
+              incrementalOnly: true,
+              verbose: true,
+            });
+            embeddingsGenerated = embeddingResult.embeddedCount;
+          } catch (err: any) {
+            console.error(`[QuickIngest] ⚠️ Embedding generation failed: ${err.message}`);
+          }
+        }
+      }
+
+      // Register in brain
+      await this.registerProject(absolutePath, 'quick-ingest');
+
+      // Update node count
+      const project = this.registeredProjects.get(projectId);
+      if (project) {
+        project.nodeCount = nodesCreated;
+        await this.saveProjectsRegistry();
+      }
+
+      const elapsed = Date.now() - startTime;
+      console.log(`[QuickIngest] Completed in ${elapsed}ms`);
+
+      return {
+        projectId,
+        stats: {
+          filesProcessed: stats.created + stats.updated + stats.unchanged,
+          nodesCreated,
+          embeddingsGenerated: options.generateEmbeddings ? embeddingsGenerated : undefined,
         },
-      }));
-
-      // Batch insert nodes
-      for (const node of nodesWithProjectId) {
-        try {
-          const labels = node.labels.join(':');
-          await this.neo4jClient.run(
-            `MERGE (n:${labels} {uuid: $uuid})
-             SET n += $properties`,
-            {
-              uuid: node.id,
-              properties: node.properties,
-            }
-          );
-          nodesCreated++;
-        } catch (err) {
-          console.warn(`[QuickIngest] Failed to create node ${node.id}:`, err);
-        }
-      }
-
-      // Create relationships
-      for (const rel of parseResult.graph.relationships) {
-        try {
-          await this.neo4jClient.run(
-            `MATCH (a {uuid: $from}), (b {uuid: $to})
-             MERGE (a)-[r:${rel.type}]->(b)
-             SET r += $properties`,
-            {
-              from: rel.from,
-              to: rel.to,
-              properties: rel.properties || {},
-            }
-          );
-        } catch (err) {
-          // Relationships may fail if nodes aren't found, that's OK
-        }
-      }
+        configPath: absolutePath,
+      };
+    } finally {
+      release();
     }
-
-    // Register in brain
-    await this.registerProject(absolutePath, 'quick-ingest');
-
-    // Update node count
-    const project = this.registeredProjects.get(projectId);
-    if (project) {
-      project.nodeCount = nodesCreated;
-      await this.saveProjectsRegistry();
-    }
-
-    const stats = {
-      filesProcessed: parseResult.graph.metadata.filesProcessed,
-      nodesCreated,
-      embeddingsGenerated: options.generateEmbeddings ? 0 : undefined, // TODO: Generate embeddings
-    };
-
-    return {
-      projectId,
-      stats,
-      configPath: autoConfigPath,
-    };
-  }
-
-  /**
-   * Detect file types in a directory
-   */
-  private async detectFileTypes(dirPath: string): Promise<{
-    patterns: string[];
-    primaryLanguage: string | null;
-    totalFiles: number;
-    hasPackageJson: boolean;
-    hasRequirementsTxt: boolean;
-    mediaFiles: number;
-    documentFiles: number;
-  }> {
-    const patterns: string[] = [];
-    let primaryLanguage: string | null = null;
-    let totalFiles = 0;
-    let hasPackageJson = false;
-    let hasRequirementsTxt = false;
-    let mediaFiles = 0;
-    let documentFiles = 0;
-
-    const languageCounts: Record<string, number> = {};
-
-    const scanDir = async (dir: string) => {
-      try {
-        const entries = await fs.readdir(dir, { withFileTypes: true });
-
-        for (const entry of entries) {
-          const fullPath = path.join(dir, entry.name);
-
-          // Skip common ignore directories
-          if (entry.isDirectory()) {
-            if (['node_modules', '.git', 'dist', '__pycache__', 'target', '.ragforge'].includes(entry.name)) {
-              continue;
-            }
-            await scanDir(fullPath);
-            continue;
-          }
-
-          totalFiles++;
-          const ext = path.extname(entry.name).toLowerCase();
-
-          // Check for package files
-          if (entry.name === 'package.json') hasPackageJson = true;
-          if (entry.name === 'requirements.txt') hasRequirementsTxt = true;
-
-          // Count by extension
-          const langMap: Record<string, string> = {
-            '.ts': 'typescript',
-            '.tsx': 'typescript',
-            '.js': 'javascript',
-            '.jsx': 'javascript',
-            '.py': 'python',
-            '.rs': 'rust',
-            '.go': 'go',
-            '.java': 'java',
-            '.rb': 'ruby',
-            '.php': 'php',
-            '.cs': 'csharp',
-            '.cpp': 'cpp',
-            '.c': 'c',
-            '.h': 'c',
-          };
-
-          const mediaExts = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.mp4', '.mp3', '.wav'];
-          const docExts = ['.md', '.pdf', '.docx', '.txt', '.rst'];
-
-          if (langMap[ext]) {
-            const lang = langMap[ext];
-            languageCounts[lang] = (languageCounts[lang] || 0) + 1;
-            if (!patterns.includes(`**/*${ext}`)) {
-              patterns.push(`**/*${ext}`);
-            }
-          } else if (mediaExts.includes(ext)) {
-            mediaFiles++;
-          } else if (docExts.includes(ext)) {
-            documentFiles++;
-            if (!patterns.includes(`**/*${ext}`)) {
-              patterns.push(`**/*${ext}`);
-            }
-          }
-        }
-      } catch {
-        // Ignore permission errors
-      }
-    };
-
-    await scanDir(dirPath);
-
-    // Determine primary language
-    let maxCount = 0;
-    for (const [lang, count] of Object.entries(languageCounts)) {
-      if (count > maxCount) {
-        maxCount = count;
-        primaryLanguage = lang;
-      }
-    }
-
-    return {
-      patterns,
-      primaryLanguage,
-      totalFiles,
-      hasPackageJson,
-      hasRequirementsTxt,
-      mediaFiles,
-      documentFiles,
-    };
-  }
-
-  /**
-   * Generate auto-config for quick ingest
-   * Uses type: 'files' with auto-detection (no adapter needed)
-   */
-  private generateAutoConfig(
-    detected: Awaited<ReturnType<typeof this.detectFileTypes>>,
-    options: QuickIngestOptions
-  ): Partial<RagForgeConfig> {
-    return {
-      name: 'quick-ingest',
-      version: '1.0.0',
-      source: {
-        type: 'files', // Universal type with auto-detection
-        root: '.',
-        include: options.include || detected.patterns,
-        exclude: options.exclude || ['node_modules', '.git', 'dist', '__pycache__', 'target'],
-      },
-      entities: [], // Will use default code entities
-    };
   }
 
   // ============================================
@@ -788,12 +1096,17 @@ export class BrainManager {
       throw new Error('Brain not initialized. Call initialize() first.');
     }
 
-    const limit = options.limit || 20;
-    const offset = options.offset || 0;
+    const limit = Math.max(0, Math.floor(options.limit ?? 20));
+    const offset = Math.max(0, Math.floor(options.offset ?? 0));
+    const embeddingType = options.embeddingType || 'all';
 
     // Build project filter
     let projectFilter = '';
-    const params: Record<string, any> = { query, limit, offset };
+    const params: Record<string, any> = {
+      query,
+      limit: neo4j.int(limit),
+      offset: neo4j.int(offset),
+    };
 
     if (options.projects && options.projects.length > 0) {
       projectFilter = 'AND n.projectId IN $projectIds';
@@ -808,48 +1121,47 @@ export class BrainManager {
     }
 
     // Execute search
-    let cypher: string;
-    if (options.semantic) {
-      // Semantic search using vector index
-      // TODO: Implement proper vector search
-      cypher = `
-        MATCH (n)
-        WHERE n.name CONTAINS $query ${projectFilter} ${nodeTypeFilter}
-        RETURN n, 1.0 as score
-        ORDER BY n.name
-        SKIP $offset
-        LIMIT $limit
-      `;
+    let results: BrainSearchResult[];
+
+    if (options.semantic && this.embeddingService?.canGenerateEmbeddings()) {
+      // Semantic search using vector similarity
+      results = await this.vectorSearch(query, {
+        embeddingType,
+        projectFilter,
+        nodeTypeFilter,
+        params,
+        limit,
+      });
     } else {
-      // Text search
-      cypher = `
+      // Text search (fallback)
+      const cypher = `
         MATCH (n)
-        WHERE (n.name CONTAINS $query OR n.content CONTAINS $query) ${projectFilter} ${nodeTypeFilter}
+        WHERE (n.name CONTAINS $query OR n.content CONTAINS $query OR n.source CONTAINS $query) ${projectFilter} ${nodeTypeFilter}
         RETURN n, 1.0 as score
         ORDER BY n.name
         SKIP $offset
         LIMIT $limit
       `;
+
+      const result = await this.neo4jClient.run(cypher, params);
+
+      results = result.records.map(record => {
+        const node = record.get('n').properties;
+        const score = record.get('score');
+        const projectId = node.projectId || 'unknown';
+        const project = this.registeredProjects.get(projectId);
+
+        return {
+          node,
+          score,
+          projectId,
+          projectPath: project?.path || 'unknown',
+          projectType: project?.type || 'unknown',
+        };
+      });
     }
 
-    const result = await this.neo4jClient.run(cypher, params);
-
-    const results: BrainSearchResult[] = result.records.map(record => {
-      const node = record.get('n').properties;
-      const score = record.get('score');
-      const projectId = node.projectId || 'unknown';
-      const project = this.registeredProjects.get(projectId);
-
-      return {
-        node,
-        score,
-        projectId,
-        projectPath: project?.path || 'unknown',
-        projectType: project?.type || 'unknown',
-      };
-    });
-
-    // Get total count
+    // Get total count (approximate for text search)
     const countCypher = `
       MATCH (n)
       WHERE (n.name CONTAINS $query OR n.content CONTAINS $query) ${projectFilter} ${nodeTypeFilter}
@@ -863,6 +1175,154 @@ export class BrainManager {
       totalCount,
       searchedProjects: options.projects || Array.from(this.registeredProjects.keys()),
     };
+  }
+
+  /**
+   * Vector similarity search using embeddings
+   */
+  private async vectorSearch(
+    query: string,
+    options: {
+      embeddingType: 'name' | 'content' | 'description' | 'all';
+      projectFilter: string;
+      nodeTypeFilter: string;
+      params: Record<string, any>;
+      limit: number;
+    }
+  ): Promise<BrainSearchResult[]> {
+    const { embeddingType, projectFilter, nodeTypeFilter, params, limit } = options;
+
+    // Get query embedding
+    const queryEmbedding = await this.embeddingService!.getQueryEmbedding(query);
+    if (!queryEmbedding) {
+      console.warn('[BrainManager] Failed to get query embedding, falling back to text search');
+      return [];
+    }
+
+    // Determine which embedding properties to search
+    const embeddingProps: string[] = [];
+    if (embeddingType === 'name' || embeddingType === 'all') {
+      embeddingProps.push('embedding_name');
+    }
+    if (embeddingType === 'content' || embeddingType === 'all') {
+      embeddingProps.push('embedding_content');
+    }
+    if (embeddingType === 'description' || embeddingType === 'all') {
+      embeddingProps.push('embedding_description');
+    }
+
+    // Also include legacy 'embedding' property for backward compatibility
+    if (embeddingType === 'all') {
+      embeddingProps.push('embedding');
+    }
+
+    // Search each embedding type and collect results
+    const allResults: BrainSearchResult[] = [];
+    const seenUuids = new Set<string>();
+
+    for (const embeddingProp of embeddingProps) {
+      const cypher = `
+        MATCH (n)
+        WHERE n.${embeddingProp} IS NOT NULL ${projectFilter} ${nodeTypeFilter}
+        WITH n, gds.similarity.cosine(n.${embeddingProp}, $queryEmbedding) AS score
+        WHERE score > 0.5
+        RETURN n, score
+        ORDER BY score DESC
+        LIMIT $limit
+      `;
+
+      try {
+        const result = await this.neo4jClient!.run(cypher, {
+          ...params,
+          queryEmbedding,
+        });
+
+        for (const record of result.records) {
+          const node = record.get('n').properties;
+          const uuid = node.uuid;
+
+          // Skip duplicates
+          if (seenUuids.has(uuid)) continue;
+          seenUuids.add(uuid);
+
+          const score = record.get('score');
+          const projectId = node.projectId || 'unknown';
+          const project = this.registeredProjects.get(projectId);
+
+          allResults.push({
+            node,
+            score,
+            projectId,
+            projectPath: project?.path || 'unknown',
+            projectType: project?.type || 'unknown',
+          });
+        }
+      } catch (err) {
+        // GDS might not be installed, try without it
+        console.warn(`[BrainManager] Vector search failed for ${embeddingProp}, trying fallback...`);
+
+        // Fallback: manual cosine similarity (less efficient but works without GDS)
+        const fallbackCypher = `
+          MATCH (n)
+          WHERE n.${embeddingProp} IS NOT NULL ${projectFilter} ${nodeTypeFilter}
+          RETURN n
+          LIMIT 500
+        `;
+
+        const fallbackResult = await this.neo4jClient!.run(fallbackCypher, params);
+
+        for (const record of fallbackResult.records) {
+          const node = record.get('n').properties;
+          const uuid = node.uuid;
+
+          if (seenUuids.has(uuid)) continue;
+
+          const nodeEmbedding = node[embeddingProp];
+          if (!nodeEmbedding || !Array.isArray(nodeEmbedding)) continue;
+
+          // Compute cosine similarity manually
+          const score = this.cosineSimilarity(queryEmbedding, nodeEmbedding);
+          if (score < 0.5) continue;
+
+          seenUuids.add(uuid);
+
+          const projectId = node.projectId || 'unknown';
+          const project = this.registeredProjects.get(projectId);
+
+          allResults.push({
+            node,
+            score,
+            projectId,
+            projectPath: project?.path || 'unknown',
+            projectType: project?.type || 'unknown',
+          });
+        }
+      }
+    }
+
+    // Sort by score and limit
+    allResults.sort((a, b) => b.score - a.score);
+    return allResults.slice(0, limit);
+  }
+
+  /**
+   * Compute cosine similarity between two vectors
+   */
+  private cosineSimilarity(a: number[], b: number[]): number {
+    if (a.length !== b.length) return 0;
+
+    let dotProduct = 0;
+    let normA = 0;
+    let normB = 0;
+
+    for (let i = 0; i < a.length; i++) {
+      dotProduct += a[i] * b[i];
+      normA += a[i] * a[i];
+      normB += b[i] * b[i];
+    }
+
+    if (normA === 0 || normB === 0) return 0;
+    return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
   }
 
   // ============================================
@@ -964,6 +1424,376 @@ export class BrainManager {
     return this.initialized;
   }
 
+  /** Get API keys */
+  getApiKeys(): { gemini?: string; replicate?: string } {
+    return this.config.apiKeys;
+  }
+
+  /** Get Gemini API key */
+  getGeminiKey(): string | undefined {
+    return this.config.apiKeys.gemini;
+  }
+
+  /** Get Replicate API token */
+  getReplicateToken(): string | undefined {
+    return this.config.apiKeys.replicate;
+  }
+
+  /** Get embedding service */
+  getEmbeddingService(): EmbeddingService | null {
+    return this.embeddingService;
+  }
+
+  /** Get ingestion lock */
+  getIngestionLock(): IngestionLock {
+    return this.ingestionLock;
+  }
+
+  // ============================================
+  // File Watching
+  // ============================================
+
+  /**
+   * Start watching a project for file changes
+   *
+   * Integrates with:
+   * - FileWatcher (chokidar-based file monitoring)
+   * - IngestionQueue (batches changes)
+   * - IngestionLock (blocks RAG queries during ingestion)
+   * - EmbeddingService (regenerates embeddings after ingestion)
+   */
+  async startWatching(
+    projectPath: string,
+    options: {
+      includePatterns?: string[];
+      excludePatterns?: string[];
+      verbose?: boolean;
+    } = {}
+  ): Promise<void> {
+    const absolutePath = path.resolve(projectPath);
+    const projectId = ProjectRegistry.generateId(absolutePath);
+
+    // Check if already watching
+    if (this.activeWatchers.has(projectId)) {
+      console.log(`[Brain] Already watching project: ${projectId}`);
+      return;
+    }
+
+    if (!this.neo4jClient) {
+      throw new Error('Brain not initialized. Call initialize() first.');
+    }
+
+    // Create IncrementalIngestionManager for the watcher
+    const ingestionManager = new IncrementalIngestionManager(this.neo4jClient);
+
+    // Default patterns (code + documents + data + media)
+    const includePatterns = options.includePatterns || [
+      // Code
+      '**/*.ts', '**/*.tsx', '**/*.js', '**/*.jsx',
+      '**/*.py', '**/*.vue', '**/*.svelte',
+      '**/*.html', '**/*.css', '**/*.scss',
+      // Documents
+      '**/*.pdf', '**/*.docx', '**/*.xlsx', '**/*.xls', '**/*.csv',
+      // Data
+      '**/*.md', '**/*.json', '**/*.yaml', '**/*.yml',
+      // Media (images + 3D)
+      '**/*.png', '**/*.jpg', '**/*.jpeg', '**/*.gif', '**/*.webp', '**/*.svg',
+      '**/*.glb', '**/*.gltf', '**/*.obj',
+    ];
+
+    const excludePatterns = options.excludePatterns || [
+      '**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**',
+      '**/__pycache__/**', '**/target/**', '**/.ragforge/**',
+    ];
+
+    // Source config for the watcher
+    const sourceConfig = {
+      type: 'code' as const,
+      adapter: 'typescript' as const,
+      root: absolutePath,
+      include: includePatterns,
+      exclude: excludePatterns,
+    };
+
+    // Create FileWatcher with afterIngestion callback for embeddings
+    const watcher = new FileWatcher(ingestionManager, sourceConfig, {
+      verbose: options.verbose ?? false,
+      ingestionLock: this.ingestionLock,
+      batchInterval: 1000, // 1 second batching
+
+      // Hook afterIngestion to regenerate embeddings
+      afterIngestion: async (stats) => {
+        if (stats.created + stats.updated > 0 && this.embeddingService?.canGenerateEmbeddings()) {
+          console.log(`[Brain] Regenerating embeddings for ${stats.created + stats.updated} changed nodes...`);
+          try {
+            const result = await this.embeddingService.generateEmbeddings({
+              projectId,
+              incrementalOnly: true,
+              verbose: options.verbose ?? false,
+            });
+            console.log(`[Brain] Embeddings: ${result.embeddedCount} generated, ${result.skippedCount} cached`);
+          } catch (err: any) {
+            console.warn(`[Brain] Embedding generation failed: ${err.message}`);
+          }
+        }
+      },
+
+      onBatchComplete: (stats) => {
+        console.log(`[Brain] Ingestion complete: +${stats.created} created, ~${stats.updated} updated, -${stats.deleted} deleted`);
+      },
+    });
+
+    // Start watching
+    await watcher.start();
+    this.activeWatchers.set(projectId, watcher);
+
+    console.log(`[Brain] Started watching project: ${projectId}`);
+  }
+
+  /**
+   * Stop watching a project
+   */
+  async stopWatching(projectPath: string): Promise<void> {
+    const absolutePath = path.resolve(projectPath);
+    const projectId = ProjectRegistry.generateId(absolutePath);
+
+    const watcher = this.activeWatchers.get(projectId);
+    if (!watcher) {
+      console.log(`[Brain] Project not being watched: ${projectId}`);
+      return;
+    }
+
+    await watcher.stop();
+    this.activeWatchers.delete(projectId);
+
+    console.log(`[Brain] Stopped watching project: ${projectId}`);
+  }
+
+  /**
+   * Check if a project is being watched
+   */
+  isWatching(projectPath: string): boolean {
+    const absolutePath = path.resolve(projectPath);
+    const projectId = ProjectRegistry.generateId(absolutePath);
+    return this.activeWatchers.has(projectId);
+  }
+
+  /**
+   * Get all actively watched project IDs
+   */
+  getWatchedProjects(): string[] {
+    return Array.from(this.activeWatchers.keys());
+  }
+
+  /**
+   * Pause file watcher for a project
+   * Use before agent-triggered edits to prevent double ingestion
+   */
+  pauseWatcher(projectPath: string): void {
+    const absolutePath = path.resolve(projectPath);
+    const projectId = ProjectRegistry.generateId(absolutePath);
+    const watcher = this.activeWatchers.get(projectId);
+    if (watcher) {
+      watcher.pause();
+    }
+  }
+
+  /**
+   * Resume file watcher for a project
+   */
+  resumeWatcher(projectPath: string): void {
+    const absolutePath = path.resolve(projectPath);
+    const projectId = ProjectRegistry.generateId(absolutePath);
+    const watcher = this.activeWatchers.get(projectId);
+    if (watcher) {
+      watcher.resume();
+    }
+  }
+
+  /**
+   * Pause all active watchers
+   */
+  pauseAllWatchers(): void {
+    for (const watcher of this.activeWatchers.values()) {
+      watcher.pause();
+    }
+  }
+
+  /**
+   * Resume all active watchers
+   */
+  resumeAllWatchers(): void {
+    for (const watcher of this.activeWatchers.values()) {
+      watcher.resume();
+    }
+  }
+
+  /**
+   * Execute a function with all watchers paused
+   * Useful for agent-triggered batch edits
+   */
+  async withPausedWatchers<T>(fn: () => Promise<T>): Promise<T> {
+    this.pauseAllWatchers();
+    try {
+      return await fn();
+    } finally {
+      this.resumeAllWatchers();
+    }
+  }
+
+  /**
+   * Get watcher for a project (for advanced control)
+   */
+  getWatcher(projectPath: string): FileWatcher | undefined {
+    const absolutePath = path.resolve(projectPath);
+    const projectId = ProjectRegistry.generateId(absolutePath);
+    return this.activeWatchers.get(projectId);
+  }
+
+  // ============================================
+  // Agent Edit Queue (for batched file changes)
+  // ============================================
+
+  private agentEditQueue: Map<string, { path: string; changeType: 'created' | 'updated' | 'deleted' }> = new Map();
+  private agentEditFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private agentEditFlushDelay = 500; // ms - wait for more edits before flushing
+
+  /**
+   * Queue a file change from agent edit/creation
+   *
+   * Automatically batches multiple edits and flushes after a delay.
+   * Use this from write_file/edit_file tools.
+   *
+   * @param filePath - Absolute path to the file
+   * @param changeType - Type of change ('created' | 'updated' | 'deleted')
+   */
+  queueFileChange(filePath: string, changeType: 'created' | 'updated' | 'deleted'): void {
+    const absolutePath = path.resolve(filePath);
+
+    // Add to queue (later changes override earlier ones for same file)
+    this.agentEditQueue.set(absolutePath, { path: absolutePath, changeType });
+
+    // Reset flush timer
+    if (this.agentEditFlushTimer) {
+      clearTimeout(this.agentEditFlushTimer);
+    }
+
+    // Schedule flush
+    this.agentEditFlushTimer = setTimeout(() => {
+      this.flushAgentEditQueue().catch(err => {
+        console.error('[Brain] Failed to flush agent edit queue:', err);
+      });
+    }, this.agentEditFlushDelay);
+  }
+
+  /**
+   * Immediately flush the agent edit queue
+   * Call this when you know all edits are done
+   *
+   * Uses IncrementalIngestionManager.reIngestFiles() for unified ingestion with change tracking
+   */
+  async flushAgentEditQueue(): Promise<{ nodesAffected: number; embeddingsGenerated: number }> {
+    // Clear timer
+    if (this.agentEditFlushTimer) {
+      clearTimeout(this.agentEditFlushTimer);
+      this.agentEditFlushTimer = null;
+    }
+
+    // Get and clear queue
+    const changes = Array.from(this.agentEditQueue.values());
+    this.agentEditQueue.clear();
+
+    if (changes.length === 0) {
+      return { nodesAffected: 0, embeddingsGenerated: 0 };
+    }
+
+    console.log(`[Brain] Flushing ${changes.length} queued file changes...`);
+
+    if (!this.ingestionManager) {
+      console.warn('[Brain] Not initialized, skipping ingestion');
+      return { nodesAffected: 0, embeddingsGenerated: 0 };
+    }
+
+    // Group by project
+    const byProject = new Map<string, { projectRoot: string; changes: typeof changes }>();
+
+    for (const change of changes) {
+      let projectId: string | null = null;
+      let projectRoot: string | null = null;
+
+      for (const [id, project] of this.registeredProjects) {
+        if (change.path.startsWith(project.path)) {
+          projectId = id;
+          projectRoot = project.path;
+          break;
+        }
+      }
+
+      if (projectId && projectRoot) {
+        if (!byProject.has(projectId)) {
+          byProject.set(projectId, { projectRoot, changes: [] });
+        }
+        byProject.get(projectId)!.changes.push(change);
+      }
+    }
+
+    let totalNodesAffected = 0;
+    let totalEmbeddingsGenerated = 0;
+
+    // Acquire ingestion lock
+    const release = await this.ingestionLock.acquire(`agent-edit-batch:${changes.length}`);
+
+    try {
+      for (const [projectId, { projectRoot, changes: projectChanges }] of byProject) {
+        // Use IncrementalIngestionManager for unified ingestion with change tracking
+        const stats = await this.ingestionManager.reIngestFiles(
+          projectChanges,
+          projectRoot,
+          {
+            projectId,
+            verbose: true,
+            trackChanges: true,
+          }
+        );
+
+        totalNodesAffected += stats.created + stats.updated + stats.deleted;
+        console.log(`[Brain] Project ${projectId}: +${stats.created} created, ~${stats.updated} updated, -${stats.deleted} deleted`);
+
+        // Generate embeddings for this project
+        if (this.embeddingService?.canGenerateEmbeddings()) {
+          const result = await this.embeddingService.generateEmbeddings({
+            projectId,
+            incrementalOnly: true,
+            verbose: false,
+          });
+          totalEmbeddingsGenerated += result.embeddedCount;
+        }
+      }
+
+      if (totalEmbeddingsGenerated > 0) {
+        console.log(`[Brain] Generated ${totalEmbeddingsGenerated} embeddings`);
+      }
+    } finally {
+      release();
+    }
+
+    return { nodesAffected: totalNodesAffected, embeddingsGenerated: totalEmbeddingsGenerated };
+  }
+
+  /**
+   * Check if there are pending agent edits
+   */
+  hasPendingEdits(): boolean {
+    return this.agentEditQueue.size > 0;
+  }
+
+  /**
+   * Get count of pending edits
+   */
+  getPendingEditCount(): number {
+    return this.agentEditQueue.size;
+  }
+
   // ============================================
   // Lifecycle
   // ============================================
@@ -972,11 +1802,33 @@ export class BrainManager {
    * Shutdown the brain manager
    */
   async shutdown(): Promise<void> {
+    // Flush any pending agent edits
+    if (this.agentEditQueue.size > 0) {
+      console.log(`[Brain] Flushing ${this.agentEditQueue.size} pending edits before shutdown...`);
+      await this.flushAgentEditQueue();
+    }
+
+    // Clear edit timer
+    if (this.agentEditFlushTimer) {
+      clearTimeout(this.agentEditFlushTimer);
+      this.agentEditFlushTimer = null;
+    }
+
+    // Stop all file watchers
+    for (const [projectId, watcher] of this.activeWatchers) {
+      console.log(`[Brain] Stopping watcher for ${projectId}...`);
+      await watcher.stop();
+    }
+    this.activeWatchers.clear();
+
     // Save registry
     await this.saveProjectsRegistry();
 
     // Dispose project registry (stops watchers, closes connections)
     await this.projectRegistry.dispose();
+
+    // Clear embedding service
+    this.embeddingService = null;
 
     // Close Neo4j connection
     if (this.neo4jClient) {
@@ -985,12 +1837,5 @@ export class BrainManager {
     }
 
     this.initialized = false;
-  }
-
-  /**
-   * Reset singleton (for testing)
-   */
-  static resetInstance(): void {
-    BrainManager.instance = null;
   }
 }

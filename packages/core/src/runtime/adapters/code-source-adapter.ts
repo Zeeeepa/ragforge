@@ -15,6 +15,9 @@
 import { globby } from 'globby';
 import { createHash } from 'crypto';
 import * as path from 'path';
+import * as fs from 'fs/promises';
+import pLimit from 'p-limit';
+import { formatLocalDate } from '../utils/timestamp.js';
 import {
   ParserRegistry,
   TypeScriptLanguageParser,
@@ -349,7 +352,21 @@ export class CodeSourceAdapter extends SourceAdapter {
     });
 
     // Discover files to parse
-    const files = await this.discoverFiles(config);
+    let files = await this.discoverFiles(config);
+
+    // Filter out files that should be skipped (incremental ingestion)
+    const rootDir = config.root || process.cwd();
+    if (options.skipFiles && options.skipFiles.size > 0) {
+      const beforeCount = files.length;
+      files = files.filter(f => {
+        const relPath = path.relative(rootDir, f);
+        return !options.skipFiles!.has(relPath);
+      });
+      const skipped = beforeCount - files.length;
+      if (skipped > 0) {
+        console.log(`[CodeSourceAdapter] Skipped ${skipped} unchanged files (incremental)`);
+      }
+    }
 
     if (files.length === 0) {
       return {
@@ -452,6 +469,9 @@ export class CodeSourceAdapter extends SourceAdapter {
       '**/node_modules/**',
       '**/dist/**',
       '**/.git/**',
+      '**/.ragforge/**',
+      '**/__pycache__/**',
+      '**/target/**',
       '**/*.test.ts',
       '**/*.spec.ts'
     ];
@@ -513,6 +533,7 @@ export class CodeSourceAdapter extends SourceAdapter {
 
   /**
    * Parse all files (code, HTML, CSS, Vue, Svelte, SCSS, Markdown, and package.json)
+   * Uses p-limit for parallel processing (10 concurrent files)
    */
   private async parseFiles(
     files: string[],
@@ -545,9 +566,35 @@ export class CodeSourceAdapter extends SourceAdapter {
     const mediaFiles = new Map<string, MediaFileInfo>();
     const documentFiles = new Map<string, DocumentFileInfo>();
 
-    for (const file of files) {
-      onProgress(file);
+    // Use p-limit for parallel processing (10 concurrent files)
+    const limit = pLimit(10);
+    let filesProcessed = 0;
 
+    // Pre-initialize all parsers BEFORE parallel processing to avoid race conditions
+    // Detect which parsers we'll need based on file extensions
+    const needsTs = files.some(f => /\.(ts|tsx|js|jsx)$/i.test(f));
+    const needsPy = files.some(f => /\.py$/i.test(f));
+    const needsVue = files.some(f => /\.vue$/i.test(f));
+    const needsSvelte = files.some(f => /\.svelte$/i.test(f));
+    const needsHtml = files.some(f => /\.html?$/i.test(f));
+    const needsCss = files.some(f => /\.css$/i.test(f));
+    const needsScss = files.some(f => /\.scss$/i.test(f));
+    const needsMd = files.some(f => /\.mdx?$/i.test(f));
+
+    // Initialize parsers in parallel
+    await Promise.all([
+      needsTs && this.registry.initializeParser('typescript').catch(() => {}),
+      needsPy && this.registry.initializeParser('python').catch(() => {}),
+      needsVue && this.getVueParser().catch(() => {}),
+      needsSvelte && this.getSvelteParser().catch(() => {}),
+      needsHtml && this.getHtmlParser().catch(() => {}),
+      needsCss && this.getCssParser().catch(() => {}),
+      needsScss && this.getScssParser().catch(() => {}),
+      needsMd && this.getMarkdownParser().catch(() => {}),
+    ].filter(Boolean));
+
+    // Parse single file and return typed result
+    const parseFile = async (file: string): Promise<void> => {
       try {
         // Handle document files first (PDF, DOCX, XLSX - binary with full text extraction)
         if (isDocumentFile(file)) {
@@ -559,7 +606,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           } catch (err) {
             console.warn(`Failed to parse document file ${file}:`, err);
           }
-          continue;
+          return;
         }
 
         // Handle media files (images, 3D - binary, metadata only)
@@ -572,7 +619,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           } catch (err) {
             console.warn(`Failed to parse media file ${file}:`, err);
           }
-          continue;
+          return;
         }
 
         const content = await import('fs').then(fs => fs.promises.readFile(file, 'utf-8'));
@@ -583,7 +630,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           if (pkgInfo) {
             packageJsonFiles.set(file, pkgInfo);
           }
-          continue;
+          return;
         }
 
         // Handle Vue SFC files
@@ -591,7 +638,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           const vueParser = await this.getVueParser();
           const result = await vueParser.parseFile(file, content);
           vueFiles.set(file, result);
-          continue;
+          return;
         }
 
         // Handle Svelte component files
@@ -599,7 +646,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           const svelteParser = await this.getSvelteParser();
           const result = await svelteParser.parseFile(file, content);
           svelteFiles.set(file, result);
-          continue;
+          return;
         }
 
         // Handle HTML files (not Vue/Svelte)
@@ -607,7 +654,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           const htmlParser = await this.getHtmlParser();
           const result = await htmlParser.parseFile(file, content, { parseScripts: true });
           htmlFiles.set(file, result);
-          continue;
+          return;
         }
 
         // Handle SCSS files
@@ -615,7 +662,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           const scssParser = await this.getScssParser();
           const result = await scssParser.parseFile(file, content);
           scssFiles.set(file, result);
-          continue;
+          return;
         }
 
         // Handle CSS files
@@ -623,7 +670,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           const cssParser = await this.getCssParser();
           const result = await cssParser.parseFile(file, content);
           cssFiles.set(file, result);
-          continue;
+          return;
         }
 
         // Handle Markdown files
@@ -631,7 +678,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           const mdParser = await this.getMarkdownParser();
           const result = await mdParser.parseFile(file, content, { parseCodeBlocks: true });
           markdownFiles.set(file, result);
-          continue;
+          return;
         }
 
         // Handle data files (JSON, YAML, XML, TOML, ENV) - but not package.json which is handled separately
@@ -642,16 +689,12 @@ export class CodeSourceAdapter extends SourceAdapter {
           } catch (err) {
             console.warn(`Failed to parse data file ${file}:`, err);
           }
-          continue;
+          return;
         }
 
-        // Handle TypeScript/Python files with ParserRegistry
+        // Handle TypeScript/Python files with ParserRegistry (parsers pre-initialized above)
         const parser = this.registry.getParserForFile(file);
         if (parser) {
-          // Initialize parser if not already initialized
-          if (!this.registry.isInitialized(parser.language)) {
-            await this.registry.initializeParser(parser.language);
-          }
           const universalAnalysis = await parser.parseFile(file, content);
 
           // LEGACY CONVERSION: Convert UniversalScope/FileAnalysis → ScopeInfo/ScopeFileAnalysis
@@ -707,7 +750,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           };
 
           codeFiles.set(file, analysis);
-          continue;
+          return;
         }
 
         // Fallback: Use GenericCodeParser for unknown code files
@@ -718,8 +761,16 @@ export class CodeSourceAdapter extends SourceAdapter {
 
       } catch (error) {
         console.error(`Error parsing file ${file}:`, error);
+      } finally {
+        filesProcessed++;
+        onProgress(file);
       }
-    }
+    };
+
+    // Process all files in parallel with concurrency limit
+    await Promise.all(
+      files.map(file => limit(() => parseFile(file)))
+    );
 
     return { codeFiles, htmlFiles, cssFiles, scssFiles, vueFiles, svelteFiles, markdownFiles, genericFiles, packageJsonFiles, dataFiles, mediaFiles, documentFiles };
   }
@@ -961,6 +1012,15 @@ export class CodeSourceAdapter extends SourceAdapter {
       // Calculate content hash (SHA-256)
       const contentHash = createHash('sha256').update(analysis.scopes.map(s => s.content || '').join('')).digest('hex');
 
+      // Get file mtime for incremental ingestion
+      let mtime: string | undefined;
+      try {
+        const stat = await fs.stat(filePath);
+        mtime = formatLocalDate(stat.mtime);
+      } catch {
+        // File may have been deleted, ignore
+      }
+
       const fileUuid = `file:${relPath}`;
       nodes.push({
         labels: ['File'],
@@ -971,7 +1031,8 @@ export class CodeSourceAdapter extends SourceAdapter {
           name: fileName,
           directory,
           extension,
-          contentHash
+          contentHash,
+          ...(mtime && { mtime }),
         }
       });
 

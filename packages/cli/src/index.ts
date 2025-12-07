@@ -48,6 +48,11 @@ import {
   runMcpServer,
   printMcpServerHelp
 } from './commands/mcp-server.js';
+import {
+  parseTestToolOptions,
+  runTestTool,
+  printTestToolHelp
+} from './commands/test-tool.js';
 
 import { VERSION } from './version.js';
 
@@ -68,6 +73,7 @@ Usage:
   ragforge create <name> [options]   Create a new TypeScript project
   ragforge agent [options]           Launch RagForge agent (RAG + File + Project tools)
   ragforge mcp-server [options]      Start as MCP server (for Claude Code)
+  ragforge test-tool <name> [opts]   Test a tool directly (for debugging)
   ragforge init [options]            Complete setup (introspect + generate)
   ragforge help <command>            Show detailed help for a specific command
 
@@ -140,6 +146,9 @@ async function main(): Promise<void> {
           case 'mcp-server':
             printMcpServerHelp();
             break;
+          case 'test-tool':
+            printTestToolHelp();
+            break;
           case 'init':
             printInitHelp();
             break;
@@ -178,6 +187,12 @@ async function main(): Promise<void> {
       case 'mcp-server': {
         const options = parseMcpServerOptions(rest);
         await runMcpServer(options);
+        return;
+      }
+
+      case 'test-tool': {
+        const options = parseTestToolOptions(rest);
+        await runTestTool(options);
         return;
       }
 

@@ -193,7 +193,7 @@ export async function detectIncludePatterns(rootPath: string): Promise<string[]>
 
   const sampleFiles = await globby(['**/*'], {
     cwd: rootPath,
-    ignore: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**'],
+    ignore: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**', '**/.ragforge/**', '**/__pycache__/**', '**/target/**'],
     onlyFiles: true,
     deep: 3,
   });

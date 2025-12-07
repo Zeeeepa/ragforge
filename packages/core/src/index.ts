@@ -78,17 +78,19 @@ export {
 } from './tools/image-tools.js';
 export type { ImageToolsContext, ImageToolsResult } from './tools/image-tools.js';
 
-// 3D Tools (render, generate from image/text)
+// 3D Tools (render, generate from image/text, analyze)
 export {
   generate3DTools,
   generateRender3DAssetTool,
   generateGenerate3DFromImageTool,
   generateGenerate3DFromTextTool,
+  generateAnalyze3DModelTool,
   generateRender3DAssetHandler,
   generateGenerate3DFromImageHandler,
   generateGenerate3DFromTextHandler,
+  generateAnalyze3DModelHandler,
 } from './tools/threed-tools.js';
-export type { ThreeDToolsContext, ThreeDToolsResult } from './tools/threed-tools.js';
+export type { ThreeDToolsContext, ThreeDToolsResult, ThreeDAnalyzeContext } from './tools/threed-tools.js';
 
 // Project Tools (create, setup, ingest, embeddings)
 export {
@@ -164,6 +166,15 @@ export {
   generateForgetPathHandler,
   generateListBrainProjectsTool,
   generateListBrainProjectsHandler,
+  // Setup tools (for MCP users)
+  generateSetupTools,
+  generateSetupToolHandlers,
+  generateSetApiKeyTool,
+  generateSetApiKeyHandler,
+  generateGetBrainStatusTool,
+  generateGetBrainStatusHandler,
+  generateCleanupBrainTool,
+  generateCleanupBrainHandler,
 } from './tools/brain-tools.js';
 export type { BrainToolsContext } from './tools/brain-tools.js';
 

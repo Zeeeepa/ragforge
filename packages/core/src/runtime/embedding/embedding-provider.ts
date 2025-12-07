@@ -7,6 +7,7 @@
  */
 
 import { GoogleGenAI } from '@google/genai';
+import pLimit from 'p-limit';
 
 /**
  * Gemini embedding provider options
@@ -40,9 +41,10 @@ export class GeminiEmbeddingProvider {
 
   constructor(options: GeminiProviderOptions) {
     this.client = new GoogleGenAI({ apiKey: options.apiKey });
-    this.model = options.model || 'text-embedding-004';
-    this.dimension = options.dimension;
-    this.batchSize = options.batching?.size ?? 16;
+    // Use gemini-embedding-001 (3072 dims native) - replaces deprecated text-embedding-004/005
+    this.model = options.model || 'gemini-embedding-001';
+    this.dimension = options.dimension; // undefined = use native 3072 dims for best quality
+    this.batchSize = options.batching?.size ?? 100; // Gemini supports up to 100 texts per batch
   }
 
   /**
@@ -69,46 +71,76 @@ export class GeminiEmbeddingProvider {
     const model = overrides?.model || this.model;
     const dimension = overrides?.dimension ?? this.dimension;
 
-    const results: number[][] = [];
-
-    // Process in batches
+    // Split into batches
+    const batches: string[][] = [];
     for (let i = 0; i < texts.length; i += this.batchSize) {
-      const batch = texts.slice(i, i + this.batchSize);
+      batches.push(texts.slice(i, i + this.batchSize));
+    }
 
-      try {
-        const response = await this.client.models.embedContent({
-          model,
-          contents: batch.map(text => ({ parts: [{ text }] })),
-          config: dimension ? { outputDimensionality: dimension } : undefined,
-        });
+    console.log(`[Embedding] ${texts.length} texts → ${batches.length} batches`);
+    const startTime = Date.now();
 
-        // Extract embeddings from response
-        if (response.embeddings) {
-          for (const embedding of response.embeddings) {
-            if (embedding.values) {
-              results.push(embedding.values);
-            }
-          }
-        }
-      } catch (error: any) {
-        // Fallback to individual requests if batch fails
-        console.warn(`Batch embedding failed, falling back to individual: ${error.message}`);
+    // Limit concurrency to avoid rate limits (5 parallel requests)
+    const limit = pLimit(5);
 
-        for (const text of batch) {
-          const singleResponse = await this.client.models.embedContent({
-            model,
-            contents: [{ parts: [{ text }] }],
-            config: dimension ? { outputDimensionality: dimension } : undefined,
-          });
-
-          if (singleResponse.embeddings?.[0]?.values) {
-            results.push(singleResponse.embeddings[0].values);
+    // Helper: retry with exponential backoff
+    const retryWithBackoff = async <T>(
+      fn: () => Promise<T>,
+      maxRetries = 3,
+      baseDelay = 1000
+    ): Promise<T> => {
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+          return await fn();
+        } catch (error: any) {
+          const isRateLimit = error.message?.includes('429') || error.message?.includes('rate');
+          if (attempt < maxRetries && isRateLimit) {
+            const delay = baseDelay * Math.pow(2, attempt);
+            console.warn(`[Embedding] Rate limited, retrying in ${delay}ms...`);
+            await new Promise(r => setTimeout(r, delay));
           } else {
-            throw new Error(`Failed to get embedding for text: ${text.substring(0, 50)}...`);
+            throw error;
           }
         }
       }
-    }
+      throw new Error('Max retries exceeded');
+    };
+
+    // Process batches with limited concurrency
+    const batchResults = await Promise.all(
+      batches.map((batch, batchNum) =>
+        limit(async () => {
+          const batchStart = Date.now();
+          try {
+            const response = await retryWithBackoff(() =>
+              this.client.models.embedContent({
+                model,
+                contents: batch.map(text => ({ parts: [{ text }] })),
+                config: dimension ? { outputDimensionality: dimension } : undefined,
+              })
+            );
+
+            const embeddings: number[][] = [];
+            if (response.embeddings) {
+              for (const embedding of response.embeddings) {
+                if (embedding.values) {
+                  embeddings.push(embedding.values);
+                }
+              }
+            }
+            console.log(`[Embedding] Batch ${batchNum + 1}/${batches.length}: ${batch.length} texts in ${Date.now() - batchStart}ms`);
+            return embeddings;
+          } catch (error: any) {
+            console.warn(`[Embedding] Batch ${batchNum + 1} failed: ${error.message}`);
+            return []; // Return empty instead of crashing
+          }
+        })
+      )
+    );
+
+    // Flatten results maintaining order
+    const results = batchResults.flat();
+    console.log(`[Embedding] Total: ${results.length} embeddings in ${Date.now() - startTime}ms`);
 
     return results;
   }
