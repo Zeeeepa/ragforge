@@ -44,31 +44,39 @@ export class IncrementalIngestionManager {
   /**
    * Get existing hashes and content for a set of node UUIDs
    * Used for incremental ingestion to detect changes and generate diffs
+   *
+   * Works with ALL content node types:
+   * - Scope, DataFile, MediaFile, DocumentFile
+   * - VueSFC, SvelteComponent, Stylesheet
+   * - MarkupDocument, CodeBlock, DataSection
    */
   async getExistingHashes(
     nodeIds: string[]
-  ): Promise<Map<string, { uuid: string; hash: string; source?: string; name?: string; file?: string }>> {
+  ): Promise<Map<string, { uuid: string; hash: string; source?: string; name?: string; file?: string; labels?: string[] }>> {
     if (nodeIds.length === 0) {
       return new Map();
     }
 
+    // Query ALL nodes by UUID (not just Scope)
+    // This works for any content node type
     const result = await this.client.run(
       `
-      MATCH (n:Scope)
+      MATCH (n)
       WHERE n.uuid IN $nodeIds
-      RETURN n.uuid AS uuid, n.hash AS hash, n.source AS source, n.name AS name, n.file AS file
+      RETURN n.uuid AS uuid, n.hash AS hash, n.source AS source, n.name AS name, n.file AS file, labels(n) AS labels
       `,
       { nodeIds }
     );
 
-    const hashes = new Map<string, { uuid: string; hash: string; source?: string; name?: string; file?: string }>();
+    const hashes = new Map<string, { uuid: string; hash: string; source?: string; name?: string; file?: string; labels?: string[] }>();
     for (const record of result.records) {
       hashes.set(record.get('uuid'), {
         uuid: record.get('uuid'),
         hash: record.get('hash'),
         source: record.get('source'),
         name: record.get('name'),
-        file: record.get('file')
+        file: record.get('file'),
+        labels: record.get('labels')
       });
     }
     return hashes;
@@ -77,18 +85,58 @@ export class IncrementalIngestionManager {
   /**
    * Delete nodes and their relationships
    * Used to clean up orphaned nodes when files are deleted
+   *
+   * Works with ALL content node types (not just Scope)
    */
   async deleteNodes(uuids: string[]): Promise<void> {
     if (uuids.length === 0) return;
 
+    // Delete ANY node by UUID (not just Scope)
     await this.client.run(
       `
-      MATCH (n:Scope)
+      MATCH (n)
       WHERE n.uuid IN $uuids
       DETACH DELETE n
       `,
       { uuids }
     );
+  }
+
+  /**
+   * Delete outgoing relationships from nodes before re-upserting
+   * This ensures stale relationships are cleaned up when content changes
+   *
+   * @param uuids - Node UUIDs to clean relationships from
+   * @param relationshipTypes - Optional list of relationship types to delete (default: all outgoing)
+   */
+  async deleteOutgoingRelationships(
+    uuids: string[],
+    relationshipTypes?: string[]
+  ): Promise<number> {
+    if (uuids.length === 0) return 0;
+
+    let query: string;
+    if (relationshipTypes && relationshipTypes.length > 0) {
+      // Delete specific relationship types
+      const relTypePattern = relationshipTypes.join('|');
+      query = `
+        MATCH (n)-[r:${relTypePattern}]->()
+        WHERE n.uuid IN $uuids
+        DELETE r
+        RETURN count(r) AS deleted
+      `;
+    } else {
+      // Delete ALL outgoing relationships
+      query = `
+        MATCH (n)-[r]->()
+        WHERE n.uuid IN $uuids
+        DELETE r
+        RETURN count(r) AS deleted
+      `;
+    }
+
+    const result = await this.client.run(query, { uuids });
+    return result.records[0]?.get('deleted')?.toNumber() || 0;
   }
 
   /**
@@ -179,34 +227,43 @@ export class IncrementalIngestionManager {
   }
 
   /**
-   * Incremental ingestion - only updates changed scopes
+   * Incremental ingestion - only updates changed content nodes
    *
    * Strategy:
-   * 1. Fetch existing hashes from DB
+   * 1. Fetch existing hashes from DB (ALL content node types)
    * 2. Filter nodes: only keep changed/new ones
    * 3. Delete orphaned nodes (files removed from codebase)
-   * 4. Upsert changed nodes
-   * 5. Update relationships for affected nodes
-   * 6. Track changes and generate diffs (if enabled)
+   * 4. Clean up outgoing relationships for modified nodes
+   * 5. Upsert changed nodes
+   * 6. Update relationships for affected nodes
+   * 7. Track changes and generate diffs (if enabled)
+   *
+   * Supports: Scope, DataFile, MediaFile, DocumentFile, VueSFC,
+   *           SvelteComponent, Stylesheet, MarkupDocument, CodeBlock
    */
   async ingestIncremental(
     graph: ParsedGraph,
-    options: { dryRun?: boolean; verbose?: boolean; trackChanges?: boolean } = {}
+    options: { dryRun?: boolean; verbose?: boolean; trackChanges?: boolean; cleanupRelationships?: boolean } = {}
   ): Promise<IncrementalStats> {
     const verbose = options.verbose ?? false;
+    const cleanupRelationships = options.cleanupRelationships ?? true;
     const { nodes, relationships } = graph;
 
     if (verbose) {
       console.log('🔍 Analyzing changes...');
     }
 
-    // 1. Get existing hashes for Scope nodes
-    const scopeNodes = nodes.filter(n => n.labels.includes('Scope'));
-    const nodeIds = scopeNodes.map(n => n.id);
+    // 1. Get ALL content nodes (not just Scope)
+    // Content nodes have a hash property and are not structural (File, Directory, Project)
+    const contentNodes = nodes.filter(n =>
+      n.properties.hash !== undefined &&
+      !isStructuralNode(n)
+    );
+    const nodeIds = contentNodes.map(n => n.id);
     const existingHashes = await this.getExistingHashes(nodeIds);
 
     if (verbose) {
-      console.log(`   Found ${existingHashes.size} existing scopes in database`);
+      console.log(`   Found ${existingHashes.size} existing content nodes in database`);
     }
 
     // 2. Classify nodes
@@ -214,7 +271,7 @@ export class IncrementalIngestionManager {
     const modified: ParsedNode[] = [];
     const created: ParsedNode[] = [];
 
-    for (const node of scopeNodes) {
+    for (const node of contentNodes) {
       const uuid = node.id;
       const existing = existingHashes.get(uuid);
       const currentHash = node.properties.hash as string;
@@ -260,17 +317,29 @@ export class IncrementalIngestionManager {
       await this.deleteNodes(deleted);
     }
 
-    // 5. Upsert modified + created nodes
+    // 5. Clean up outgoing relationships for modified nodes
+    // This ensures stale references are removed before re-upserting
+    if (cleanupRelationships && modified.length > 0) {
+      const modifiedUuids = modified.map(n => n.id);
+      if (verbose) {
+        console.log(`\n🔗 Cleaning up relationships for ${modified.length} modified nodes...`);
+      }
+      const deletedRels = await this.deleteOutgoingRelationships(modifiedUuids);
+      if (verbose && deletedRels > 0) {
+        console.log(`   Removed ${deletedRels} stale relationships`);
+      }
+    }
+
+    // 6. Upsert modified + created nodes
     const nodesToUpsert = [...modified, ...created];
 
-    // Always include structural nodes (everything except Scope)
-    // These should be upserted even if no scope changes
-    // Uses dynamic detection - no need to hardcode each type
+    // Always include structural nodes (File, Directory, Project)
+    // These should be upserted even if no content changes
     const structuralNodes = nodes.filter(isStructuralNode);
 
     if (nodesToUpsert.length > 0 || structuralNodes.length > 0) {
       if (verbose) {
-        console.log(`\n💾 Upserting ${nodesToUpsert.length} changed scopes + ${structuralNodes.length} structural nodes...`);
+        console.log(`\n💾 Upserting ${nodesToUpsert.length} changed content nodes + ${structuralNodes.length} structural nodes...`);
       }
 
       // Include all node IDs for relationship filtering
@@ -283,7 +352,7 @@ export class IncrementalIngestionManager {
       await this.ingestNodes(
         allNodesToIngest,
         relevantRelationships,
-        true  // Mark changed scopes as embeddingsDirty
+        true  // Mark changed nodes as embeddingsDirty
       );
 
       // 6. Track changes and generate diffs (if enabled)

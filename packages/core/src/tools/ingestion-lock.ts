@@ -5,6 +5,8 @@
  * or be notified that data might be stale.
  */
 
+import type { AgentLogger } from '../runtime/agents/rag-agent.js';
+
 export interface IngestionStatus {
   isLocked: boolean;
   currentFile?: string;
@@ -17,6 +19,8 @@ export interface IngestionLockOptions {
   timeout?: number;
   /** Callback when lock state changes */
   onStatusChange?: (status: IngestionStatus) => void;
+  /** Optional AgentLogger for structured logging */
+  logger?: AgentLogger;
 }
 
 /**
@@ -47,13 +51,22 @@ export class IngestionLock {
   private pendingFiles: string[] = [];
   private timeoutHandle?: NodeJS.Timeout;
   private waitingPromises: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
-  private options: Required<IngestionLockOptions>;
+  private options: Omit<Required<IngestionLockOptions>, 'logger'>;
+  private logger?: AgentLogger;
 
   constructor(options: IngestionLockOptions = {}) {
     this.options = {
       timeout: options.timeout ?? 30000,
       onStatusChange: options.onStatusChange ?? (() => {}),
     };
+    this.logger = options.logger;
+  }
+
+  /**
+   * Set or update the logger (useful when logger is created after lock)
+   */
+  setLogger(logger: AgentLogger): void {
+    this.logger = logger;
   }
 
   /**
@@ -100,9 +113,13 @@ export class IngestionLock {
     this.startedAt = new Date();
     this.notifyStatusChange();
 
+    // Log acquisition
+    this.logger?.logLock('acquired', filePath);
+
     // Safety timeout
     this.timeoutHandle = setTimeout(() => {
       console.warn(`[IngestionLock] Timeout reached for ${filePath}, force releasing`);
+      this.logger?.logLock('timeout', filePath, this.options.timeout);
       this.release();
     }, this.options.timeout);
 
@@ -118,6 +135,9 @@ export class IngestionLock {
       clearTimeout(this.timeoutHandle);
       this.timeoutHandle = undefined;
     }
+
+    // Log release
+    this.logger?.logLock('released');
 
     this.locked = false;
     this.currentFile = undefined;
@@ -214,13 +234,24 @@ export function withIngestionLock<T extends (...args: any[]) => Promise<any>>(
     waitForUnlock?: boolean;
     /** Max wait time in ms */
     waitTimeout?: number;
+    /** Optional logger for blocked queries */
+    logger?: AgentLogger;
   } = {}
 ): T {
   return (async (...args: Parameters<T>) => {
     if (lock.isLocked()) {
+      const status = lock.getStatus();
+
+      // Log that query is blocked
+      options.logger?.logLock('blocked', status.currentFile);
+
       if (options.waitForUnlock) {
+        const waitStart = Date.now();
         const unlocked = await lock.waitForUnlock(options.waitTimeout ?? 5000);
+        const waitTime = Date.now() - waitStart;
+
         if (!unlocked) {
+          options.logger?.logLock('timeout', status.currentFile, waitTime);
           return {
             error: 'Ingestion timeout',
             message: lock.getBlockingMessage(),

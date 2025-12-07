@@ -842,6 +842,7 @@ export function generateImageTools(ctx: ImageToolsContext): ImageToolsResult {
       generateListImagesTool(),
       generateGenerateImageTool(),
       generateGenerateMultiviewImagesTool(),
+      generateAnalyzeVisualTool(),
     ],
     handlers: {
       read_image: generateReadImageHandler(ctx),
@@ -849,6 +850,180 @@ export function generateImageTools(ctx: ImageToolsContext): ImageToolsResult {
       list_images: generateListImagesHandler(ctx),
       generate_image: generateGenerateImageHandler(ctx),
       generate_multiview_images: generateGenerateMultiviewImagesHandler(ctx),
+      analyze_visual: generateAnalyzeVisualHandler(ctx),
     },
+  };
+}
+
+// ============================================
+// analyze_visual - Gemini Vision for images & documents
+// ============================================
+
+/**
+ * Generate analyze_visual tool (Gemini Vision for images and documents)
+ *
+ * This tool is for on-demand visual analysis when:
+ * - Document has needsGeminiVision: true (low OCR confidence)
+ * - Agent wants to extract specific info from an image/document
+ */
+export function generateAnalyzeVisualTool(): GeneratedToolDefinition {
+  return {
+    name: 'analyze_visual',
+    description: `Analyze an image or document page using Gemini Vision.
+
+Use this tool when:
+- A document has low OCR confidence (needsGeminiVision: true)
+- You need to extract specific information from an image
+- You want to understand visual content (diagrams, charts, screenshots)
+
+Works with:
+- Images: PNG, JPG, JPEG, GIF, WebP, BMP, SVG
+- Documents: PDF (will convert specified page to image first)
+
+Parameters:
+- path: Path to image or PDF file
+- prompt: What you want to know about the visual (required)
+- page: For PDFs, which page to analyze (1-indexed, default: 1)
+
+Examples:
+  analyze_visual({ path: "scan.pdf", prompt: "Extract all text from this scanned document", page: 1 })
+  analyze_visual({ path: "chart.png", prompt: "What are the values shown in this bar chart?" })
+  analyze_visual({ path: "diagram.png", prompt: "Describe the architecture shown" })`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Path to image or PDF file',
+        },
+        prompt: {
+          type: 'string',
+          description: 'What you want to know about the visual content',
+        },
+        page: {
+          type: 'number',
+          description: 'For PDFs, which page to analyze (1-indexed, default: 1)',
+        },
+      },
+      required: ['path', 'prompt'],
+    },
+  };
+}
+
+/**
+ * Generate handler for analyze_visual
+ */
+export function generateAnalyzeVisualHandler(ctx: ImageToolsContext): (args: any) => Promise<any> {
+  return async (params: any) => {
+    const { path: filePath, prompt, page = 1 } = params;
+    const fs = await import('fs/promises');
+    const pathModule = await import('path');
+    const os = await import('os');
+
+    if (!prompt || typeof prompt !== 'string' || prompt.trim() === '') {
+      return { error: 'prompt is required and must be a non-empty string' };
+    }
+
+    // Resolve path
+    const absolutePath = pathModule.isAbsolute(filePath)
+      ? filePath
+      : pathModule.join(ctx.projectRoot, filePath);
+
+    // Check file exists
+    try {
+      const stat = await fs.stat(absolutePath);
+      if (stat.isDirectory()) {
+        return { error: `Path is a directory, not a file: ${absolutePath}` };
+      }
+    } catch (err: any) {
+      if (err.code === 'ENOENT') {
+        return { error: `File not found: ${absolutePath}` };
+      }
+      throw err;
+    }
+
+    const ext = pathModule.extname(absolutePath).toLowerCase();
+    const imageExtensions = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg'];
+    const isPdf = ext === '.pdf';
+
+    let imageToAnalyze = absolutePath;
+    let tempFile: string | null = null;
+
+    // If PDF, convert the specified page to an image first
+    if (isPdf) {
+      try {
+        const { pdf } = await import('pdf-to-img');
+        const document = await pdf(absolutePath, { scale: 2.0 });
+
+        let pageIndex = 0;
+        let targetPageBuffer: Buffer | null = null;
+
+        for await (const pageImage of document) {
+          pageIndex++;
+          if (pageIndex === page) {
+            targetPageBuffer = pageImage;
+            break;
+          }
+        }
+
+        if (!targetPageBuffer) {
+          return { error: `Page ${page} not found in PDF (document has ${pageIndex} pages)` };
+        }
+
+        // Save to temp file
+        tempFile = pathModule.join(os.tmpdir(), `ragforge-pdf-page-${Date.now()}.png`);
+        await fs.writeFile(tempFile, targetPageBuffer);
+        imageToAnalyze = tempFile;
+
+      } catch (pdfErr: any) {
+        return { error: `Failed to convert PDF page to image: ${pdfErr.message}` };
+      }
+    } else if (!imageExtensions.includes(ext)) {
+      return { error: `Unsupported format: ${ext}. Supported: ${imageExtensions.join(', ')}, .pdf` };
+    }
+
+    // Use Gemini Vision to analyze
+    try {
+      const { getOCRService } = await import('../runtime/index.js');
+      const ocrService = getOCRService({ primaryProvider: 'gemini' });
+
+      if (!ocrService.isAvailable()) {
+        if (tempFile) await fs.unlink(tempFile).catch(() => {});
+        return {
+          error: 'Gemini Vision not available. Set GEMINI_API_KEY environment variable.',
+        };
+      }
+
+      const startTime = Date.now();
+      const result = await ocrService.extractText(imageToAnalyze, { prompt });
+      const processingTimeMs = Date.now() - startTime;
+
+      // Cleanup temp file
+      if (tempFile) {
+        await fs.unlink(tempFile).catch(() => {});
+      }
+
+      if (result.error) {
+        return {
+          path: filePath,
+          page: isPdf ? page : undefined,
+          error: result.error,
+        };
+      }
+
+      return {
+        path: filePath,
+        page: isPdf ? page : undefined,
+        prompt,
+        response: result.text,
+        provider: 'gemini-vision',
+        processing_time_ms: processingTimeMs,
+      };
+    } catch (importError: any) {
+      if (tempFile) await fs.unlink(tempFile).catch(() => {});
+      return {
+        error: `Vision service error: ${importError.message}`,
+      };
+    }
   };
 }

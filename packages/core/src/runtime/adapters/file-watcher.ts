@@ -9,8 +9,13 @@ import chokidar from 'chokidar';
 import type { CodeSourceConfig } from './code-source-adapter.js';
 import type { IncrementalIngestionManager } from './incremental-ingestion.js';
 import { IngestionQueue, type IngestionQueueConfig } from './ingestion-queue.js';
+import type { AgentLogger } from '../agents/rag-agent.js';
 
 export interface FileWatcherConfig extends IngestionQueueConfig {
+  /**
+   * Optional AgentLogger for structured logging
+   */
+  logger?: AgentLogger;
   /**
    * Chokidar options for file watching
    * See: https://github.com/paulmillr/chokidar#api
@@ -32,6 +37,7 @@ export class FileWatcher {
   private watcher: chokidar.FSWatcher | null = null;
   private queue: IngestionQueue;
   private config: FileWatcherConfig;
+  private logger?: AgentLogger;
 
   constructor(
     private manager: IncrementalIngestionManager,
@@ -39,7 +45,16 @@ export class FileWatcher {
     config: FileWatcherConfig = {}
   ) {
     this.config = config;
-    this.queue = new IngestionQueue(manager, sourceConfig, config);
+    this.logger = config.logger;
+    this.queue = new IngestionQueue(manager, sourceConfig, { ...config, logger: this.logger });
+  }
+
+  /**
+   * Set or update the logger
+   */
+  setLogger(logger: AgentLogger): void {
+    this.logger = logger;
+    this.queue.setLogger(logger);
   }
 
   /**
@@ -91,12 +106,18 @@ export class FileWatcher {
     // Wait for watcher to be ready
     await new Promise<void>((resolve) => {
       this.watcher!.on('ready', () => {
+        const watched = this.watcher!.getWatched();
+        const paths = Object.keys(watched);
+        const fileCount = Object.values(watched).reduce((sum, files) => sum + files.length, 0);
+
         if (this.config.verbose) {
           console.log('✅ File watcher ready\n');
         }
+
+        // Log to AgentLogger
+        this.logger?.logWatcherStarted(patterns, fileCount);
+
         if (this.config.onWatchStart) {
-          const watched = this.watcher!.getWatched();
-          const paths = Object.keys(watched);
           this.config.onWatchStart(paths);
         }
         resolve();
@@ -154,6 +175,9 @@ export class FileWatcher {
       const emoji = eventType === 'add' ? '➕' : eventType === 'change' ? '✏️' : '➖';
       console.log(`${emoji} ${eventType.toUpperCase()}: ${filePath}`);
     }
+
+    // Log to AgentLogger
+    this.logger?.logFileChange(filePath, eventType);
 
     if (this.config.onFileChange) {
       this.config.onFileChange(filePath, eventType);

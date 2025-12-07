@@ -43,11 +43,21 @@
 
 ---
 
-## 🚧 In Progress
+## ✅ Recently Completed
 
 ### Document Nodes Integration
-- [ ] Add `DocumentFile` nodes to graph
-- [ ] Add `needsGeminiVision` property for lazy OCR
+- [x] Add `DocumentFile` nodes to graph (PDFDocument, WordDocument, SpreadsheetDocument)
+- [x] Add `needsGeminiVision` property for lazy OCR
+- [x] Full text extraction stored in `textContent` property
+
+### Web Tools Integration
+- [x] `search_web` - Gemini grounding with Google Search
+- [x] `fetch_web_page` - Playwright rendering (handles SPAs)
+- [x] Integrated into RagAgent with `includeWebTools: true`
+
+## 🚧 In Progress
+
+### On-demand Gemini Vision OCR
 - [ ] Create `extract_document_text` tool for on-demand Gemini Vision
 
 ---
@@ -212,10 +222,12 @@
 - [x] Gemini Vision fallback → lazy loading flag
 
 ### Next Tests
-- [ ] Build & verify no TypeScript errors
+- [x] Build & verify no TypeScript errors
 - [ ] Ingest project with mixed file types
 - [ ] Query new node types in Neo4j
 - [ ] Test Gemini Vision on-demand extraction
+- [x] Test web search tool (search_web)
+- [x] Test web page fetch tool (fetch_web_page)
 
 ---
 

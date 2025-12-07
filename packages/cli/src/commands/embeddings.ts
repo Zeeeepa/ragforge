@@ -18,6 +18,7 @@ interface EmbeddingOptions {
   database?: string;
   rootDir: string;
   geminiKey: string;
+  incremental?: boolean;
 }
 
 export async function parseEmbeddingsOptions(args: string[]): Promise<EmbeddingOptions> {
@@ -28,6 +29,7 @@ export async function parseEmbeddingsOptions(args: string[]): Promise<EmbeddingO
   let username: string | undefined;
   let password: string | undefined;
   let database: string | undefined;
+  let incremental: boolean = true; // Default to incremental (only dirty nodes)
 
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
@@ -46,6 +48,14 @@ export async function parseEmbeddingsOptions(args: string[]): Promise<EmbeddingO
         break;
       case '--database':
         database = args[++i];
+        break;
+      case '--incremental':
+      case '-i':
+        incremental = true;
+        break;
+      case '--all':
+      case '-a':
+        incremental = false; // Force regenerate all embeddings
         break;
       case '-h':
       case '--help':
@@ -84,7 +94,8 @@ export async function parseEmbeddingsOptions(args: string[]): Promise<EmbeddingO
     password: finalPassword,
     database: database || envDatabase,
     rootDir,
-    geminiKey
+    geminiKey,
+    incremental
   };
 }
 
@@ -99,6 +110,7 @@ Options:
   --username <user>  Neo4j username
   --password <pass>  Neo4j password
   --database <name>  Neo4j database (optional)
+  -a, --all          Regenerate ALL embeddings (default: only dirty nodes)
 `);
 }
 
@@ -201,14 +213,24 @@ export async function runEmbeddingsGenerate(options: EmbeddingOptions): Promise<
   // Create embedding provider based on config (multi-provider support!)
   const provider = createEmbeddingProvider(config, embeddingsConfig);
 
+  // Incremental mode: only process nodes with embeddingsDirty = true
+  const onlyDirty = options.incremental ?? true;
+
   try {
+    if (onlyDirty) {
+      console.log('🔄 Incremental mode: only generating embeddings for dirty nodes');
+    } else {
+      console.log('🔄 Full mode: regenerating ALL embeddings');
+    }
+
     for (const entity of embeddingsConfig.entities) {
-      console.log(`🔄 Generating embeddings for ${entity.entity}`);
+      console.log(`   Processing ${entity.entity}...`);
       await runEmbeddingPipelines({
         neo4j: client,
         entity,
         provider,
-        defaults: embeddingsConfig.defaults
+        defaults: embeddingsConfig.defaults,
+        onlyDirty
       });
     }
 

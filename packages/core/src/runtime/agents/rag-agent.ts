@@ -38,7 +38,9 @@ import * as path from 'path';
 
 export interface AgentLogEntry {
   timestamp: string;
-  type: 'start' | 'iteration' | 'tool_call' | 'tool_result' | 'llm_response' | 'final_answer';
+  type:
+    | 'start' | 'iteration' | 'tool_call' | 'tool_result' | 'llm_response' | 'final_answer'
+    | 'file_change' | 'ingestion' | 'lock' | 'system';
   iteration?: number;
   data: any;
 }
@@ -56,7 +58,7 @@ export interface AgentSessionLog {
   totalIterations: number;
 }
 
-class AgentLogger {
+export class AgentLogger {
   private logPath?: string;
   private currentSession?: AgentSessionLog;
 
@@ -189,6 +191,118 @@ class AgentLogger {
   /** Force write the current session (call on error/abort) */
   flush(): void {
     this.writeSessionToFile();
+  }
+
+  // ============================================
+  // System Events (file tracking, ingestion, locks)
+  // ============================================
+
+  /**
+   * Log file change detected by file watcher
+   */
+  logFileChange(filePath: string, event: 'add' | 'change' | 'unlink'): void {
+    const eventLabels = { add: 'Created', change: 'Modified', unlink: 'Deleted' };
+    console.log(`[file-tracker] ${eventLabels[event]}: ${filePath}`);
+
+    this.log({
+      timestamp: formatLocalDate(),
+      type: 'file_change',
+      data: { filePath, event },
+    });
+  }
+
+  /**
+   * Log file watcher started
+   */
+  logWatcherStarted(patterns: string[], fileCount: number): void {
+    console.log(`[file-tracker] Watching: ${patterns.join(', ')} (${fileCount} files)`);
+
+    this.log({
+      timestamp: formatLocalDate(),
+      type: 'file_change',
+      data: { action: 'watcher_started', patterns, fileCount },
+    });
+  }
+
+  /**
+   * Log ingestion events
+   */
+  logIngestion(
+    action: 'started' | 'completed' | 'error',
+    data: { fileCount?: number; stats?: { created: number; updated: number; deleted: number; unchanged: number }; error?: string }
+  ): void {
+    if (action === 'started') {
+      console.log(`[ingestion] Processing ${data.fileCount} file(s)...`);
+    } else if (action === 'completed' && data.stats) {
+      const { created, updated, deleted, unchanged } = data.stats;
+      console.log(`[ingestion] Completed: +${created} created, ~${updated} updated, -${deleted} deleted, =${unchanged} unchanged`);
+    } else if (action === 'error') {
+      console.error(`[ingestion] Error: ${data.error}`);
+    }
+
+    this.log({
+      timestamp: formatLocalDate(),
+      type: 'ingestion',
+      data: { action, ...data },
+    });
+  }
+
+  /**
+   * Log lock events
+   */
+  logLock(action: 'acquired' | 'released' | 'blocked' | 'timeout', filePath?: string, waitTimeMs?: number): void {
+    switch (action) {
+      case 'acquired':
+        console.log(`[lock] Acquired for: ${filePath}`);
+        break;
+      case 'released':
+        console.log(`[lock] Released`);
+        break;
+      case 'blocked':
+        console.log(`[lock] Query blocked (ingestion in progress: ${filePath})`);
+        break;
+      case 'timeout':
+        console.log(`[lock] Query timeout after ${waitTimeMs}ms waiting for: ${filePath}`);
+        break;
+    }
+
+    this.log({
+      timestamp: formatLocalDate(),
+      type: 'lock',
+      data: { action, filePath, waitTimeMs },
+    });
+  }
+
+  /**
+   * Log embeddings generation
+   */
+  logEmbeddings(action: 'started' | 'completed' | 'error', data: { dirtyCount?: number; generatedCount?: number; error?: string }): void {
+    if (action === 'started') {
+      console.log(`[embeddings] Generating for ${data.dirtyCount} dirty node(s)...`);
+    } else if (action === 'completed') {
+      console.log(`[embeddings] Generated ${data.generatedCount} embedding(s)`);
+    } else if (action === 'error') {
+      console.error(`[embeddings] Error: ${data.error}`);
+    }
+
+    this.log({
+      timestamp: formatLocalDate(),
+      type: 'system',
+      data: { subsystem: 'embeddings', action, ...data },
+    });
+  }
+
+  /**
+   * Generic system log
+   */
+  logSystem(subsystem: string, message: string, data?: Record<string, any>): void {
+    console.log(`[${subsystem}] ${message}`);
+
+    this.log({
+      timestamp: formatLocalDate(),
+      type: 'system',
+      data: { subsystem, message, ...data },
+    });
   }
 }
 

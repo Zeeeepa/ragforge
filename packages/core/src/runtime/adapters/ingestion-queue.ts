@@ -11,8 +11,13 @@
 import type { CodeSourceConfig } from './code-source-adapter.js';
 import type { IncrementalIngestionManager, IncrementalStats } from './incremental-ingestion.js';
 import type { IngestionLock } from '../../index.js';
+import type { AgentLogger } from '../agents/rag-agent.js';
 
 export interface IngestionQueueConfig {
+  /**
+   * Optional AgentLogger for structured logging
+   */
+  logger?: AgentLogger;
   /**
    * Batch interval in milliseconds
    * Changes are collected for this duration before triggering ingestion
@@ -53,7 +58,8 @@ export class IngestionQueue {
   private batchTimer: NodeJS.Timeout | null = null;
   private isIngesting = false;
   private queuedBatch: Set<string> | null = null;
-  private config: Required<Omit<IngestionQueueConfig, 'ingestionLock'>> & { ingestionLock?: IngestionLock };
+  private config: Required<Omit<IngestionQueueConfig, 'ingestionLock' | 'logger'>> & { ingestionLock?: IngestionLock };
+  private logger?: AgentLogger;
 
   constructor(
     private manager: IncrementalIngestionManager,
@@ -68,6 +74,14 @@ export class IngestionQueue {
       onBatchComplete: config.onBatchComplete ?? (() => {}),
       onBatchError: config.onBatchError ?? (() => {})
     };
+    this.logger = config.logger;
+  }
+
+  /**
+   * Set or update the logger
+   */
+  setLogger(logger: AgentLogger): void {
+    this.logger = logger;
   }
 
   /**

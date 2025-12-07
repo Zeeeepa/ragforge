@@ -71,6 +71,14 @@ import {
   type ThreeDFileInfo,
   type PDFFileInfo,
 } from './media-file-parser.js';
+import {
+  parseDocumentFile,
+  isDocumentFile,
+  type DocumentFileInfo,
+  type SpreadsheetInfo,
+  type PDFInfo,
+  type DOCXInfo,
+} from './document-file-parser.js';
 
 const execAsync = promisify(exec);
 
@@ -380,7 +388,8 @@ export class CodeSourceAdapter extends SourceAdapter {
       genericFiles,
       packageJsonFiles,
       dataFiles,
-      mediaFiles
+      mediaFiles,
+      documentFiles
     } = await this.parseFiles(files, config, (current) => {
       options.onProgress?.({
         phase: 'parsing',
@@ -411,7 +420,8 @@ export class CodeSourceAdapter extends SourceAdapter {
       genericFiles,
       packageJsonFiles,
       dataFiles,
-      mediaFiles
+      mediaFiles,
+      documentFiles
     }, config, resolver, projectInfo);
 
     // Export XML if requested
@@ -520,6 +530,7 @@ export class CodeSourceAdapter extends SourceAdapter {
     packageJsonFiles: Map<string, PackageJsonInfo>;
     dataFiles: Map<string, DataFileInfo>;
     mediaFiles: Map<string, MediaFileInfo>;
+    documentFiles: Map<string, DocumentFileInfo>;
   }> {
     const codeFiles = new Map<string, ScopeFileAnalysis>();
     const htmlFiles = new Map<string, HTMLParseResult>();
@@ -532,12 +543,26 @@ export class CodeSourceAdapter extends SourceAdapter {
     const packageJsonFiles = new Map<string, PackageJsonInfo>();
     const dataFiles = new Map<string, DataFileInfo>();
     const mediaFiles = new Map<string, MediaFileInfo>();
+    const documentFiles = new Map<string, DocumentFileInfo>();
 
     for (const file of files) {
       onProgress(file);
 
       try {
-        // Handle media files first (binary, don't read as text)
+        // Handle document files first (PDF, DOCX, XLSX - binary with full text extraction)
+        if (isDocumentFile(file)) {
+          try {
+            const docInfo = await parseDocumentFile(file, { extractText: true });
+            if (docInfo) {
+              documentFiles.set(file, docInfo);
+            }
+          } catch (err) {
+            console.warn(`Failed to parse document file ${file}:`, err);
+          }
+          continue;
+        }
+
+        // Handle media files (images, 3D - binary, metadata only)
         if (isMediaFile(file)) {
           try {
             const mediaInfo = await parseMediaFile(file);
@@ -696,7 +721,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       }
     }
 
-    return { codeFiles, htmlFiles, cssFiles, scssFiles, vueFiles, svelteFiles, markdownFiles, genericFiles, packageJsonFiles, dataFiles, mediaFiles };
+    return { codeFiles, htmlFiles, cssFiles, scssFiles, vueFiles, svelteFiles, markdownFiles, genericFiles, packageJsonFiles, dataFiles, mediaFiles, documentFiles };
   }
 
   /**
@@ -748,6 +773,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       packageJsonFiles: Map<string, PackageJsonInfo>;
       dataFiles: Map<string, DataFileInfo>;
       mediaFiles: Map<string, MediaFileInfo>;
+      documentFiles: Map<string, DocumentFileInfo>;
     },
     config: CodeSourceConfig,
     resolver: ImportResolver,
@@ -764,7 +790,8 @@ export class CodeSourceAdapter extends SourceAdapter {
       genericFiles,
       packageJsonFiles,
       dataFiles,
-      mediaFiles
+      mediaFiles,
+      documentFiles
     } = parsedFiles;
     const nodes: ParsedNode[] = [];
     const relationships: ParsedRelationship[] = [];
@@ -2119,11 +2146,102 @@ export class CodeSourceAdapter extends SourceAdapter {
       this.ensureDirectoryNodes(relPath, directories, nodes, relationships, fileUuid);
     }
 
+    // Create DocumentFile nodes for PDFs, DOCX, XLSX (with full text extraction)
+    for (const [filePath, docInfo] of documentFiles) {
+      const relPath = path.relative(projectRoot, filePath);
+
+      // Determine specific labels based on format
+      const labels = ['DocumentFile'];
+      if (docInfo.format === 'pdf') labels.push('PDFDocument');
+      if (docInfo.format === 'docx') labels.push('WordDocument');
+      if (docInfo.format === 'xlsx' || docInfo.format === 'xls') labels.push('SpreadsheetDocument');
+      if (docInfo.format === 'csv') labels.push('SpreadsheetDocument');
+
+      const docId = `doc:${docInfo.uuid}`;
+      const properties: Record<string, unknown> = {
+        uuid: docId,
+        file: relPath,
+        format: docInfo.format,
+        hash: docInfo.hash,
+        sizeBytes: docInfo.sizeBytes,
+        pageCount: docInfo.pageCount,
+        hasFullText: docInfo.hasFullText,
+        needsGeminiVision: docInfo.needsGeminiVision,
+        extractionMethod: docInfo.extractionMethod,
+        indexedAt: getLocalTimestamp()
+      };
+
+      // Add text content if available (for search)
+      if (docInfo.textContent) {
+        properties.textContent = docInfo.textContent;
+        properties.textLength = docInfo.textContent.length;
+      }
+
+      // Add OCR confidence if available
+      if (docInfo.ocrConfidence !== undefined) {
+        properties.ocrConfidence = docInfo.ocrConfidence;
+      }
+
+      // Add spreadsheet-specific properties
+      if ('sheetNames' in docInfo) {
+        const spreadsheet = docInfo as SpreadsheetInfo;
+        if (spreadsheet.sheetNames) {
+          properties.sheetNames = spreadsheet.sheetNames;
+          properties.sheetCount = spreadsheet.sheetNames.length;
+        }
+      }
+
+      nodes.push({
+        labels,
+        id: docId,
+        properties
+      });
+
+      relationships.push({
+        type: 'BELONGS_TO',
+        from: docId,
+        to: projectId
+      });
+
+      // Create File node for document file
+      const fileName = relPath.split('/').pop() || relPath;
+      const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
+      const extension = path.extname(relPath);
+      const fileUuid = `file:${relPath}`;
+
+      nodes.push({
+        labels: ['File'],
+        id: fileUuid,
+        properties: {
+          uuid: fileUuid,
+          path: relPath,
+          name: fileName,
+          directory,
+          extension,
+          contentHash: docInfo.hash
+        }
+      });
+
+      relationships.push({
+        type: 'BELONGS_TO',
+        from: fileUuid,
+        to: projectId
+      });
+
+      relationships.push({
+        type: 'DEFINED_IN',
+        from: docId,
+        to: fileUuid
+      });
+
+      this.ensureDirectoryNodes(relPath, directories, nodes, relationships, fileUuid);
+    }
+
     return {
       nodes,
       relationships,
       metadata: {
-        filesProcessed: codeFiles.size + htmlFiles.size + cssFiles.size + scssFiles.size + vueFiles.size + svelteFiles.size + markdownFiles.size + genericFiles.size + dataFiles.size + mediaFiles.size,
+        filesProcessed: codeFiles.size + htmlFiles.size + cssFiles.size + scssFiles.size + vueFiles.size + svelteFiles.size + markdownFiles.size + genericFiles.size + dataFiles.size + mediaFiles.size + documentFiles.size,
         nodesGenerated: nodes.length,
         relationshipsGenerated: relationships.length,
         parseTimeMs: 0 // Will be set by caller
