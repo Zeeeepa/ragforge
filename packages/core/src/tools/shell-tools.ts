@@ -7,6 +7,7 @@
  * @since 2025-12-07
  */
 
+import path from 'path';
 import type { GeneratedToolDefinition } from './types/index.js';
 import * as shellHelpers from './shell-helpers.js';
 
@@ -240,7 +241,7 @@ export function generateRunCommandHandler(ctx: ShellToolsContext) {
 
     // Resolve cwd
     const cwd = params.cwd
-      ? (require('path').isAbsolute(params.cwd) ? params.cwd : require('path').join(projectRoot || process.cwd(), params.cwd))
+      ? (path.isAbsolute(params.cwd) ? params.cwd : path.join(projectRoot || process.cwd(), params.cwd))
       : (projectRoot || process.cwd());
 
     // Execute command

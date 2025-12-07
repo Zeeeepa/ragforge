@@ -7,6 +7,7 @@
  * @since 2025-12-07
  */
 
+import path from 'path';
 import type { GeneratedToolDefinition } from './types/index.js';
 import * as fsHelpers from './fs-helpers.js';
 
@@ -368,7 +369,7 @@ export function generateGlobFilesHandler(ctx: FsToolsContext) {
 
     try {
       const cwd = params.cwd
-        ? (require('path').isAbsolute(params.cwd) ? params.cwd : require('path').join(projectRoot, params.cwd))
+        ? (path.isAbsolute(params.cwd) ? params.cwd : path.join(projectRoot, params.cwd))
         : projectRoot;
 
       const defaultIgnore = params.no_default_excludes

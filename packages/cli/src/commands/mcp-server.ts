@@ -25,6 +25,23 @@ import {
   generateContextTools,
   ProjectRegistry,
   generateProjectManagementTools,
+  // Discovery tools (get_schema)
+  generateDiscoveryTools,
+  // Brain tools (ingest, search)
+  BrainManager,
+  generateBrainTools,
+  generateBrainToolHandlers,
+  // Web tools (search, fetch)
+  webToolDefinitions,
+  createWebToolHandlers,
+  type WebToolsContext,
+  // Image tools
+  generateImageTools,
+  type ImageToolsContext,
+  // 3D tools
+  generate3DTools,
+  type ThreeDToolsContext,
+  // Types
   type ToolGenerationContext,
   type RagForgeConfig,
   type GeneratedToolDefinition,
@@ -64,6 +81,7 @@ interface McpContext {
   ragClient: ReturnType<typeof createClient> | null;
   isProjectLoaded: boolean;
   registry: ProjectRegistry;
+  brainManager: BrainManager | null;
 }
 
 // ============================================
@@ -194,7 +212,34 @@ async function prepareToolsForMcp(
     registry: new ProjectRegistry({
       memoryPolicy: { maxLoadedProjects: 3, idleUnloadTimeout: 5 * 60 * 1000 },
     }),
+    brainManager: null,
   };
+
+  // Try to initialize BrainManager (for brain tools)
+  try {
+    const neo4jUri = getEnv(['NEO4J_URI']);
+    const neo4jUser = getEnv(['NEO4J_USERNAME', 'NEO4J_USER']);
+    const neo4jPassword = getEnv(['NEO4J_PASSWORD']);
+    const geminiKey = getEnv(['GEMINI_API_KEY']);
+
+    if (neo4jUri && neo4jUser && neo4jPassword) {
+      ctx.brainManager = await BrainManager.getInstance({
+        neo4j: {
+          type: 'external',
+          uri: neo4jUri,
+          username: neo4jUser,
+          password: neo4jPassword,
+          database: getEnv(['NEO4J_DATABASE']) || 'neo4j',
+        },
+      });
+      await ctx.brainManager.initialize();
+      log('info', 'BrainManager initialized');
+    } else {
+      log('debug', 'BrainManager not initialized (missing NEO4J_* env vars)');
+    }
+  } catch (error: any) {
+    log('debug', `BrainManager init failed: ${error.message}`);
+  }
 
   // Cached config for dynamic context
   let cachedConfig: RagForgeConfig | null = null;
@@ -282,14 +327,15 @@ async function prepareToolsForMcp(
 
   // Add file tools (read, write, edit)
   // Note: These return ready handlers, not generators
-  const fileTools = generateFileTools({ projectRoot: () => ctx.currentProjectPath });
+  // Fallback to cwd for standalone mode (no project loaded)
+  const fileTools = generateFileTools({ projectRoot: () => ctx.currentProjectPath || process.cwd() });
   allTools.push(...fileTools.tools);
   for (const [name, handler] of Object.entries(fileTools.handlers)) {
     allHandlers[name] = handler;
   }
 
   // Add FS tools (list_directory, glob_files, etc.)
-  const fsTools = generateFsTools({ projectRoot: () => ctx.currentProjectPath });
+  const fsTools = generateFsTools({ projectRoot: () => ctx.currentProjectPath || process.cwd() });
   allTools.push(...fsTools.tools);
   for (const [name, handler] of Object.entries(fsTools.handlers)) {
     allHandlers[name] = handler;
@@ -323,6 +369,71 @@ async function prepareToolsForMcp(
   for (const [name, handler] of Object.entries(pmTools.handlers)) {
     allHandlers[name] = handler as any;
   }
+
+  // Add brain tools (ingest, search, forget) - if BrainManager available
+  if (ctx.brainManager) {
+    const brainToolDefs = generateBrainTools();
+    const brainHandlers = generateBrainToolHandlers({ brain: ctx.brainManager });
+    allTools.push(...brainToolDefs);
+    for (const [name, handler] of Object.entries(brainHandlers)) {
+      allHandlers[name] = handler;
+    }
+    log('debug', 'Brain tools enabled');
+  } else {
+    log('debug', 'Brain tools disabled (BrainManager not initialized)');
+  }
+
+  // Add discovery tools (get_schema) - uses cached context from loaded project
+  if (cachedContext) {
+    const discoveryTools = generateDiscoveryTools(cachedContext, getToolContext);
+    allTools.push(...discoveryTools.tools);
+    for (const [name, handlerGen] of Object.entries(discoveryTools.handlers)) {
+      // Discovery handlers are generators that need the client
+      allHandlers[name] = (handlerGen as any)(ctx.ragClient);
+    }
+    log('debug', 'Discovery tools enabled');
+  } else {
+    log('debug', 'Discovery tools disabled (no project loaded)');
+  }
+
+  // Add web tools (search, fetch) - if Gemini API key available
+  const webGeminiKey = getEnv(['GEMINI_API_KEY']);
+  if (webGeminiKey) {
+    const webToolsCtx: WebToolsContext = {
+      geminiApiKey: webGeminiKey,
+    };
+    const webHandlers = createWebToolHandlers(webToolsCtx);
+    allTools.push(...webToolDefinitions);
+    for (const [name, handler] of Object.entries(webHandlers)) {
+      allHandlers[name] = handler;
+    }
+    log('debug', 'Web tools enabled');
+  } else {
+    log('debug', 'Web tools disabled (no GEMINI_API_KEY)');
+  }
+
+  // Add image tools
+  const projectRoot = ctx.currentProjectPath || process.cwd();
+  const imageToolsCtx: ImageToolsContext = {
+    projectRoot: projectRoot,
+  };
+  const imageTools = generateImageTools(imageToolsCtx);
+  allTools.push(...imageTools.tools);
+  for (const [name, handler] of Object.entries(imageTools.handlers)) {
+    allHandlers[name] = handler;
+  }
+  log('debug', 'Image tools enabled');
+
+  // Add 3D tools
+  const threeDToolsCtx: ThreeDToolsContext = {
+    projectRoot: projectRoot,
+  };
+  const threeDTools = generate3DTools(threeDToolsCtx);
+  allTools.push(...threeDTools.tools);
+  for (const [name, handler] of Object.entries(threeDTools.handlers)) {
+    allHandlers[name] = handler;
+  }
+  log('debug', '3D tools enabled');
 
   log('info', `Prepared ${allTools.length} tools total`);
 

@@ -387,13 +387,42 @@ export const SECTION_INFO: Record<ToolSection, SectionInfo> = {
 ## Ordre d'implémentation
 
 ### Phase 1 : MCP Server (priorité)
-1. [ ] Installer `@modelcontextprotocol/sdk` dans cli
-2. [ ] Créer `packages/cli/src/mcp/tool-adapter.ts`
-3. [ ] Créer `packages/cli/src/mcp/server.ts`
-4. [ ] Créer commande `ragforge mcp-server`
-5. [ ] Tester avec Claude Code
-6. [ ] Ajouter filtrage par sections
+1. [x] Installer `@modelcontextprotocol/sdk` dans cli
+2. [x] Créer `packages/cli/src/mcp/tool-adapter.ts`
+3. [x] Créer `packages/cli/src/mcp/server.ts`
+4. [x] Créer commande `ragforge mcp-server`
+5. [x] Tester avec Claude Code - **PARTIELLEMENT** (voir bugs ci-dessous)
+6. [x] Ajouter filtrage par sections
 7. [ ] Ajouter configuration YAML
+
+### ✅ STATUS FINAL (7 déc 2025, 19h15)
+
+**39 outils disponibles via MCP Server !**
+
+| Catégorie | Outils | Status |
+|-----------|--------|--------|
+| `file_ops` | read_file, write_file, edit_file, list_directory, glob_files, file_exists, get_file_info, delete_path, move_file, copy_file, create_directory | ✅ OK |
+| `shell_ops` | run_command, run_npm_script, git_status, git_diff, list_safe_commands | ✅ OK |
+| `context_ops` | get_working_directory, get_environment_info, get_project_info | ✅ OK |
+| `project_ops` | list_projects, switch_project, unload_project | ✅ OK |
+| `brain_ops` | ingest_directory, ingest_web_page, brain_search, forget_path, list_brain_projects | ✅ OK (nécessite NEO4J_*) |
+| `web_ops` | search_web, fetch_web_page | ✅ OK (nécessite GEMINI_API_KEY) |
+| `media_ops` | read_image, describe_image, list_images, generate_image, generate_multiview_images, analyze_visual | ✅ OK |
+| `3d_ops` | render_3d_asset, generate_3d_from_image, generate_3d_from_text | ✅ OK |
+| `discovery_ops` | get_schema, describe_entity | ⚠️ Nécessite projet chargé |
+
+**Outils NON encore intégrés :**
+| Fichier source | Outils | Raison |
+|----------------|--------|--------|
+| `project-tools.ts` | create_project, setup_project, load_project, ingest_code, embeddings | Complexité des callbacks - à faire via CLI |
+| `database-tools.ts` | query_database, describe_table, list_tables | Nécessite connexions DB externes |
+| `planning-tools.ts` | plan_actions | Dépend de l'agent loop |
+
+**Bugs corrigés :**
+- [x] `require('path')` → `import path` dans fs-tools.ts et shell-tools.ts (ESM compatibility)
+- [x] `projectRoot` fallback vers `process.cwd()` pour mode standalone
+- [x] Types corrigés pour getEnv (string[] vs string)
+- [x] BrainConfig.neo4j.type manquant
 
 ### Phase 2 : MCP Client
 1. [ ] Créer `packages/core/src/mcp/client-manager.ts`
