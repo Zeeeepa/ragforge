@@ -76,11 +76,13 @@ export function generateWriteFileTool(): GeneratedToolDefinition {
   return {
     name: 'write_file',
     section: 'file_ops',
-    description: `Create or overwrite a file.
+    description: `Write content to a file (overwrites if exists).
+
+⚠️ WARNING: This will OVERWRITE existing files without confirmation!
+Use create_file if you want to create a NEW file safely.
 
 Creates parent directories if they don't exist.
-If file exists, it will be overwritten (change tracked).
-If file is new, it will be created (change tracked as 'created').
+Returns change_type: 'created' or 'updated' with diff.
 
 Parameters:
 - path: Absolute or relative file path
@@ -93,6 +95,42 @@ Example: write_file({ path: "src/utils.ts", content: "export const foo = 1;" })`
         path: {
           type: 'string',
           description: 'File path to write (absolute or relative to project root)',
+        },
+        content: {
+          type: 'string',
+          description: 'Full file content to write',
+        },
+      },
+      required: ['path', 'content'],
+    },
+  };
+}
+
+/**
+ * Generate create_file tool (fails if file exists)
+ */
+export function generateCreateFileTool(): GeneratedToolDefinition {
+  return {
+    name: 'create_file',
+    section: 'file_ops',
+    description: `Create a NEW file (fails if file already exists).
+
+Use this when you want to create a new file and ensure you don't accidentally overwrite an existing one.
+If you need to update an existing file, use write_file or edit_file instead.
+
+Creates parent directories if they don't exist.
+
+Parameters:
+- path: Absolute or relative file path
+- content: Full file content to write
+
+Example: create_file({ path: "src/new-component.ts", content: "export const Component = () => {};" })`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'File path to create (absolute or relative to project root)',
         },
         content: {
           type: 'string',
@@ -392,6 +430,49 @@ export function generateWriteFileHandler(ctx: FileToolsContext): (args: any) => 
       // Release lock at the end
       if (release) release();
     }
+  };
+}
+
+/**
+ * Generate create_file handler (fails if file exists)
+ */
+export function generateCreateFileHandler(ctx: FileToolsContext): (args: any) => Promise<any> {
+  return async (params: any) => {
+    const { path: filePath, content } = params;
+    const fs = await import('fs/promises');
+    const pathModule = await import('path');
+
+    // Get dynamic project root
+    const projectRoot = getProjectRoot(ctx);
+    if (!projectRoot) {
+      return {
+        error: 'No project loaded. Use create_project, setup_project, or load_project first.',
+        suggestion: 'load_project',
+      };
+    }
+
+    // Resolve path
+    const absolutePath = pathModule.isAbsolute(filePath)
+      ? filePath
+      : pathModule.join(projectRoot, filePath);
+
+    // Check if file already exists
+    try {
+      await fs.access(absolutePath);
+      return {
+        error: `File already exists: ${filePath}. Use write_file to overwrite or edit_file to modify.`,
+        suggestion: 'Use write_file if you want to overwrite, or edit_file to modify specific parts.',
+      };
+    } catch (err: any) {
+      if (err.code !== 'ENOENT') {
+        return { error: `Access error: ${err.message}` };
+      }
+      // ENOENT = file doesn't exist, which is what we want
+    }
+
+    // File doesn't exist, delegate to write_file handler
+    const writeHandler = generateWriteFileHandler(ctx);
+    return writeHandler(params);
   };
 }
 
@@ -1077,12 +1158,14 @@ export function generateFileTools(ctx: FileToolsContext): FileToolsResult {
     tools: [
       generateReadFileTool(),
       generateWriteFileTool(),
+      generateCreateFileTool(),
       generateEditFileTool(),
       generateInstallPackageTool(),
     ],
     handlers: {
       read_file: generateReadFileHandler(ctx),
       write_file: generateWriteFileHandler(ctx),
+      create_file: generateCreateFileHandler(ctx),
       edit_file: generateEditFileHandler(ctx),
       install_package: generateInstallPackageHandler(ctx),
     },

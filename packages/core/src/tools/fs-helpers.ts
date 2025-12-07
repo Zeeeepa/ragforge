@@ -353,9 +353,9 @@ export async function moveFile(
 export async function copyFile(
   source: string,
   destination: string,
-  options: { basePath?: string; recursive?: boolean } = {}
+  options: { basePath?: string; recursive?: boolean; overwrite?: boolean } = {}
 ): Promise<CopyResult> {
-  const { basePath, recursive = true } = options;
+  const { basePath, recursive = true, overwrite = false } = options;
 
   const absoluteSource = basePath && !path.isAbsolute(source)
     ? path.join(basePath, source)
@@ -367,6 +367,19 @@ export async function copyFile(
 
   // Check source exists
   const stat = await fs.stat(absoluteSource);
+
+  // Check if destination already exists
+  if (!overwrite) {
+    try {
+      await fs.access(absoluteDestination);
+      throw new Error(`Destination already exists: ${destination}. Use overwrite: true to replace.`);
+    } catch (err: any) {
+      if (err.code !== 'ENOENT') {
+        throw err; // Re-throw if it's not "file not found"
+      }
+      // ENOENT = doesn't exist, which is what we want
+    }
+  }
 
   // Create destination parent directory if needed
   const destDir = path.dirname(absoluteDestination);

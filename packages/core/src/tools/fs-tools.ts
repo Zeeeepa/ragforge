@@ -10,6 +10,8 @@
 import path from 'path';
 import type { GeneratedToolDefinition } from './types/index.js';
 import * as fsHelpers from './fs-helpers.js';
+import { distance as levenshtein } from 'fastest-levenshtein';
+import pLimit from 'p-limit';
 
 // ============================================
 // Types
@@ -270,10 +272,12 @@ export function generateCopyFileTool(): GeneratedToolDefinition {
 
 Creates parent directories if needed.
 Directories are copied recursively by default.
+Fails if destination already exists (use overwrite: true to replace).
 
 Parameters:
 - source: File/directory to copy
 - destination: Destination path
+- overwrite: Replace if destination exists (default: false)
 
 Example: copy_file({ source: "template.ts", destination: "src/new-file.ts" })
 Example: copy_file({ source: "src/components", destination: "src/components-backup" })`,
@@ -287,6 +291,10 @@ Example: copy_file({ source: "src/components", destination: "src/components-back
         destination: {
           type: 'string',
           description: 'Destination path',
+        },
+        overwrite: {
+          type: 'boolean',
+          description: 'Replace if destination exists (default: false)',
         },
       },
       required: ['source', 'destination'],
@@ -491,7 +499,7 @@ export function generateMoveFileHandler(ctx: FsToolsContext) {
 }
 
 export function generateCopyFileHandler(ctx: FsToolsContext) {
-  return async (params: { source: string; destination: string }) => {
+  return async (params: { source: string; destination: string; overwrite?: boolean }) => {
     const projectRoot = getProjectRoot(ctx);
     if (!projectRoot) {
       return {
@@ -503,6 +511,7 @@ export function generateCopyFileHandler(ctx: FsToolsContext) {
     try {
       return await fsHelpers.copyFile(params.source, params.destination, {
         basePath: projectRoot,
+        overwrite: params.overwrite ?? false,
       });
     } catch (err: any) {
       return { error: err.message };
@@ -529,6 +538,318 @@ export function generateCreateDirectoryHandler(ctx: FsToolsContext) {
 }
 
 // ============================================
+// Change Directory Tool
+// ============================================
+
+export function generateChangeDirectoryTool(): GeneratedToolDefinition {
+  return {
+    name: 'change_directory',
+    section: 'file_ops',
+    description: `Change the current working directory.
+
+Changes the process working directory (like 'cd' in shell).
+Use this to navigate before running commands or file operations.
+
+Parameters:
+- path: Directory to change to (absolute or relative)
+
+Example: change_directory({ path: "src/components" })
+Example: change_directory({ path: ".." })
+Example: change_directory({ path: "/home/user/project" })`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Directory path to change to',
+        },
+      },
+      required: ['path'],
+    },
+  };
+}
+
+export function generateChangeDirectoryHandler(ctx: FsToolsContext) {
+  return async (params: { path: string }) => {
+    const fs = await import('fs/promises');
+
+    const projectRoot = getProjectRoot(ctx);
+    const targetPath = path.isAbsolute(params.path)
+      ? params.path
+      : path.join(process.cwd(), params.path);
+
+    // Check if directory exists
+    try {
+      const stat = await fs.stat(targetPath);
+      if (!stat.isDirectory()) {
+        return { error: `Not a directory: ${params.path}` };
+      }
+    } catch (err: any) {
+      return { error: `Directory not found: ${params.path}` };
+    }
+
+    // Change directory
+    const previousDir = process.cwd();
+    try {
+      process.chdir(targetPath);
+      return {
+        previous_directory: previousDir,
+        current_directory: process.cwd(),
+        success: true,
+      };
+    } catch (err: any) {
+      return { error: `Failed to change directory: ${err.message}` };
+    }
+  };
+}
+
+// ============================================
+// Search Tools (grep, fuzzy search)
+// ============================================
+
+export function generateGrepFilesTool(): GeneratedToolDefinition {
+  return {
+    name: 'grep_files',
+    section: 'file_ops',
+    description: `Search file contents using regex pattern.
+
+Searches within files matching a glob pattern.
+Returns matching lines with file path and line numbers.
+
+Parameters:
+- pattern: Glob pattern to filter files (e.g., "**/*.ts", "src/**/*.js")
+- regex: Regular expression to search for in file contents
+- ignore_case: Case insensitive search (default: false)
+- max_results: Maximum number of matches to return (default: 100)
+
+Example: grep_files({ pattern: "**/*.ts", regex: "function.*Handler" })
+Example: grep_files({ pattern: "src/**/*.js", regex: "TODO|FIXME", ignore_case: true })`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pattern: {
+          type: 'string',
+          description: 'Glob pattern to filter files',
+        },
+        regex: {
+          type: 'string',
+          description: 'Regular expression to search for',
+        },
+        ignore_case: {
+          type: 'boolean',
+          description: 'Case insensitive search (default: false)',
+        },
+        max_results: {
+          type: 'number',
+          description: 'Maximum matches to return (default: 100)',
+        },
+      },
+      required: ['pattern', 'regex'],
+    },
+  };
+}
+
+export function generateSearchFilesTool(): GeneratedToolDefinition {
+  return {
+    name: 'search_files',
+    section: 'file_ops',
+    description: `Fuzzy search file contents using Levenshtein distance.
+
+Searches within files matching a glob pattern with typo tolerance.
+Useful when you don't know the exact spelling.
+
+Parameters:
+- pattern: Glob pattern to filter files (e.g., "**/*.ts")
+- query: Text to search for (fuzzy matched)
+- threshold: Similarity threshold 0-1 (default: 0.7, higher = stricter)
+- max_results: Maximum number of matches to return (default: 50)
+
+Example: search_files({ pattern: "**/*.ts", query: "authentification" })
+Example: search_files({ pattern: "src/**/*", query: "levenshtien", threshold: 0.6 })`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pattern: {
+          type: 'string',
+          description: 'Glob pattern to filter files',
+        },
+        query: {
+          type: 'string',
+          description: 'Text to search for (fuzzy matched)',
+        },
+        threshold: {
+          type: 'number',
+          description: 'Similarity threshold 0-1 (default: 0.7)',
+        },
+        max_results: {
+          type: 'number',
+          description: 'Maximum matches to return (default: 50)',
+        },
+      },
+      required: ['pattern', 'query'],
+    },
+  };
+}
+
+export function generateGrepFilesHandler(ctx: FsToolsContext) {
+  return async (params: { pattern: string; regex: string; ignore_case?: boolean; max_results?: number }) => {
+    const fs = await import('fs/promises');
+    const { glob } = await import('glob');
+
+    const projectRoot = getProjectRoot(ctx);
+    if (!projectRoot) {
+      return { error: 'No project loaded.' };
+    }
+
+    const { pattern, regex, ignore_case = false, max_results = 100 } = params;
+
+    try {
+      // Validate regex
+      new RegExp(regex, ignore_case ? 'i' : '');
+    } catch (err: any) {
+      return { error: `Invalid regex: ${err.message}` };
+    }
+
+    const regexFlags = ignore_case ? 'gi' : 'g';
+    const searchRegex = new RegExp(regex, regexFlags);
+
+    // Get files matching glob
+    const files = await glob(pattern, {
+      cwd: projectRoot,
+      nodir: true,
+      ignore: ['**/node_modules/**', '**/.git/**', '**/dist/**'],
+    });
+
+    if (files.length === 0) {
+      return { matches: [], files_searched: 0, message: 'No files matched the glob pattern' };
+    }
+
+    const limit = pLimit(10); // Process 10 files concurrently
+    const matches: Array<{ file: string; line: number; content: string; match: string }> = [];
+    let totalMatches = 0;
+
+    const searchFile = async (file: string) => {
+      if (totalMatches >= max_results) return;
+
+      const filePath = path.join(projectRoot, file);
+      try {
+        const content = await fs.readFile(filePath, 'utf-8');
+        const lines = content.split('\n');
+
+        for (let i = 0; i < lines.length && totalMatches < max_results; i++) {
+          const line = lines[i];
+          searchRegex.lastIndex = 0; // Reset regex state
+          const match = searchRegex.exec(line);
+
+          if (match) {
+            matches.push({
+              file,
+              line: i + 1,
+              content: line.trim().substring(0, 200),
+              match: match[0],
+            });
+            totalMatches++;
+          }
+        }
+      } catch {
+        // Skip unreadable files (binary, etc.)
+      }
+    };
+
+    await Promise.all(files.map(file => limit(() => searchFile(file))));
+
+    return {
+      matches,
+      files_searched: files.length,
+      total_matches: matches.length,
+      truncated: totalMatches >= max_results,
+    };
+  };
+}
+
+export function generateSearchFilesHandler(ctx: FsToolsContext) {
+  return async (params: { pattern: string; query: string; threshold?: number; max_results?: number }) => {
+    const fs = await import('fs/promises');
+    const { glob } = await import('glob');
+
+    const projectRoot = getProjectRoot(ctx);
+    if (!projectRoot) {
+      return { error: 'No project loaded.' };
+    }
+
+    const { pattern, query, threshold = 0.7, max_results = 50 } = params;
+    const queryLower = query.toLowerCase();
+    const queryLen = query.length;
+
+    // Get files matching glob
+    const files = await glob(pattern, {
+      cwd: projectRoot,
+      nodir: true,
+      ignore: ['**/node_modules/**', '**/.git/**', '**/dist/**'],
+    });
+
+    if (files.length === 0) {
+      return { matches: [], files_searched: 0, message: 'No files matched the glob pattern' };
+    }
+
+    const limit = pLimit(10);
+    const matches: Array<{ file: string; line: number; content: string; matched_word: string; similarity: number }> = [];
+
+    const searchFile = async (file: string) => {
+      if (matches.length >= max_results) return;
+
+      const filePath = path.join(projectRoot, file);
+      try {
+        const content = await fs.readFile(filePath, 'utf-8');
+        const lines = content.split('\n');
+
+        for (let i = 0; i < lines.length && matches.length < max_results; i++) {
+          const line = lines[i];
+          // Extract words from line
+          const words = line.match(/\b\w{3,}\b/g) || [];
+
+          for (const word of words) {
+            if (matches.length >= max_results) break;
+
+            const wordLower = word.toLowerCase();
+            const maxLen = Math.max(queryLen, word.length);
+            const distance = levenshtein(queryLower, wordLower);
+            const similarity = 1 - distance / maxLen;
+
+            if (similarity >= threshold) {
+              matches.push({
+                file,
+                line: i + 1,
+                content: line.trim().substring(0, 200),
+                matched_word: word,
+                similarity: Math.round(similarity * 100) / 100,
+              });
+              break; // One match per line
+            }
+          }
+        }
+      } catch {
+        // Skip unreadable files
+      }
+    };
+
+    await Promise.all(files.map(file => limit(() => searchFile(file))));
+
+    // Sort by similarity (best first)
+    matches.sort((a, b) => b.similarity - a.similarity);
+
+    return {
+      query,
+      threshold,
+      matches,
+      files_searched: files.length,
+      total_matches: matches.length,
+      truncated: matches.length >= max_results,
+    };
+  };
+}
+
+// ============================================
 // Export All FS Tools
 // ============================================
 
@@ -551,6 +872,9 @@ export function generateFsTools(ctx: FsToolsContext): FsToolsResult {
       generateMoveFileTool(),
       generateCopyFileTool(),
       generateCreateDirectoryTool(),
+      generateChangeDirectoryTool(),
+      generateGrepFilesTool(),
+      generateSearchFilesTool(),
     ],
     handlers: {
       list_directory: generateListDirectoryHandler(ctx),
@@ -561,6 +885,9 @@ export function generateFsTools(ctx: FsToolsContext): FsToolsResult {
       move_file: generateMoveFileHandler(ctx),
       copy_file: generateCopyFileHandler(ctx),
       create_directory: generateCreateDirectoryHandler(ctx),
+      change_directory: generateChangeDirectoryHandler(ctx),
+      grep_files: generateGrepFilesHandler(ctx),
+      search_files: generateSearchFilesHandler(ctx),
     },
   };
 }
