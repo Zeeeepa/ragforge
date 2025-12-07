@@ -33,6 +33,7 @@ const MAX_LINE_LENGTH = 2000;
 export function generateReadFileTool(): GeneratedToolDefinition {
   return {
     name: 'read_file',
+    section: 'file_ops',
     description: `Read file contents with line numbers.
 
 Returns file content with line numbers (format: "00001| content").
@@ -74,6 +75,7 @@ Example: read_file({ path: "src/index.ts" })`,
 export function generateWriteFileTool(): GeneratedToolDefinition {
   return {
     name: 'write_file',
+    section: 'file_ops',
     description: `Create or overwrite a file.
 
 Creates parent directories if they don't exist.
@@ -108,6 +110,7 @@ Example: write_file({ path: "src/utils.ts", content: "export const foo = 1;" })`
 export function generateEditFileTool(): GeneratedToolDefinition {
   return {
     name: 'edit_file',
+    section: 'file_ops',
     description: `Edit a file using search/replace OR line numbers.
 
 **Method 1: Search/Replace**

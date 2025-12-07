@@ -204,6 +204,7 @@ export function getFetchCache(context: WebToolsContext): WebFetchCache {
 
 export const searchWebToolDefinition: GeneratedToolDefinition = {
   name: 'search_web',
+  section: 'web_ops',
   description: `Search the web for current information using Google Search.
 Returns an answer synthesized from web results along with source URLs.
 Use this tool when you need up-to-date information that may not be in the codebase.
@@ -222,6 +223,7 @@ You can call this tool multiple times with refined queries if the first results 
 
 export const fetchWebPageToolDefinition: GeneratedToolDefinition = {
   name: 'fetch_web_page',
+  section: 'web_ops',
   description: `Fetch and render a web page, extracting its content.
 Uses a headless browser to render JavaScript and extract text, links, images, and metadata.
 Use this when you have a specific URL and need to extract its content.

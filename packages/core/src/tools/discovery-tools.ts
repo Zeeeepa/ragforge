@@ -135,6 +135,7 @@ NOTE: If no project is loaded, this will return an empty schema. Use create_proj
 
   const definition: GeneratedToolDefinition = {
     name: 'get_schema',
+    section: 'rag_ops',
     description,
     inputSchema: {
       type: 'object',
@@ -182,6 +183,7 @@ Use this when you need detailed info about one entity after calling get_schema.`
 
   const definition: GeneratedToolDefinition = {
     name: 'describe_entity',
+    section: 'rag_ops',
     description,
     inputSchema: {
       type: 'object',

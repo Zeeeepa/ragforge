@@ -60,6 +60,7 @@ function resolveValue<T>(value: T | (() => T)): T {
 export function generateGetWorkingDirectoryTool(): GeneratedToolDefinition {
   return {
     name: 'get_working_directory',
+    section: 'context_ops',
     description: `Get the current working directory and project context.
 
 Returns:
@@ -82,6 +83,7 @@ Example: get_working_directory()`,
 export function generateGetEnvironmentInfoTool(): GeneratedToolDefinition {
   return {
     name: 'get_environment_info',
+    section: 'context_ops',
     description: `Get information about the runtime environment.
 
 Returns: Node version, OS, platform, architecture, home directory, etc.
@@ -99,6 +101,7 @@ Example: get_environment_info()`,
 export function generateGetProjectInfoTool(): GeneratedToolDefinition {
   return {
     name: 'get_project_info',
+    section: 'context_ops',
     description: `Get detailed information about the loaded project.
 
 Returns: package.json info, ragforge config, git info, etc.

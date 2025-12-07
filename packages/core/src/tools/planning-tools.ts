@@ -74,6 +74,7 @@ export function generatePlanActionsTool(): {
 } {
   const definition: GeneratedToolDefinition = {
     name: 'plan_actions',
+    section: 'planning_ops',
     description: `Plan and execute a sequence of actions using a sub-agent.
 
 Use this when you have a complex task that requires multiple steps.

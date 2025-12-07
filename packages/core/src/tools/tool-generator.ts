@@ -356,6 +356,7 @@ You can ORDER BY any searchable field or computed field (ASC or DESC).`;
 
   return {
     name: 'query_entities',
+    section: 'rag_ops',
     description,
     inputSchema: {
       type: 'object',
@@ -445,6 +446,7 @@ Workflow: semantic_search → get_entities_by_ids → answer with actual content
 
   return {
     name: 'semantic_search',
+    section: 'rag_ops',
     description,
     inputSchema: {
       type: 'object',
@@ -506,6 +508,7 @@ Use 'outgoing' for forward direction, 'incoming' for reverse, 'both' for bidirec
 
   return {
     name: 'explore_relationships',
+    section: 'rag_ops',
     description,
     inputSchema: {
       type: 'object',
@@ -572,6 +575,7 @@ Returns complete entity with all properties.`;
 
   return {
     name: 'get_entity_by_id',
+    section: 'rag_ops',
     description,
     inputSchema: {
       type: 'object',
@@ -863,6 +867,7 @@ Example workflow:
 
   return {
     name: 'get_entities_by_ids',
+    section: 'rag_ops',
     description,
     inputSchema: {
       type: 'object',
@@ -1059,6 +1064,7 @@ Use this for quick pattern-based filtering. Combine with semantic_search for bes
 
   return {
     name: 'glob_search',
+    section: 'rag_ops',
     description,
     inputSchema: {
       type: 'object',

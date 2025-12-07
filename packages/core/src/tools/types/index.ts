@@ -141,6 +141,20 @@ export interface ToolPropertySchema {
 }
 
 /**
+ * Tool section identifiers
+ * Used to organize tools into logical groups for sub-agent delegation
+ */
+export type ToolSection =
+  | 'file_ops'      // File read/write/edit, directory operations
+  | 'shell_ops'     // Command execution, git, npm
+  | 'rag_ops'       // Knowledge graph queries, semantic search
+  | 'project_ops'   // Project creation, setup, ingestion
+  | 'web_ops'       // Web search, page fetching
+  | 'media_ops'     // Image, 3D, document processing
+  | 'context_ops'   // Environment info, working directory
+  | 'planning_ops'; // Task planning, sub-agent delegation
+
+/**
  * Generated tool definition (before handler attachment)
  */
 export interface GeneratedToolDefinition {
@@ -151,6 +165,8 @@ export interface GeneratedToolDefinition {
     properties: Record<string, ToolPropertySchema>;
     required?: string[];
   };
+  /** Section this tool belongs to (for grouping and sub-agent delegation) */
+  section?: ToolSection;
 }
 
 /**

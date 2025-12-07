@@ -43,6 +43,11 @@ import {
   runAgent,
   printAgentHelp
 } from './commands/agent.js';
+import {
+  parseMcpServerOptions,
+  runMcpServer,
+  printMcpServerHelp
+} from './commands/mcp-server.js';
 
 import { VERSION } from './version.js';
 
@@ -62,6 +67,7 @@ Usage:
   ragforge quickstart [options]      Quick setup for code RAG with defaults
   ragforge create <name> [options]   Create a new TypeScript project
   ragforge agent [options]           Launch RagForge agent (RAG + File + Project tools)
+  ragforge mcp-server [options]      Start as MCP server (for Claude Code)
   ragforge init [options]            Complete setup (introspect + generate)
   ragforge help <command>            Show detailed help for a specific command
 
@@ -131,6 +137,9 @@ async function main(): Promise<void> {
           case 'agent':
             printAgentHelp();
             break;
+          case 'mcp-server':
+            printMcpServerHelp();
+            break;
           case 'init':
             printInitHelp();
             break;
@@ -163,6 +172,12 @@ async function main(): Promise<void> {
       case 'agent': {
         const options = parseAgentOptions(rest);
         await runAgent(options);
+        return;
+      }
+
+      case 'mcp-server': {
+        const options = parseMcpServerOptions(rest);
+        await runMcpServer(options);
         return;
       }
 

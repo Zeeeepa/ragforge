@@ -50,6 +50,7 @@ function getProjectRoot(ctx: ShellToolsContext): string | null {
 export function generateRunCommandTool(): GeneratedToolDefinition {
   return {
     name: 'run_command',
+    section: 'shell_ops',
     description: `Execute a shell command in the project directory.
 
 SECURITY: Only whitelisted commands are allowed:
@@ -97,6 +98,7 @@ Example: run_command({ command: "ls -la src" })`,
 export function generateRunNpmScriptTool(): GeneratedToolDefinition {
   return {
     name: 'run_npm_script',
+    section: 'shell_ops',
     description: `Run an npm script from package.json.
 
 Shortcut for "npm run <script>". Safer and simpler than run_command for npm scripts.
@@ -128,6 +130,7 @@ Example: run_npm_script({ script: "test", args: "--coverage" })`,
 export function generateGitStatusTool(): GeneratedToolDefinition {
   return {
     name: 'git_status',
+    section: 'shell_ops',
     description: `Get the current git status.
 
 Returns: branch name, changed files, staged files, untracked files.
@@ -143,6 +146,7 @@ Example: git_status()`,
 export function generateGitDiffTool(): GeneratedToolDefinition {
   return {
     name: 'git_diff',
+    section: 'shell_ops',
     description: `Show git diff for changes.
 
 Parameters:
@@ -173,6 +177,7 @@ Example: git_diff({ file: "src/index.ts" })`,
 export function generateListSafeCommandsTool(): GeneratedToolDefinition {
   return {
     name: 'list_safe_commands',
+    section: 'shell_ops',
     description: `List all commands that are whitelisted for execution.
 
 Returns the list of command names that can be used with run_command.

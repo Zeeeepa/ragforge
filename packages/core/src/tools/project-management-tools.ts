@@ -35,6 +35,7 @@ interface ProjectSummary {
 export function generateListProjectsTool(): GeneratedToolDefinition {
   return {
     name: 'list_projects',
+    section: 'project_ops',
     description: `List all currently loaded projects.
 
 Shows:
@@ -83,6 +84,7 @@ export function generateSwitchProjectTool(registry: ProjectRegistry): GeneratedT
 
   return {
     name: 'switch_project',
+    section: 'project_ops',
     description: `Switch the active project context.
 
 All subsequent RAG queries and file operations will use the new active project.
@@ -152,6 +154,7 @@ export function generateUnloadProjectTool(registry: ProjectRegistry): GeneratedT
 
   return {
     name: 'unload_project',
+    section: 'project_ops',
     description: `Unload a project from memory.
 
 This will:

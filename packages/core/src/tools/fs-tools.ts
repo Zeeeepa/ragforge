@@ -49,6 +49,7 @@ function getProjectRoot(ctx: FsToolsContext): string | null {
 export function generateListDirectoryTool(): GeneratedToolDefinition {
   return {
     name: 'list_directory',
+    section: 'file_ops',
     description: `List files and directories in a given path.
 
 Returns file names, types (file/directory), sizes, and modification times.
@@ -94,6 +95,7 @@ Example: list_directory({ path: "node_modules", no_default_excludes: true })`,
 export function generateGlobFilesTool(): GeneratedToolDefinition {
   return {
     name: 'glob_files',
+    section: 'file_ops',
     description: `Find files matching a glob pattern.
 
 Useful to find all files of a certain type or in a specific location.
@@ -146,6 +148,7 @@ Example: glob_files({ pattern: "node_modules/**/*.d.ts", no_default_excludes: tr
 export function generateFileExistsTool(): GeneratedToolDefinition {
   return {
     name: 'file_exists',
+    section: 'file_ops',
     description: `Check if a file or directory exists.
 
 Quick check without reading the file. Returns basic info if exists.
@@ -171,6 +174,7 @@ Example: file_exists({ path: "src/utils" })`,
 export function generateGetFileInfoTool(): GeneratedToolDefinition {
   return {
     name: 'get_file_info',
+    section: 'file_ops',
     description: `Get detailed information about a file or directory.
 
 Returns: exists, type, size, created/modified/accessed times, permissions.
@@ -195,6 +199,7 @@ Example: get_file_info({ path: "package.json" })`,
 export function generateDeletePathTool(): GeneratedToolDefinition {
   return {
     name: 'delete_path',
+    section: 'file_ops',
     description: `Delete a file or directory.
 
 By default, only deletes files and empty directories. Use recursive: true for non-empty directories.
@@ -227,6 +232,7 @@ Example: delete_path({ path: "temp", recursive: true })`,
 export function generateMoveFileTool(): GeneratedToolDefinition {
   return {
     name: 'move_file',
+    section: 'file_ops',
     description: `Move or rename a file or directory.
 
 Creates parent directories if needed.
@@ -258,6 +264,7 @@ Example: move_file({ source: "old-name.ts", destination: "new-name.ts" })`,
 export function generateCopyFileTool(): GeneratedToolDefinition {
   return {
     name: 'copy_file',
+    section: 'file_ops',
     description: `Copy a file or directory.
 
 Creates parent directories if needed.
@@ -289,6 +296,7 @@ Example: copy_file({ source: "src/components", destination: "src/components-back
 export function generateCreateDirectoryTool(): GeneratedToolDefinition {
   return {
     name: 'create_directory',
+    section: 'file_ops',
     description: `Create a directory (and parent directories if needed).
 
 Equivalent to "mkdir -p". Does nothing if directory already exists.

@@ -119,6 +119,7 @@ export interface ProjectToolsContext {
 export function generateCreateProjectTool(): GeneratedToolDefinition {
   return {
     name: 'create_project',
+    section: 'project_ops',
     description: `Create a new RagForge project with TypeScript structure and RAG capabilities.
 
 Creates a complete project with:
@@ -172,6 +173,7 @@ Example: create_project({ name: "my-api" })`,
 export function generateSetupProjectTool(): GeneratedToolDefinition {
   return {
     name: 'setup_project',
+    section: 'project_ops',
     description: `Setup Neo4j and run initial code ingestion for a RagForge project.
 
 This is equivalent to running "ragforge quickstart". It will:
@@ -229,6 +231,7 @@ Example: setup_project({ embeddings: true })`,
 export function generateIngestCodeTool(): GeneratedToolDefinition {
   return {
     name: 'ingest_code',
+    section: 'project_ops',
     description: `Re-ingest code into the Neo4j knowledge graph.
 
 Use this after making changes to the codebase to update the graph.
@@ -263,6 +266,7 @@ Example: ingest_code({ files: ["src/index.ts", "src/utils.ts"] })`,
 export function generateEmbeddingsTool(): GeneratedToolDefinition {
   return {
     name: 'generate_embeddings',
+    section: 'project_ops',
     description: `Generate vector embeddings for semantic search.
 
 Embeddings enable semantic similarity search on the knowledge graph.
@@ -300,6 +304,7 @@ Example: generate_embeddings({ force: false })`,
 export function generateLoadProjectTool(): GeneratedToolDefinition {
   return {
     name: 'load_project',
+    section: 'project_ops',
     description: `Load an existing RagForge project to work on it.
 
 This connects to the project's Neo4j database and enables all tools:

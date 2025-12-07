@@ -19,6 +19,7 @@ import type { GeneratedToolDefinition } from './types/index.js';
 export function generateReadImageTool(): GeneratedToolDefinition {
   return {
     name: 'read_image',
+    section: 'media_ops',
     description: `Extract text from an image using OCR.
 
 Uses AI vision models (Gemini Vision or DeepSeek-OCR) to extract all text content from an image.
@@ -55,6 +56,7 @@ Example: read_image({ path: "docs/screenshot.png" })`,
 export function generateDescribeImageTool(): GeneratedToolDefinition {
   return {
     name: 'describe_image',
+    section: 'media_ops',
     description: `Get a detailed description of an image's visual content.
 
 Uses AI vision models to analyze and describe what's in the image.
@@ -90,6 +92,7 @@ Example:
 export function generateGenerateMultiviewImagesTool(): GeneratedToolDefinition {
   return {
     name: 'generate_multiview_images',
+    section: 'media_ops',
     description: `Generate multiple consistent view images from a text description.
 
 Uses AI to create 4 coherent views (front, right, top, perspective) of the same object.
@@ -140,6 +143,7 @@ Returns paths to 4 images: {name}_front.png, {name}_right.png, {name}_top.png, {
 export function generateGenerateImageTool(): GeneratedToolDefinition {
   return {
     name: 'generate_image',
+    section: 'media_ops',
     description: `Generate an image from a text prompt using AI.
 
 Uses Gemini's image generation (gemini-2.0-flash-exp) to create images from text descriptions.
@@ -185,6 +189,7 @@ Example:
 export function generateListImagesTool(): GeneratedToolDefinition {
   return {
     name: 'list_images',
+    section: 'media_ops',
     description: `List image files in a directory.
 
 Finds all image files (PNG, JPG, JPEG, GIF, WebP, BMP, SVG) in the specified directory.
@@ -880,6 +885,7 @@ export function generateImageTools(ctx: ImageToolsContext): ImageToolsResult {
 export function generateAnalyzeVisualTool(): GeneratedToolDefinition {
   return {
     name: 'analyze_visual',
+    section: 'media_ops',
     description: `Analyze an image or document page using Gemini Vision.
 
 Use this tool when:

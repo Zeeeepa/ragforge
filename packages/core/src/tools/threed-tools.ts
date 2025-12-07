@@ -20,6 +20,7 @@ import type { GeneratedToolDefinition } from './types/index.js';
 export function generateRender3DAssetTool(): GeneratedToolDefinition {
   return {
     name: 'render_3d_asset',
+    section: 'media_ops',
     description: `Render a 3D model to images from multiple viewpoints.
 
 Uses Three.js to render .glb/.gltf/.obj models to PNG images.
@@ -86,6 +87,7 @@ Example: render_3d_asset({
 export function generateGenerate3DFromImageTool(): GeneratedToolDefinition {
   return {
     name: 'generate_3d_from_image',
+    section: 'media_ops',
     description: `Generate a 3D model from reference image(s).
 
 Uses Trellis (via Replicate) to convert images into a 3D model.
@@ -138,6 +140,7 @@ Example with multiple views (better quality):
 export function generateGenerate3DFromTextTool(): GeneratedToolDefinition {
   return {
     name: 'generate_3d_from_text',
+    section: 'media_ops',
     description: `Generate a 3D model from a text description.
 
 This tool automatically:

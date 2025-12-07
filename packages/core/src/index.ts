@@ -38,6 +38,7 @@ export type {
   ToolGenerationMetadata,
 } from './tools/types/index.js';
 export { EMPTY_CONTEXT } from './tools/types/index.js';
+export type { ToolSection, ToolPropertySchema } from './tools/types/index.js';
 
 // Discovery Tools (schema for agents)
 export { generateDiscoveryTools } from './tools/discovery-tools.js';
@@ -241,6 +242,26 @@ export {
   generateGetProjectInfoHandler,
 } from './tools/context-tools.js';
 export type { ContextToolsContext, ContextToolsResult } from './tools/context-tools.js';
+
+// Tool Sections (tool grouping and sub-agent management)
+export {
+  SECTION_INFO,
+  ALWAYS_AVAILABLE_SECTIONS,
+  MAX_SUBAGENT_DEPTH,
+  aggregateToolsBySection,
+  getToolsForSections,
+  getSectionSummary,
+  validateSections,
+  canSpawnSubAgent,
+  createChildContext,
+  createRootContext,
+  validateToolSection,
+  validateAllToolSections,
+} from './tools/tool-sections.js';
+export type {
+  SectionInfo,
+  SubAgentContext,
+} from './tools/tool-sections.js';
 
 // Computed Fields (Phase 3)
 export {
