@@ -395,9 +395,9 @@ export const SECTION_INFO: Record<ToolSection, SectionInfo> = {
 6. [x] Ajouter filtrage par sections
 7. [ ] Ajouter configuration YAML
 
-### ✅ STATUS FINAL (7 déc 2025, 20h00)
+### ✅ STATUS FINAL (7 déc 2025, 19h45)
 
-**39 outils disponibles via MCP Server !**
+**44 outils disponibles via MCP Server !** (+4 nouveaux: `create_file`, `change_directory`, `grep_files`, `search_files`)
 
 ---
 
@@ -500,20 +500,20 @@ export const SECTION_INFO: Record<ToolSection, SectionInfo> = {
 
 ---
 
-## 📊 Résumé des tests (7 déc 2025, 19h10)
+## 📊 Résumé des tests (7 déc 2025, 19h45)
 
 | Catégorie | Total | Testés | OK | À tester |
 |-----------|-------|--------|-----|----------|
-| `file_ops` | 11 | 5 | 5 | 6 |
-| `shell_ops` | 5 | 5 | 5 | 0 |
-| `context_ops` | 3 | 3 | 3 | 0 |
+| `file_ops` | 15 | 15 | 15 | 0 | ✅ COMPLET
+| `shell_ops` | 5 | 5 | 5 | 0 | ✅ COMPLET
+| `context_ops` | 3 | 3 | 3 | 0 | ✅ COMPLET
 | `project_ops` | 3 | 1 | 1 | 2 |
 | `brain_ops` | 5 | 1 | 1 | 4 |
-| `web_ops` | 2 | 2 | 2 | 0 |
+| `web_ops` | 2 | 2 | 2 | 0 | ✅ COMPLET
 | `media_ops` | 6 | 4 | 4 | 2 |
-| `3d_ops` | 3 | 3 | 3 | 0 |
+| `3d_ops` | 3 | 3 | 3 | 0 | ✅ COMPLET
 | `discovery_ops` | 2 | 0 | 0 | 2 |
-| **TOTAL** | **40** | **24** | **24** | **16** |
+| **TOTAL** | **44** | **34** | **34** | **10** |
 
 ---
 
