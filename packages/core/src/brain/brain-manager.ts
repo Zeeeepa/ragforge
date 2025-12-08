@@ -201,7 +201,7 @@ const DEFAULT_BRAIN_CONFIG: BrainConfig = {
   },
   embeddings: {
     provider: 'gemini',
-    model: 'text-embedding-004',
+    model: 'gemini-embedding-001',
     cacheEnabled: true,
   },
   cleanup: {
@@ -803,9 +803,9 @@ volumes:
   /**
    * Register a project in the brain
    */
-  async registerProject(projectPath: string, type: ProjectType = 'ragforge-project'): Promise<string> {
+  async registerProject(projectPath: string, type: ProjectType = 'ragforge-project', customId?: string): Promise<string> {
     const absolutePath = path.resolve(projectPath);
-    const projectId = ProjectRegistry.generateId(absolutePath);
+    const projectId = customId || ProjectRegistry.generateId(absolutePath);
 
     // Check if already registered
     if (this.registeredProjects.has(projectId)) {
@@ -850,6 +850,25 @@ volumes:
    */
   listProjects(): RegisteredProject[] {
     return Array.from(this.registeredProjects.values());
+  }
+
+  /**
+   * Clear all projects from registry (used by cleanup)
+   */
+  async clearProjectsRegistry(): Promise<void> {
+    this.registeredProjects.clear();
+    await this.saveProjectsRegistry();
+  }
+
+  /**
+   * Unregister a specific project from the registry
+   */
+  async unregisterProject(projectId: string): Promise<boolean> {
+    const deleted = this.registeredProjects.delete(projectId);
+    if (deleted) {
+      await this.saveProjectsRegistry();
+    }
+    return deleted;
   }
 
   /**
@@ -969,8 +988,8 @@ volumes:
         }
       }
 
-      // Register in brain
-      await this.registerProject(absolutePath, 'quick-ingest');
+      // Register in brain with the same projectId used for nodes
+      await this.registerProject(absolutePath, 'quick-ingest', projectId);
 
       // Update node count
       const project = this.registeredProjects.get(projectId);
@@ -1134,9 +1153,10 @@ volumes:
       });
     } else {
       // Text search (fallback)
+      // Search in name, content, source, and rawText (for markdown documents)
       const cypher = `
         MATCH (n)
-        WHERE (n.name CONTAINS $query OR n.content CONTAINS $query OR n.source CONTAINS $query) ${projectFilter} ${nodeTypeFilter}
+        WHERE (n.name CONTAINS $query OR n.content CONTAINS $query OR n.source CONTAINS $query OR n.rawText CONTAINS $query) ${projectFilter} ${nodeTypeFilter}
         RETURN n, 1.0 as score
         ORDER BY n.name
         SKIP $offset
@@ -1164,7 +1184,7 @@ volumes:
     // Get total count (approximate for text search)
     const countCypher = `
       MATCH (n)
-      WHERE (n.name CONTAINS $query OR n.content CONTAINS $query) ${projectFilter} ${nodeTypeFilter}
+      WHERE (n.name CONTAINS $query OR n.content CONTAINS $query OR n.rawText CONTAINS $query) ${projectFilter} ${nodeTypeFilter}
       RETURN count(n) as total
     `;
     const countResult = await this.neo4jClient.run(countCypher, params);
@@ -1225,7 +1245,7 @@ volumes:
         MATCH (n)
         WHERE n.${embeddingProp} IS NOT NULL ${projectFilter} ${nodeTypeFilter}
         WITH n, gds.similarity.cosine(n.${embeddingProp}, $queryEmbedding) AS score
-        WHERE score > 0.5
+        WHERE score > 0.3
         RETURN n, score
         ORDER BY score DESC
         LIMIT $limit
@@ -1282,7 +1302,7 @@ volumes:
 
           // Compute cosine similarity manually
           const score = this.cosineSimilarity(queryEmbedding, nodeEmbedding);
-          if (score < 0.5) continue;
+          if (score < 0.3) continue;
 
           seenUuids.add(uuid);
 

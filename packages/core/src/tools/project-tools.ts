@@ -270,7 +270,7 @@ export function generateEmbeddingsTool(): GeneratedToolDefinition {
     description: `Generate vector embeddings for semantic search.
 
 Embeddings enable semantic similarity search on the knowledge graph.
-Uses Gemini text-embedding-004 model by default.
+Uses Gemini gemini-embedding-001 model by default.
 
 Parameters:
 - entity: Entity type to embed (default: Scope)

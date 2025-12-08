@@ -838,21 +838,27 @@ export function generateCleanupBrainTool(): GeneratedToolDefinition {
 ⚠️ THIS TOOL IS DESTRUCTIVE - USE WITH CAUTION.
 
 Options:
-- data_only: Only clear Neo4j data (keeps config and credentials)
+- data_only: Clear all Neo4j data (keeps config and credentials)
+- project: Delete a specific project only (requires project_id)
 - full: Remove everything including Docker container, volumes, and ~/.ragforge
 
 After cleanup with 'full', you'll need to restart the MCP server to reinitialize.
 
 Example:
-  cleanup_brain({ mode: "data_only" })  // Clear just the graph data
-  cleanup_brain({ mode: "full" })        // Complete reset`,
+  cleanup_brain({ mode: "data_only", confirm: true })  // Clear all data
+  cleanup_brain({ mode: "project", project_id: "my-project", confirm: true })  // Delete one project
+  cleanup_brain({ mode: "full", confirm: true })  // Complete reset`,
     inputSchema: {
       type: 'object',
       properties: {
         mode: {
           type: 'string',
-          enum: ['data_only', 'full'],
-          description: 'Cleanup mode: data_only (clear Neo4j data) or full (remove everything)',
+          enum: ['data_only', 'project', 'full'],
+          description: 'Cleanup mode: data_only (clear all), project (delete specific project), full (remove everything)',
+        },
+        project_id: {
+          type: 'string',
+          description: 'Project ID to delete (required when mode is "project")',
         },
         confirm: {
           type: 'boolean',
@@ -869,10 +875,11 @@ Example:
  */
 export function generateCleanupBrainHandler(ctx: BrainToolsContext) {
   return async (params: {
-    mode: 'data_only' | 'full';
+    mode: 'data_only' | 'project' | 'full';
+    project_id?: string;
     confirm: boolean;
   }): Promise<{ success: boolean; message: string; details?: string[] }> => {
-    const { mode, confirm } = params;
+    const { mode, project_id, confirm } = params;
 
     if (!confirm) {
       return {
@@ -890,6 +897,59 @@ export function generateCleanupBrainHandler(ctx: BrainToolsContext) {
 
     const brainPath = ctx.brain.getBrainPath();
 
+    // Mode: Delete a specific project
+    if (mode === 'project') {
+      if (!project_id) {
+        return {
+          success: false,
+          message: 'project_id is required when mode is "project"',
+        };
+      }
+
+      const neo4jClient = ctx.brain.getNeo4jClient();
+      if (!neo4jClient) {
+        return {
+          success: false,
+          message: 'Neo4j client not available',
+        };
+      }
+
+      try {
+        // Delete all nodes with this projectId
+        const result = await neo4jClient.run(
+          'MATCH (n {projectId: $projectId}) DETACH DELETE n RETURN count(n) as deleted',
+          { projectId: project_id }
+        );
+        const deletedCount = result.records[0]?.get('deleted')?.toNumber() || 0;
+        details.push(`Deleted ${deletedCount} nodes with projectId: ${project_id}`);
+
+        // Also delete the Project node itself
+        await neo4jClient.run(
+          'MATCH (p:Project {projectId: $projectId}) DETACH DELETE p',
+          { projectId: project_id }
+        );
+
+        // Remove from registry
+        try {
+          await ctx.brain.unregisterProject(project_id);
+          details.push(`Removed project from registry: ${project_id}`);
+        } catch (err: any) {
+          details.push(`Warning: Could not remove from registry: ${err.message}`);
+        }
+
+        return {
+          success: true,
+          message: `Project "${project_id}" deleted successfully.`,
+          details,
+        };
+      } catch (err: any) {
+        return {
+          success: false,
+          message: `Failed to delete project: ${err.message}`,
+        };
+      }
+    }
+
     if (mode === 'data_only') {
       // Just clear Neo4j data
       const neo4jClient = ctx.brain.getNeo4jClient();
@@ -905,13 +965,12 @@ export function generateCleanupBrainHandler(ctx: BrainToolsContext) {
         }
       }
 
-      // Clear projects registry
-      const registryPath = path.join(brainPath, 'projects.yaml');
+      // Clear projects registry (both file and in-memory)
       try {
-        await fs.writeFile(registryPath, 'version: 1\nprojects: []\n', 'utf-8');
+        await ctx.brain.clearProjectsRegistry();
         details.push('Cleared projects registry');
-      } catch {
-        // File might not exist
+      } catch (err: any) {
+        details.push(`Warning: Could not clear projects registry: ${err.message}`);
       }
 
       return {

@@ -49,7 +49,7 @@ export interface IndexConfig {
 export class VectorSearch {
   private static defaultConfig: IndexConfig = {
     provider: 'gemini',
-    model: 'text-embedding-004'
+    model: 'gemini-embedding-001'
   };
   private static indexRegistry = new Map<string, IndexConfig>();
 

@@ -131,7 +131,7 @@ function createEmbeddingProvider(config: any, embeddingsConfig: any): GeminiEmbe
     apiKey = ensureGeminiKey(getEnv(['GEMINI_API_KEY'], true));
   }
 
-  const model = config.embedding?.model || embeddingsConfig.defaults?.model || 'text-embedding-004';
+  const model = config.embedding?.model || embeddingsConfig.defaults?.model || 'gemini-embedding-001';
   const dimension = config.embedding?.dimensions || embeddingsConfig.defaults?.dimension;
 
   console.log(`📦 Using Gemini embedding provider (model: ${model})`);

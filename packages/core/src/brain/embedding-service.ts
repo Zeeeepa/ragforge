@@ -505,6 +505,7 @@ export class EmbeddingService {
     if (geminiApiKey) {
       this.embeddingProvider = new GeminiEmbeddingProvider({
         apiKey: geminiApiKey,
+        dimension: 3072,
         // Use native 3072 dimensions for best quality
       });
     }

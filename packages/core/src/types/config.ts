@@ -486,7 +486,7 @@ export interface EmbeddingProviderConfig {
   /** Provider name (gemini, openai, cohere, ollama, etc.) */
   provider: string;
 
-  /** Model name (e.g., "text-embedding-004", "text-embedding-3-small") */
+  /** Model name (e.g., 'gemini-embedding-001', "text-embedding-3-small") */
   model?: string;
 
   /** API key (not needed for Ollama) */

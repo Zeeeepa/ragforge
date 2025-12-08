@@ -408,8 +408,8 @@ describe('StructuredLLMExecutor', () => {
         targetField: 'embedding',
         provider: {
           provider: 'gemini',
-          model: 'text-embedding-004',
-          dimensions: 768
+          model: 'gemini-embedding-001',
+          dimensions: 3072
         },
         batchSize: 10
       };
@@ -419,7 +419,7 @@ describe('StructuredLLMExecutor', () => {
       expect(results).toHaveLength(1);
       expect(results[0]).toHaveProperty('embedding');
       expect(Array.isArray(results[0].embedding)).toBe(true);
-      expect(results[0].embedding.length).toBe(768); // Gemini text-embedding-004 dimension
+      expect(results[0].embedding.length).toBe(3072); // Gemini gemini-embedding-001 dimension
       expect(results[0].uuid).toBe('scope-1');
       expect(results[0].name).toBe('mainFunction');
     });
@@ -441,8 +441,8 @@ describe('StructuredLLMExecutor', () => {
         targetField: 'embedding',
         provider: {
           provider: 'gemini',
-          model: 'text-embedding-004',
-          dimensions: 768
+          model: 'gemini-embedding-001',
+          dimensions: 3072
         },
         batchSize: 3
       };

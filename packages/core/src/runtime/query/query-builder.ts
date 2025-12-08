@@ -600,7 +600,7 @@ export class QueryBuilder<T = any> {
    *     targetField: 'codeEmbedding',
    *     includeRelationships: ['CONSUMES'],
    *     relationshipFormat: 'text',
-   *     provider: { provider: 'gemini', model: 'text-embedding-004' }
+   *     provider: { provider: 'gemini', model: 'gemini-embedding-001' }
    *   })
    *   .execute();
    *

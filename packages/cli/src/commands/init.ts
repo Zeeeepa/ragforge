@@ -223,7 +223,7 @@ function createVectorIndexFromField(entityName: string, field: string): VectorIn
     name: `${entitySlug}_${fieldSlug}_embeddings`,
     field: `embedding_${fieldSlug}`,
     source_field: field,
-    dimension: 768,
+    dimension: 3072,
     similarity: 'cosine',
     provider: 'gemini',
     model: 'gemini-embedding-001'

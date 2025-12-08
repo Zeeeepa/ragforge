@@ -1858,6 +1858,8 @@ export class CodeSourceAdapter extends SourceAdapter {
             id: blockId,
             properties: {
               uuid: blockId,
+              projectId,
+              file: relPath,
               language: block.language || 'text',
               code: block.code,
               startLine: block.startLine,
@@ -1871,6 +1873,51 @@ export class CodeSourceAdapter extends SourceAdapter {
             from: mdId,
             to: blockId
           });
+        }
+      }
+
+      // Create MarkdownSection nodes for each section (searchable content)
+      if (doc.sections && doc.sections.length > 0) {
+        for (const section of doc.sections) {
+          const sectionId = `section:${section.uuid}`;
+
+          nodes.push({
+            labels: ['MarkdownSection'],
+            id: sectionId,
+            properties: {
+              uuid: sectionId,
+              projectId,
+              file: relPath,
+              title: section.title,
+              level: section.level,
+              slug: section.slug,
+              // Store both full content and own content for different search needs
+              content: section.content,
+              ownContent: section.ownContent,
+              startLine: section.startLine,
+              endLine: section.endLine,
+              ...(section.parentTitle && { parentTitle: section.parentTitle }),
+              indexedAt: getLocalTimestamp()
+            }
+          });
+
+          relationships.push({
+            type: 'HAS_SECTION',
+            from: mdId,
+            to: sectionId
+          });
+
+          // Link to parent section if exists
+          if (section.parentTitle) {
+            const parentSection = doc.sections.find(s => s.title === section.parentTitle);
+            if (parentSection) {
+              relationships.push({
+                type: 'CHILD_OF',
+                from: sectionId,
+                to: `section:${parentSection.uuid}`
+              });
+            }
+          }
         }
       }
     }

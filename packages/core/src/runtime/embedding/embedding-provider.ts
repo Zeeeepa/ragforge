@@ -27,8 +27,8 @@ export interface GeminiProviderOptions {
  * @example
  * const provider = new GeminiEmbeddingProvider({
  *   apiKey: process.env.GEMINI_API_KEY!,
- *   model: 'text-embedding-004',
- *   dimension: 768
+ *   model: 'gemini-embedding-001',
+ *   dimension: 3072
  * });
  *
  * const embeddings = await provider.embed(['hello world', 'foo bar']);
@@ -41,7 +41,7 @@ export class GeminiEmbeddingProvider {
 
   constructor(options: GeminiProviderOptions) {
     this.client = new GoogleGenAI({ apiKey: options.apiKey });
-    // Use gemini-embedding-001 (3072 dims native) - replaces deprecated text-embedding-004/005
+    // Use gemini-embedding-001 (3072 dims native)
     this.model = options.model || 'gemini-embedding-001';
     this.dimension = options.dimension; // undefined = use native 3072 dims for best quality
     this.batchSize = options.batching?.size ?? 100; // Gemini supports up to 100 texts per batch

@@ -534,7 +534,7 @@ export class ConfigGenerator {
       provider: 'gemini',
       defaults: {
         model: 'gemini-embedding-001',
-        dimension: 768,
+        dimension: 3072,
         similarity: 'cosine'
       },
       entities: embeddingEntities
@@ -627,7 +627,7 @@ export class ConfigGenerator {
         name: `${normalizedEntity}_${normalizedProp}_embeddings`,
         field: targetField,
         source_field: candidate.prop.name,
-        dimension: 768,
+        dimension: 3072,
         similarity: 'cosine',
         provider: 'gemini',
         model: 'gemini-embedding-001',

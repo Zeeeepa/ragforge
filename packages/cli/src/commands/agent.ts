@@ -354,7 +354,7 @@ async function startFileWatcherForProject(
       // Create embedding provider
       const provider = new GeminiEmbeddingProvider({
         apiKey: geminiKey,
-        model: embeddingsConfig.defaults?.model || 'text-embedding-004',
+        model: embeddingsConfig.defaults?.model || 'gemini-embedding-001',
       });
 
       // Run embeddings for each entity (only dirty nodes)

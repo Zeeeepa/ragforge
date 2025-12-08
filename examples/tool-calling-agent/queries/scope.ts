@@ -62,7 +62,7 @@ export class ScopeQuery extends QueryBuilder<Scope> {
 
   /**
    * Semantic search using scopeSourceEmbeddings
-   * Searches by source embeddings (model=text-embedding-004, dimension=768)
+   * Searches by source embeddings (model=gemini-embedding-001, dimension=3072)
    */
   semanticSearchBySource(query: string, options?: { topK?: number; minScore?: number }): this {
     return this.semantic(query, {
