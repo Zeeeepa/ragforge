@@ -22,6 +22,221 @@ export interface BrainToolsContext {
 }
 
 // ============================================
+// create_project
+// ============================================
+
+/**
+ * Generate create_project tool definition
+ */
+export function generateCreateProjectTool(): GeneratedToolDefinition {
+  return {
+    name: 'create_project',
+    description: `Create a new TypeScript project and register it in the brain.
+
+Creates a minimal project structure:
+- package.json (ESM, TypeScript, tsx)
+- tsconfig.json
+- src/index.ts
+- .gitignore
+
+The project is automatically ingested into the brain for RAG queries.
+
+Parameters:
+- name: Project name (kebab-case, e.g., "my-app")
+- path: Parent directory (default: current directory)
+- install_deps: Run npm install (default: false)
+- ingest: Auto-ingest into brain (default: true)
+- generate_embeddings: Generate embeddings for search (default: true)
+
+Example: create_project({ name: "my-api" })
+Example: create_project({ name: "my-app", path: "/projects", install_deps: true })`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'Project name (kebab-case, lowercase letters, numbers, hyphens)',
+        },
+        path: {
+          type: 'string',
+          description: 'Parent directory for the project (default: current directory)',
+        },
+        install_deps: {
+          type: 'boolean',
+          description: 'Run npm install after creation (default: false)',
+        },
+        ingest: {
+          type: 'boolean',
+          description: 'Auto-ingest into brain after creation (default: true)',
+        },
+        generate_embeddings: {
+          type: 'boolean',
+          description: 'Generate embeddings for semantic search (default: true)',
+        },
+      },
+      required: ['name'],
+    },
+  };
+}
+
+/**
+ * Result type for create_project
+ */
+interface CreateProjectResult {
+  success: boolean;
+  projectPath: string;
+  projectId?: string;
+  filesCreated: string[];
+  ingested: boolean;
+  embeddingsGenerated: number;
+  watching?: boolean;
+  error?: string;
+}
+
+/**
+ * Generate handler for create_project
+ */
+export function generateCreateProjectHandler(ctx: BrainToolsContext) {
+  return async (params: {
+    name: string;
+    path?: string;
+    install_deps?: boolean;
+    ingest?: boolean;
+    generate_embeddings?: boolean;
+  }): Promise<CreateProjectResult> => {
+    const fs = await import('fs/promises');
+    const pathModule = await import('path');
+    const { fileURLToPath } = await import('url');
+
+    const {
+      name,
+      path: parentPath = process.cwd(),
+      install_deps = false,
+      ingest = true,
+      generate_embeddings = true,
+    } = params;
+
+    // Validate name
+    if (!/^[a-z0-9-]+$/.test(name)) {
+      return {
+        success: false,
+        projectPath: '',
+        filesCreated: [],
+        ingested: false,
+        embeddingsGenerated: 0,
+        error: 'Project name must be kebab-case (lowercase letters, numbers, hyphens)',
+      };
+    }
+
+    const projectPath = pathModule.join(parentPath, name);
+    const filesCreated: string[] = [];
+
+    try {
+      // Check if directory already exists
+      try {
+        await fs.access(projectPath);
+        return {
+          success: false,
+          projectPath,
+          filesCreated: [],
+          ingested: false,
+          embeddingsGenerated: 0,
+          error: `Directory already exists: ${projectPath}`,
+        };
+      } catch {
+        // Directory doesn't exist, good!
+      }
+
+      // Load templates
+      const loadTemplate = async (templateName: string): Promise<string> => {
+        // Find templates directory relative to this file
+        const currentFile = fileURLToPath(import.meta.url);
+        const currentDir = pathModule.dirname(currentFile);
+        // Go up to src, then to templates (which is copied to dist/templates at build time)
+        const templatesDir = pathModule.resolve(currentDir, '..', '..', 'templates', 'create-project');
+        const templatePath = pathModule.join(templatesDir, templateName);
+        const content = await fs.readFile(templatePath, 'utf-8');
+        return content.replace(/\{\{PROJECT_NAME\}\}/g, name);
+      };
+
+      // Create directories
+      await fs.mkdir(projectPath, { recursive: true });
+      await fs.mkdir(pathModule.join(projectPath, 'src'), { recursive: true });
+
+      // Write files
+      const packageJson = await loadTemplate('package.json.template');
+      await fs.writeFile(pathModule.join(projectPath, 'package.json'), packageJson);
+      filesCreated.push('package.json');
+
+      const tsconfig = await loadTemplate('tsconfig.json.template');
+      await fs.writeFile(pathModule.join(projectPath, 'tsconfig.json'), tsconfig);
+      filesCreated.push('tsconfig.json');
+
+      const indexTs = await loadTemplate('index.ts.template');
+      await fs.writeFile(pathModule.join(projectPath, 'src', 'index.ts'), indexTs);
+      filesCreated.push('src/index.ts');
+
+      const gitignore = await loadTemplate('gitignore.template');
+      await fs.writeFile(pathModule.join(projectPath, '.gitignore'), gitignore);
+      filesCreated.push('.gitignore');
+
+      // Optional: npm install
+      if (install_deps) {
+        const { exec } = await import('child_process');
+        const { promisify } = await import('util');
+        const execAsync = promisify(exec);
+        try {
+          await execAsync('npm install', { cwd: projectPath });
+        } catch (e: any) {
+          // Non-fatal, just warn
+          console.warn(`npm install failed: ${e.message}`);
+        }
+      }
+
+      // Ingest into brain
+      let projectId: string | undefined;
+      let embeddingsGenerated = 0;
+
+      if (ingest) {
+        const result = await ctx.brain.quickIngest(projectPath, {
+          projectName: name,
+          generateEmbeddings: generate_embeddings,
+        });
+        projectId = result.projectId;
+        embeddingsGenerated = result.stats?.embeddingsGenerated || 0;
+
+        // Start file watcher for auto-ingestion on changes
+        try {
+          await ctx.brain.startWatching(projectPath, { verbose: false });
+        } catch (e: any) {
+          console.warn(`[create_project] Could not start file watcher: ${e.message}`);
+        }
+      }
+
+      return {
+        success: true,
+        projectPath,
+        projectId,
+        filesCreated,
+        ingested: ingest,
+        embeddingsGenerated,
+        watching: ingest, // file watcher started if ingested
+      };
+
+    } catch (error: any) {
+      return {
+        success: false,
+        projectPath,
+        filesCreated,
+        ingested: false,
+        embeddingsGenerated: 0,
+        error: error.message,
+      };
+    }
+  };
+}
+
+// ============================================
 // ingest_directory
 // ============================================
 
@@ -641,6 +856,818 @@ export function generateListBrainProjectsHandler(ctx: BrainToolsContext) {
 }
 
 // ============================================
+// File Watcher Management Tools
+// ============================================
+
+/**
+ * Generate list_watchers tool definition
+ */
+export function generateListWatchersTool(): GeneratedToolDefinition {
+  return {
+    name: 'list_watchers',
+    description: `List all active file watchers.
+
+Shows which projects have file watchers running for auto-ingestion.
+
+Returns:
+- watchers: Array of { projectId, projectPath, isWatching }
+- count: Total number of active watchers
+
+Example: list_watchers()`,
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: [],
+    },
+  };
+}
+
+/**
+ * Generate handler for list_watchers
+ */
+export function generateListWatchersHandler(ctx: BrainToolsContext) {
+  return async (): Promise<{
+    watchers: Array<{ projectId: string; projectPath: string }>;
+    count: number;
+  }> => {
+    const watchedIds = ctx.brain.getWatchedProjects();
+    const projects = ctx.brain.listProjects();
+
+    const watchers = watchedIds.map((projectId: string) => {
+      const project = projects.find(p => p.id === projectId);
+      return {
+        projectId,
+        projectPath: project?.path || 'unknown',
+      };
+    });
+
+    return {
+      watchers,
+      count: watchers.length,
+    };
+  };
+}
+
+/**
+ * Generate start_watcher tool definition
+ */
+export function generateStartWatcherTool(): GeneratedToolDefinition {
+  return {
+    name: 'start_watcher',
+    description: `Start a file watcher for a project.
+
+Starts monitoring a project directory for file changes.
+When files are modified, they are automatically re-ingested into the brain.
+
+Parameters:
+- project_path: Path to the project directory (must be a registered project)
+- verbose: Enable verbose logging (default: false)
+
+Example: start_watcher({ project_path: "/path/to/project" })`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_path: {
+          type: 'string',
+          description: 'Path to the project directory',
+        },
+        verbose: {
+          type: 'boolean',
+          description: 'Enable verbose logging (default: false)',
+        },
+      },
+      required: ['project_path'],
+    },
+  };
+}
+
+/**
+ * Generate handler for start_watcher
+ */
+export function generateStartWatcherHandler(ctx: BrainToolsContext) {
+  return async (params: { project_path: string; verbose?: boolean }): Promise<{
+    success: boolean;
+    projectId?: string;
+    message: string;
+  }> => {
+    const { project_path, verbose = false } = params;
+    const pathModule = await import('path');
+    const absolutePath = pathModule.resolve(project_path);
+
+    // Check if already watching
+    if (ctx.brain.isWatching(absolutePath)) {
+      return {
+        success: false,
+        message: `Already watching: ${absolutePath}`,
+      };
+    }
+
+    try {
+      await ctx.brain.startWatching(absolutePath, { verbose });
+      const projects = ctx.brain.listProjects();
+      const project = projects.find(p => p.path === absolutePath);
+
+      return {
+        success: true,
+        projectId: project?.id,
+        message: `File watcher started for ${project?.id || absolutePath}`,
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        message: `Failed to start watcher: ${err.message}`,
+      };
+    }
+  };
+}
+
+/**
+ * Generate stop_watcher tool definition
+ */
+export function generateStopWatcherTool(): GeneratedToolDefinition {
+  return {
+    name: 'stop_watcher',
+    description: `Stop a file watcher for a project.
+
+Stops monitoring a project directory for file changes.
+
+Parameters:
+- project_path: Path to the project directory
+
+Example: stop_watcher({ project_path: "/path/to/project" })`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_path: {
+          type: 'string',
+          description: 'Path to the project directory',
+        },
+      },
+      required: ['project_path'],
+    },
+  };
+}
+
+/**
+ * Generate handler for stop_watcher
+ */
+export function generateStopWatcherHandler(ctx: BrainToolsContext) {
+  return async (params: { project_path: string }): Promise<{
+    success: boolean;
+    message: string;
+  }> => {
+    const { project_path } = params;
+    const pathModule = await import('path');
+    const absolutePath = pathModule.resolve(project_path);
+
+    // Check if watching
+    if (!ctx.brain.isWatching(absolutePath)) {
+      return {
+        success: false,
+        message: `Not watching: ${absolutePath}`,
+      };
+    }
+
+    try {
+      await ctx.brain.stopWatching(absolutePath);
+      return {
+        success: true,
+        message: `File watcher stopped for ${absolutePath}`,
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        message: `Failed to stop watcher: ${err.message}`,
+      };
+    }
+  };
+}
+
+// ============================================
+// Brain-Aware File Tools
+// ============================================
+
+const DEFAULT_READ_LIMIT = 2000;
+const MAX_LINE_LENGTH = 2000;
+
+/**
+ * Helper: Find which project a file belongs to
+ */
+async function findProjectForFile(brain: BrainManager, absolutePath: string): Promise<{ id: string; path: string } | null> {
+  const projects = brain.listProjects();
+  const pathModule = await import('path');
+
+  for (const project of projects) {
+    if (absolutePath.startsWith(project.path + pathModule.sep) || absolutePath === project.path) {
+      return { id: project.id, path: project.path };
+    }
+  }
+  return null;
+}
+
+/**
+ * Helper: Trigger re-ingestion for a file's project
+ */
+async function triggerReIngestion(
+  brain: BrainManager,
+  absolutePath: string,
+  changeType: 'created' | 'updated' | 'deleted'
+): Promise<{ projectId?: string; stats?: any } | null> {
+  const pathModule = await import('path');
+  const ext = pathModule.extname(absolutePath).toLowerCase();
+
+  // Media files use updateMediaContent
+  const mediaExts = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.pdf', '.docx', '.xlsx', '.glb', '.gltf'];
+
+  if (mediaExts.includes(ext) && changeType !== 'deleted') {
+    try {
+      await brain.updateMediaContent({
+        filePath: absolutePath,
+        extractionMethod: `file-tool-${changeType}`,
+        generateEmbeddings: true,
+      });
+      return { projectId: 'media', stats: { mediaUpdated: true } };
+    } catch (e: any) {
+      console.warn(`[file-tool] Media re-ingestion failed: ${e.message}`);
+      return null;
+    }
+  }
+
+  // Code files use quickIngest on the project
+  const project = await findProjectForFile(brain, absolutePath);
+  if (project) {
+    try {
+      const result = await brain.quickIngest(project.path, {
+        projectName: project.id,
+        generateEmbeddings: true,
+      });
+      return { projectId: project.id, stats: result.stats };
+    } catch (e: any) {
+      console.warn(`[file-tool] Code re-ingestion failed: ${e.message}`);
+      return null;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Generate read_file tool definition (brain-aware)
+ */
+export function generateBrainReadFileTool(): GeneratedToolDefinition {
+  return {
+    name: 'read_file',
+    description: `Read file contents with line numbers.
+
+Returns file content with line numbers (format: "00001| content").
+Supports pagination with offset and limit for large files.
+
+Parameters:
+- path: Absolute or relative file path
+- offset: Start line (0-based, optional)
+- limit: Max lines to read (default: 2000)
+
+Long lines (>2000 chars) are truncated with "...".
+Binary files cannot be read.
+
+Example: read_file({ path: "src/index.ts" })`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'File path to read (absolute or relative to project root)',
+        },
+        offset: {
+          type: 'number',
+          description: 'Start line (0-based). Use for pagination.',
+        },
+        limit: {
+          type: 'number',
+          description: 'Max lines to read (default: 2000)',
+        },
+      },
+      required: ['path'],
+    },
+  };
+}
+
+/**
+ * Generate write_file tool definition (brain-aware)
+ */
+export function generateBrainWriteFileTool(): GeneratedToolDefinition {
+  return {
+    name: 'write_file',
+    description: `Write content to a file (overwrites if exists).
+
+⚠️ WARNING: This will OVERWRITE existing files without confirmation!
+Use create_file if you want to create a NEW file safely.
+
+Creates parent directories if they don't exist.
+Automatically updates the brain's knowledge graph after writing.
+
+Parameters:
+- path: Absolute or relative file path
+- content: Full file content to write
+
+Example: write_file({ path: "src/utils.ts", content: "export const foo = 1;" })`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'File path to write (absolute or relative to project root)',
+        },
+        content: {
+          type: 'string',
+          description: 'Full file content to write',
+        },
+      },
+      required: ['path', 'content'],
+    },
+  };
+}
+
+/**
+ * Generate create_file tool definition (brain-aware)
+ */
+export function generateBrainCreateFileTool(): GeneratedToolDefinition {
+  return {
+    name: 'create_file',
+    description: `Create a NEW file (fails if file already exists).
+
+Use this when you want to create a new file and ensure you don't accidentally overwrite an existing one.
+If you need to update an existing file, use write_file or edit_file instead.
+
+Creates parent directories if they don't exist.
+Automatically updates the brain's knowledge graph after creation.
+
+Parameters:
+- path: Absolute or relative file path
+- content: Full file content to write
+
+Example: create_file({ path: "src/new-component.ts", content: "export const Component = () => {};" })`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'File path to create (absolute or relative to project root)',
+        },
+        content: {
+          type: 'string',
+          description: 'Full file content to write',
+        },
+      },
+      required: ['path', 'content'],
+    },
+  };
+}
+
+/**
+ * Generate edit_file tool definition (brain-aware)
+ */
+export function generateBrainEditFileTool(): GeneratedToolDefinition {
+  return {
+    name: 'edit_file',
+    description: `Edit a file using search/replace OR line numbers.
+
+**Method 1: Search/Replace**
+- old_string: Text to find and replace (line number prefixes like "00001| " are auto-stripped)
+- new_string: Replacement text
+
+**Method 2: Line Numbers**
+- start_line: First line to replace (1-based, from read_file output)
+- end_line: Last line to replace (inclusive)
+- new_string: New content for those lines
+
+**Method 3: Append**
+- append: true (adds new_string at the end of the file)
+- new_string: Content to append
+
+Automatically updates the brain's knowledge graph after editing.
+
+Examples:
+  edit_file({ path: "src/index.ts", old_string: "const x = 1;", new_string: "const x = 2;" })
+  edit_file({ path: "src/index.ts", start_line: 5, end_line: 7, new_string: "// replaced" })
+  edit_file({ path: "src/index.ts", append: true, new_string: "export function newFunc() {}" })`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'File path to edit',
+        },
+        old_string: {
+          type: 'string',
+          description: 'Text to find and replace (line number prefixes auto-stripped)',
+        },
+        new_string: {
+          type: 'string',
+          description: 'Replacement text (or content to append if append=true)',
+        },
+        start_line: {
+          type: 'number',
+          description: 'First line to replace (1-based). Use with end_line instead of old_string.',
+        },
+        end_line: {
+          type: 'number',
+          description: 'Last line to replace (1-based, inclusive).',
+        },
+        append: {
+          type: 'boolean',
+          description: 'If true, append new_string to end of file instead of replacing',
+        },
+        replace_all: {
+          type: 'boolean',
+          description: 'Replace all occurrences (default: false)',
+        },
+      },
+      required: ['path', 'new_string'],
+    },
+  };
+}
+
+/**
+ * Generate delete_path tool definition (brain-aware)
+ */
+export function generateBrainDeletePathTool(): GeneratedToolDefinition {
+  return {
+    name: 'delete_path',
+    description: `Delete a file or directory.
+
+By default, only deletes files and empty directories. Use recursive: true for non-empty directories.
+Automatically removes the deleted content from the brain's knowledge graph.
+
+Parameters:
+- path: File or directory to delete
+- recursive: Delete non-empty directories (default: false)
+
+Example: delete_path({ path: "src/old-file.ts" })
+Example: delete_path({ path: "temp", recursive: true })`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Path to delete',
+        },
+        recursive: {
+          type: 'boolean',
+          description: 'Delete non-empty directories (default: false, DANGEROUS)',
+        },
+      },
+      required: ['path'],
+    },
+  };
+}
+
+// ============================================
+// Brain-Aware File Tool Handlers
+// ============================================
+
+/**
+ * Check if a file is binary
+ */
+async function isBinaryFile(filePath: string): Promise<boolean> {
+  const fs = await import('fs/promises');
+  try {
+    const buffer = Buffer.alloc(512);
+    const fd = await fs.open(filePath, 'r');
+    const { bytesRead } = await fd.read(buffer, 0, 512, 0);
+    await fd.close();
+
+    // Check for null bytes (common in binary files)
+    for (let i = 0; i < bytesRead; i++) {
+      if (buffer[i] === 0) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Strip line number prefixes from text (e.g., "00005| const x" -> "const x")
+ */
+function stripLineNumberPrefix(text: string): string {
+  return text.replace(/^\s*\d+\|\s?/gm, '');
+}
+
+/**
+ * Generate handler for read_file (brain-aware)
+ */
+export function generateBrainReadFileHandler(ctx: BrainToolsContext) {
+  return async (params: { path: string; offset?: number; limit?: number }): Promise<any> => {
+    const { path: filePath, offset = 0, limit = DEFAULT_READ_LIMIT } = params;
+    const fs = await import('fs/promises');
+    const pathModule = await import('path');
+
+    // Resolve path (use cwd as fallback)
+    const absolutePath = pathModule.isAbsolute(filePath)
+      ? filePath
+      : pathModule.resolve(process.cwd(), filePath);
+
+    // Check file exists
+    try {
+      const stat = await fs.stat(absolutePath);
+      if (stat.isDirectory()) {
+        return { error: `Path is a directory, not a file: ${absolutePath}` };
+      }
+    } catch (err: any) {
+      if (err.code === 'ENOENT') {
+        return { error: `File not found: ${absolutePath}` };
+      }
+      throw err;
+    }
+
+    // Check if binary
+    if (await isBinaryFile(absolutePath)) {
+      return { error: `Cannot read binary file: ${absolutePath}` };
+    }
+
+    // Read file
+    const content = await fs.readFile(absolutePath, 'utf-8');
+    const lines = content.split('\n');
+    const totalLines = lines.length;
+
+    // Apply offset and limit
+    const selectedLines = lines.slice(offset, offset + limit);
+    const formattedLines = selectedLines.map((line, index) => {
+      const lineNum = (index + offset + 1).toString().padStart(5, '0');
+      const truncatedLine = line.length > MAX_LINE_LENGTH
+        ? line.substring(0, MAX_LINE_LENGTH) + '...'
+        : line;
+      return `${lineNum}| ${truncatedLine}`;
+    });
+
+    const lastReadLine = offset + selectedLines.length;
+    const hasMoreLines = totalLines > lastReadLine;
+
+    let output = formattedLines.join('\n');
+    if (hasMoreLines) {
+      output += `\n\n(File has more lines. Use offset=${lastReadLine} to continue. Total: ${totalLines} lines)`;
+    } else {
+      output += `\n\n(End of file - ${totalLines} lines)`;
+    }
+
+    return {
+      path: filePath,
+      absolute_path: absolutePath,
+      total_lines: totalLines,
+      lines_read: selectedLines.length,
+      offset,
+      has_more: hasMoreLines,
+      content: output,
+    };
+  };
+}
+
+/**
+ * Generate handler for write_file (brain-aware)
+ */
+export function generateBrainWriteFileHandler(ctx: BrainToolsContext) {
+  return async (params: { path: string; content: string }): Promise<any> => {
+    const { path: filePath, content } = params;
+    const fs = await import('fs/promises');
+    const pathModule = await import('path');
+    const crypto = await import('crypto');
+
+    // Resolve path
+    const absolutePath = pathModule.isAbsolute(filePath)
+      ? filePath
+      : pathModule.resolve(process.cwd(), filePath);
+
+    // Check if file exists (for change tracking)
+    let oldContent: string | null = null;
+    let changeType: 'created' | 'updated' = 'created';
+
+    try {
+      oldContent = await fs.readFile(absolutePath, 'utf-8');
+      changeType = 'updated';
+    } catch (err: any) {
+      if (err.code !== 'ENOENT') throw err;
+    }
+
+    // Create parent directories if needed
+    const parentDir = pathModule.dirname(absolutePath);
+    await fs.mkdir(parentDir, { recursive: true });
+
+    // Write file
+    await fs.writeFile(absolutePath, content, 'utf-8');
+    const newHash = crypto.createHash('sha256').update(content).digest('hex').substring(0, 16);
+
+    // Trigger re-ingestion
+    const ingestionResult = await triggerReIngestion(ctx.brain, absolutePath, changeType);
+
+    return {
+      path: filePath,
+      absolute_path: absolutePath,
+      change_type: changeType,
+      lines_written: content.split('\n').length,
+      hash: newHash,
+      rag_synced: !!ingestionResult,
+      ingestion_stats: ingestionResult?.stats,
+      project_id: ingestionResult?.projectId,
+    };
+  };
+}
+
+/**
+ * Generate handler for create_file (brain-aware)
+ */
+export function generateBrainCreateFileHandler(ctx: BrainToolsContext) {
+  return async (params: { path: string; content: string }): Promise<any> => {
+    const { path: filePath, content } = params;
+    const fs = await import('fs/promises');
+    const pathModule = await import('path');
+
+    // Resolve path
+    const absolutePath = pathModule.isAbsolute(filePath)
+      ? filePath
+      : pathModule.resolve(process.cwd(), filePath);
+
+    // Check if file already exists
+    try {
+      await fs.access(absolutePath);
+      return {
+        error: `File already exists: ${filePath}. Use write_file to overwrite or edit_file to modify.`,
+      };
+    } catch (err: any) {
+      if (err.code !== 'ENOENT') {
+        return { error: `Access error: ${err.message}` };
+      }
+    }
+
+    // Delegate to write_file handler
+    const writeHandler = generateBrainWriteFileHandler(ctx);
+    return writeHandler(params);
+  };
+}
+
+/**
+ * Generate handler for edit_file (brain-aware)
+ */
+export function generateBrainEditFileHandler(ctx: BrainToolsContext) {
+  return async (params: {
+    path: string;
+    old_string?: string;
+    new_string: string;
+    start_line?: number;
+    end_line?: number;
+    append?: boolean;
+    replace_all?: boolean;
+  }): Promise<any> => {
+    const { path: filePath, old_string, new_string, start_line, end_line, append, replace_all } = params;
+    const fs = await import('fs/promises');
+    const pathModule = await import('path');
+    const crypto = await import('crypto');
+
+    // Resolve path
+    const absolutePath = pathModule.isAbsolute(filePath)
+      ? filePath
+      : pathModule.resolve(process.cwd(), filePath);
+
+    // Read existing content
+    let oldContent: string;
+    try {
+      oldContent = await fs.readFile(absolutePath, 'utf-8');
+    } catch (err: any) {
+      if (err.code === 'ENOENT') {
+        return { error: `File not found: ${absolutePath}` };
+      }
+      throw err;
+    }
+
+    let newContent: string;
+
+    // Method 3: Append
+    if (append) {
+      newContent = oldContent + (oldContent.endsWith('\n') ? '' : '\n') + new_string;
+    }
+    // Method 2: Line numbers
+    else if (start_line !== undefined && end_line !== undefined) {
+      const lines = oldContent.split('\n');
+      const startIdx = start_line - 1; // Convert to 0-based
+      const endIdx = end_line; // end_line is inclusive, but slice end is exclusive
+
+      if (startIdx < 0 || endIdx > lines.length || startIdx >= endIdx) {
+        return { error: `Invalid line range: ${start_line}-${end_line} (file has ${lines.length} lines)` };
+      }
+
+      const newLines = new_string.split('\n');
+      lines.splice(startIdx, endIdx - startIdx, ...newLines);
+      newContent = lines.join('\n');
+    }
+    // Method 1: Search/replace
+    else if (old_string !== undefined) {
+      // Strip line number prefixes from old_string
+      const cleanOldString = stripLineNumberPrefix(old_string);
+
+      if (!oldContent.includes(cleanOldString)) {
+        return {
+          error: `old_string not found in file. Make sure the text matches exactly.`,
+          hint: 'Use read_file to see the current content.',
+        };
+      }
+
+      if (replace_all) {
+        newContent = oldContent.split(cleanOldString).join(new_string);
+      } else {
+        // Check for multiple occurrences
+        const count = oldContent.split(cleanOldString).length - 1;
+        if (count > 1) {
+          return {
+            error: `old_string appears ${count} times. Use replace_all: true or provide more context for unique match.`,
+          };
+        }
+        newContent = oldContent.replace(cleanOldString, new_string);
+      }
+    } else {
+      return { error: 'Must provide old_string, start_line/end_line, or append: true' };
+    }
+
+    // Write the modified content
+    await fs.writeFile(absolutePath, newContent, 'utf-8');
+    const newHash = crypto.createHash('sha256').update(newContent).digest('hex').substring(0, 16);
+
+    // Trigger re-ingestion
+    const ingestionResult = await triggerReIngestion(ctx.brain, absolutePath, 'updated');
+
+    return {
+      path: filePath,
+      absolute_path: absolutePath,
+      change_type: 'updated',
+      lines_before: oldContent.split('\n').length,
+      lines_after: newContent.split('\n').length,
+      hash: newHash,
+      rag_synced: !!ingestionResult,
+      ingestion_stats: ingestionResult?.stats,
+      project_id: ingestionResult?.projectId,
+    };
+  };
+}
+
+/**
+ * Generate handler for delete_path (brain-aware)
+ */
+export function generateBrainDeletePathHandler(ctx: BrainToolsContext) {
+  return async (params: { path: string; recursive?: boolean }): Promise<any> => {
+    const { path: filePath, recursive = false } = params;
+    const fs = await import('fs/promises');
+    const pathModule = await import('path');
+
+    // Resolve path
+    const absolutePath = pathModule.isAbsolute(filePath)
+      ? filePath
+      : pathModule.resolve(process.cwd(), filePath);
+
+    // Check if path exists
+    let stat;
+    try {
+      stat = await fs.stat(absolutePath);
+    } catch (err: any) {
+      if (err.code === 'ENOENT') {
+        return { error: `Path not found: ${absolutePath}` };
+      }
+      throw err;
+    }
+
+    const isDirectory = stat.isDirectory();
+
+    // Delete
+    if (isDirectory) {
+      if (recursive) {
+        await fs.rm(absolutePath, { recursive: true });
+      } else {
+        try {
+          await fs.rmdir(absolutePath);
+        } catch (err: any) {
+          if (err.code === 'ENOTEMPTY') {
+            return { error: `Directory not empty. Use recursive: true to delete non-empty directories.` };
+          }
+          throw err;
+        }
+      }
+    } else {
+      await fs.unlink(absolutePath);
+    }
+
+    // Trigger re-ingestion (will handle deletion in the project)
+    const ingestionResult = await triggerReIngestion(ctx.brain, absolutePath, 'deleted');
+
+    return {
+      path: filePath,
+      absolute_path: absolutePath,
+      deleted: true,
+      was_directory: isDirectory,
+      rag_synced: !!ingestionResult,
+      project_id: ingestionResult?.projectId,
+    };
+  };
+}
+
+// ============================================
 // Export all tools
 // ============================================
 
@@ -649,11 +1676,23 @@ export function generateListBrainProjectsHandler(ctx: BrainToolsContext) {
  */
 export function generateBrainTools(): GeneratedToolDefinition[] {
   return [
+    // Project management
+    generateCreateProjectTool(),
     generateIngestDirectoryTool(),
     generateIngestWebPageTool(),
     generateBrainSearchTool(),
     generateForgetPathTool(),
     generateListBrainProjectsTool(),
+    // File watcher management
+    generateListWatchersTool(),
+    generateStartWatcherTool(),
+    generateStopWatcherTool(),
+    // Brain-aware file tools
+    generateBrainReadFileTool(),
+    generateBrainWriteFileTool(),
+    generateBrainCreateFileTool(),
+    generateBrainEditFileTool(),
+    generateBrainDeletePathTool(),
   ];
 }
 
@@ -662,11 +1701,23 @@ export function generateBrainTools(): GeneratedToolDefinition[] {
  */
 export function generateBrainToolHandlers(ctx: BrainToolsContext): Record<string, (params: any) => Promise<any>> {
   return {
+    // Project management
+    create_project: generateCreateProjectHandler(ctx),
     ingest_directory: generateIngestDirectoryHandler(ctx),
     ingest_web_page: generateIngestWebPageHandler(ctx),
     brain_search: generateBrainSearchHandler(ctx),
     forget_path: generateForgetPathHandler(ctx),
     list_brain_projects: generateListBrainProjectsHandler(ctx),
+    // File watcher management
+    list_watchers: generateListWatchersHandler(ctx),
+    start_watcher: generateStartWatcherHandler(ctx),
+    stop_watcher: generateStopWatcherHandler(ctx),
+    // Brain-aware file tools
+    read_file: generateBrainReadFileHandler(ctx),
+    write_file: generateBrainWriteFileHandler(ctx),
+    create_file: generateBrainCreateFileHandler(ctx),
+    edit_file: generateBrainEditFileHandler(ctx),
+    delete_path: generateBrainDeletePathHandler(ctx),
   };
 }
 

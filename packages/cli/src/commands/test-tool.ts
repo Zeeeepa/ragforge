@@ -2,10 +2,14 @@
  * Test Tool Command
  *
  * CLI command to test MCP tools directly without needing Claude Code.
- * Useful for development and debugging.
+ * By default, uses the Brain Daemon for persistent state and faster execution.
  *
  * Usage:
  *   ragforge test-tool <tool-name> [--param1=value1] [--param2=value2]
+ *
+ * Options:
+ *   --no-daemon    Run without daemon (direct BrainManager, slower but no persistent state)
+ *   -v, --verbose  Show detailed output
  *
  * Examples:
  *   ragforge test-tool get_brain_status
@@ -24,11 +28,13 @@ import {
   type ImageToolsContext,
   type ThreeDToolsContext,
 } from '@luciformresearch/ragforge';
+import { callToolViaDaemon, isDaemonRunning, listTools } from './daemon-client.js';
 
 export interface TestToolOptions {
   toolName: string;
   params: Record<string, any>;
   verbose: boolean;
+  noDaemon: boolean;
 }
 
 export function parseTestToolOptions(args: string[]): TestToolOptions {
@@ -36,6 +42,7 @@ export function parseTestToolOptions(args: string[]): TestToolOptions {
     toolName: '',
     params: {},
     verbose: false,
+    noDaemon: false,
   };
 
   // Helper to parse values from CLI strings
@@ -61,6 +68,11 @@ export function parseTestToolOptions(args: string[]): TestToolOptions {
 
     if (arg === '-v' || arg === '--verbose') {
       options.verbose = true;
+      continue;
+    }
+
+    if (arg === '--no-daemon') {
+      options.noDaemon = true;
       continue;
     }
 
@@ -99,7 +111,11 @@ export function parseTestToolOptions(args: string[]): TestToolOptions {
 
 export async function runTestTool(options: TestToolOptions): Promise<void> {
   const globalStart = Date.now();
-  const log = (msg: string) => console.log(`[${Date.now() - globalStart}ms] ${msg}`);
+  const log = (msg: string) => {
+    if (options.verbose) {
+      console.log(`[${Date.now() - globalStart}ms] ${msg}`);
+    }
+  };
 
   if (!options.toolName) {
     console.error('Error: No tool name provided');
@@ -114,6 +130,14 @@ export async function runTestTool(options: TestToolOptions): Promise<void> {
   }
   console.log('');
 
+  // Use daemon by default for faster execution and persistent state
+  if (!options.noDaemon) {
+    await runTestToolViaDaemon(options);
+    return;
+  }
+
+  // Direct mode (--no-daemon): Initialize BrainManager directly
+  console.log('📦 Running in direct mode (no daemon)...');
   let brain: BrainManager | null = null;
 
   try {
@@ -190,15 +214,73 @@ export async function runTestTool(options: TestToolOptions): Promise<void> {
   }
 }
 
+/**
+ * Run a tool via the Brain Daemon (default mode)
+ * This is faster because the daemon keeps BrainManager alive between calls.
+ */
+async function runTestToolViaDaemon(options: TestToolOptions): Promise<void> {
+  const globalStart = Date.now();
+  const log = (msg: string) => {
+    if (options.verbose) {
+      console.log(`[${Date.now() - globalStart}ms] ${msg}`);
+    }
+  };
+
+  try {
+    log('⏳ Calling tool via daemon...');
+    const response = await callToolViaDaemon(options.toolName, options.params, {
+      verbose: options.verbose,
+    });
+
+    if (!response.success) {
+      console.error(`❌ Error: ${response.error}`);
+
+      // If tool not found, show available tools
+      if (response.error?.includes('Unknown tool')) {
+        const tools = await listTools();
+        if (tools.length > 0) {
+          console.log('\nAvailable tools:');
+          for (const name of tools) {
+            console.log(`  - ${name}`);
+          }
+        }
+      }
+      process.exitCode = 1;
+      return;
+    }
+
+    log(`✓ Tool execution completed in ${response.duration_ms}ms`);
+
+    console.log('\n📋 Result:');
+    console.log(JSON.stringify(response.result, null, 2));
+
+    if (options.verbose && response.duration_ms) {
+      console.log(`\n⏱️  Execution time: ${response.duration_ms}ms`);
+    }
+
+  } catch (error: any) {
+    console.error(`\n❌ Error: ${error.message}`);
+    if (options.verbose && error.stack) {
+      console.error('\nStack trace:');
+      console.error(error.stack);
+    }
+    process.exitCode = 1;
+  }
+}
+
 export function printTestToolHelp(): void {
   console.log(`
 ragforge test-tool - Test MCP tools directly from CLI
+
+By default, uses the Brain Daemon (port 6666) for faster execution.
+The daemon auto-starts if needed and shuts down after 5 min of inactivity.
 
 Usage:
   ragforge test-tool <tool-name> [--param1=value1] [--param2=value2] [-v]
 
 Options:
-  -v, --verbose    Show detailed error stack traces
+  -v, --verbose    Show detailed output and timing info
+  --no-daemon      Run without daemon (slower, no persistent state)
 
 Available Brain Tools:
   ingest_directory     Ingest a directory into the brain

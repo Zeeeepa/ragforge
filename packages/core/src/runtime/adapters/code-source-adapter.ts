@@ -153,6 +153,28 @@ export class CodeSourceAdapter extends SourceAdapter {
   }
 
   /**
+   * Compute file metadata for incremental ingestion
+   * Returns rawContentHash (for pre-parsing skip) and mtime
+   */
+  private async computeFileMetadata(filePath: string): Promise<{
+    rawContentHash?: string;
+    mtime?: string;
+  }> {
+    try {
+      const [fileContent, stat] = await Promise.all([
+        fs.readFile(filePath),
+        fs.stat(filePath)
+      ]);
+      return {
+        rawContentHash: createHash('sha256').update(fileContent).digest('hex'),
+        mtime: formatLocalDate(stat.mtime)
+      };
+    } catch {
+      return {};
+    }
+  }
+
+  /**
    * Get or initialize HTML parser
    */
   private async getHtmlParser(): Promise<HTMLDocumentParser> {
@@ -1009,17 +1031,11 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = fileName.includes('.') ? fileName.substring(fileName.lastIndexOf('.')) : '';
 
-      // Calculate content hash (SHA-256)
+      // Calculate content hash (SHA-256 of parsed scopes - for detecting semantic changes)
       const contentHash = createHash('sha256').update(analysis.scopes.map(s => s.content || '').join('')).digest('hex');
 
-      // Get file mtime for incremental ingestion
-      let mtime: string | undefined;
-      try {
-        const stat = await fs.stat(filePath);
-        mtime = formatLocalDate(stat.mtime);
-      } catch {
-        // File may have been deleted, ignore
-      }
+      // Compute file metadata for incremental ingestion
+      const { rawContentHash, mtime } = await this.computeFileMetadata(filePath);
 
       const fileUuid = `file:${relPath}`;
       nodes.push({
@@ -1032,6 +1048,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           directory,
           extension,
           contentHash,
+          ...(rawContentHash && { rawContentHash }),
           ...(mtime && { mtime }),
         }
       });
@@ -1309,6 +1326,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const fileName = relPath.split('/').pop() || relPath;
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = fileName.includes('.') ? fileName.substring(fileName.lastIndexOf('.')) : '';
+      const { rawContentHash, mtime } = await this.computeFileMetadata(filePath);
 
       nodes.push({
         labels: ['File'],
@@ -1318,7 +1336,9 @@ export class CodeSourceAdapter extends SourceAdapter {
           name: fileName,
           directory,
           extension,
-          contentHash: doc.hash
+          contentHash: doc.hash,
+          ...(rawContentHash && { rawContentHash }),
+          ...(mtime && { mtime }),
         }
       });
 
@@ -1480,6 +1500,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = fileName.includes('.') ? fileName.substring(fileName.lastIndexOf('.')) : '';
       const fileUuid = `file:${relPath}`;
+      const { rawContentHash, mtime } = await this.computeFileMetadata(filePath);
 
       nodes.push({
         labels: ['File'],
@@ -1490,7 +1511,9 @@ export class CodeSourceAdapter extends SourceAdapter {
           name: fileName,
           directory,
           extension,
-          contentHash: stylesheet.hash
+          contentHash: stylesheet.hash,
+          ...(rawContentHash && { rawContentHash }),
+          ...(mtime && { mtime }),
         }
       });
 
@@ -1613,6 +1636,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = fileName.includes('.') ? fileName.substring(fileName.lastIndexOf('.')) : '';
       const fileUuid = `file:${relPath}`;
+      const { rawContentHash: scssRawHash, mtime: scssMtime } = await this.computeFileMetadata(filePath);
 
       nodes.push({
         labels: ['File'],
@@ -1623,7 +1647,9 @@ export class CodeSourceAdapter extends SourceAdapter {
           name: fileName,
           directory,
           extension,
-          contentHash: stylesheet.hash
+          contentHash: stylesheet.hash,
+          ...(scssRawHash && { rawContentHash: scssRawHash }),
+          ...(scssMtime && { mtime: scssMtime }),
         }
       });
 
@@ -1682,6 +1708,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = '.vue';
       const fileUuid = `file:${relPath}`;
+      const { rawContentHash: vueRawHash, mtime: vueMtime } = await this.computeFileMetadata(filePath);
 
       nodes.push({
         labels: ['File'],
@@ -1692,7 +1719,9 @@ export class CodeSourceAdapter extends SourceAdapter {
           name: fileName,
           directory,
           extension,
-          contentHash: sfc.hash
+          contentHash: sfc.hash,
+          ...(vueRawHash && { rawContentHash: vueRawHash }),
+          ...(vueMtime && { mtime: vueMtime }),
         }
       });
 
@@ -1750,6 +1779,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = '.svelte';
       const fileUuid = `file:${relPath}`;
+      const { rawContentHash: svelteRawHash, mtime: svelteMtime } = await this.computeFileMetadata(filePath);
 
       nodes.push({
         labels: ['File'],
@@ -1760,7 +1790,9 @@ export class CodeSourceAdapter extends SourceAdapter {
           name: fileName,
           directory,
           extension,
-          contentHash: component.hash
+          contentHash: component.hash,
+          ...(svelteRawHash && { rawContentHash: svelteRawHash }),
+          ...(svelteMtime && { mtime: svelteMtime }),
         }
       });
 
@@ -1819,6 +1851,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = fileName.includes('.') ? fileName.substring(fileName.lastIndexOf('.')) : '';
       const fileUuid = `file:${relPath}`;
+      const { rawContentHash: mdRawHash, mtime: mdMtime } = await this.computeFileMetadata(filePath);
 
       nodes.push({
         labels: ['File'],
@@ -1829,7 +1862,9 @@ export class CodeSourceAdapter extends SourceAdapter {
           name: fileName,
           directory,
           extension,
-          contentHash: doc.hash
+          contentHash: doc.hash,
+          ...(mdRawHash && { rawContentHash: mdRawHash }),
+          ...(mdMtime && { mtime: mdMtime }),
         }
       });
 
@@ -1954,6 +1989,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = fileName.includes('.') ? fileName.substring(fileName.lastIndexOf('.')) : '';
       const fileUuid = `file:${relPath}`;
+      const { rawContentHash: genericRawHash, mtime: genericMtime } = await this.computeFileMetadata(filePath);
 
       nodes.push({
         labels: ['File'],
@@ -1964,7 +2000,9 @@ export class CodeSourceAdapter extends SourceAdapter {
           name: fileName,
           directory,
           extension,
-          contentHash: genericResult.hash
+          contentHash: genericResult.hash,
+          ...(genericRawHash && { rawContentHash: genericRawHash }),
+          ...(genericMtime && { mtime: genericMtime }),
         }
       });
 
@@ -2031,6 +2069,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = fileName.includes('.') ? fileName.substring(fileName.lastIndexOf('.')) : '';
       const fileUuid = `file:${relPath}`;
+      const { rawContentHash: dataRawHash, mtime: dataMtime } = await this.computeFileMetadata(filePath);
 
       nodes.push({
         labels: ['File'],
@@ -2041,7 +2080,9 @@ export class CodeSourceAdapter extends SourceAdapter {
           name: fileName,
           directory,
           extension,
-          contentHash: dataInfo.hash
+          contentHash: dataInfo.hash,
+          ...(dataRawHash && { rawContentHash: dataRawHash }),
+          ...(dataMtime && { mtime: dataMtime }),
         }
       });
 
@@ -2225,6 +2266,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = path.extname(relPath);
       const fileUuid = `file:${relPath}`;
+      const { rawContentHash: mediaRawHash, mtime: mediaMtime } = await this.computeFileMetadata(filePath);
 
       nodes.push({
         labels: ['File'],
@@ -2235,7 +2277,9 @@ export class CodeSourceAdapter extends SourceAdapter {
           name: fileName,
           directory,
           extension,
-          contentHash: mediaInfo.hash
+          contentHash: mediaInfo.hash,
+          ...(mediaRawHash && { rawContentHash: mediaRawHash }),
+          ...(mediaMtime && { mtime: mediaMtime }),
         }
       });
 
@@ -2316,6 +2360,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = path.extname(relPath);
       const fileUuid = `file:${relPath}`;
+      const { rawContentHash: docRawHash, mtime: docMtime } = await this.computeFileMetadata(filePath);
 
       nodes.push({
         labels: ['File'],
@@ -2326,7 +2371,9 @@ export class CodeSourceAdapter extends SourceAdapter {
           name: fileName,
           directory,
           extension,
-          contentHash: docInfo.hash
+          contentHash: docInfo.hash,
+          ...(docRawHash && { rawContentHash: docRawHash }),
+          ...(docMtime && { mtime: docMtime }),
         }
       });
 

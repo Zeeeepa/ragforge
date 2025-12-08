@@ -10,6 +10,8 @@ import type { ParsedGraph, ParsedNode, ParsedRelationship, SourceConfig, SourceA
 import { UniversalSourceAdapter } from './universal-source-adapter.js';
 import { ChangeTracker } from './change-tracker.js';
 import { isStructuralNode } from '../../utils/node-schema.js';
+import { createHash } from 'crypto';
+import { globby } from 'globby';
 
 export interface IncrementalStats {
   unchanged: number;
@@ -100,6 +102,137 @@ export class IncrementalIngestionManager {
       });
     }
     return hashes;
+  }
+
+  /**
+   * Get existing File nodes with their rawContentHash for a project
+   * Used for pre-parsing incremental check
+   *
+   * @param projectId - Project ID to query
+   * @returns Map of relative file path -> rawContentHash
+   */
+  async getExistingFileHashes(projectId: string): Promise<Map<string, string>> {
+    const query = `
+      MATCH (f:File)-[:BELONGS_TO]->(p:Project {uuid: $projectId})
+      WHERE f.rawContentHash IS NOT NULL
+      RETURN f.path AS path, f.rawContentHash AS hash
+    `;
+
+    const result = await this.client.run(query, { projectId });
+
+    const hashes = new Map<string, string>();
+    for (const record of result.records) {
+      const filePath = record.get('path');
+      const hash = record.get('hash');
+      if (filePath && hash) {
+        hashes.set(filePath, hash);
+      }
+    }
+    return hashes;
+  }
+
+  /**
+   * Compute raw content hash for a file (SHA-256)
+   * Fast operation - just reads file and hashes it, no parsing
+   */
+  static async computeFileHash(filePath: string): Promise<string> {
+    const fs = await import('fs/promises');
+    const content = await fs.readFile(filePath);
+    return createHash('sha256').update(content).digest('hex');
+  }
+
+  /**
+   * Filter files to only those that have changed (based on rawContentHash)
+   *
+   * This is the KEY optimization for incremental ingestion:
+   * - Reads file content (fast)
+   * - Computes hash (fast)
+   * - Compares with DB hash (fast)
+   * - Only changed files will be parsed (expensive operation skipped for unchanged)
+   *
+   * @param config - Source configuration with include/exclude patterns
+   * @param projectId - Project ID to compare against
+   * @param verbose - Enable verbose logging
+   * @returns Object with changedFiles (to parse) and unchangedFiles (to skip)
+   */
+  async filterChangedFiles(
+    config: SourceConfig,
+    projectId: string,
+    verbose: boolean = false
+  ): Promise<{
+    allFiles: string[];
+    changedFiles: string[];
+    unchangedFiles: Set<string>;
+    newHashes: Map<string, string>;
+  }> {
+    const fs = await import('fs/promises');
+    const pathModule = await import('path');
+    const pLimit = (await import('p-limit')).default;
+
+    const rootPath = config.root || process.cwd();
+    const patterns = config.include || ['**/*'];
+    const ignore = config.exclude || [
+      '**/node_modules/**',
+      '**/dist/**',
+      '**/.git/**',
+      '**/.ragforge/**',
+    ];
+
+    // 1. Discover all files matching patterns
+    const allFiles = await globby(patterns, {
+      cwd: rootPath,
+      ignore,
+      absolute: true,
+    });
+
+    if (verbose) {
+      console.log(`🔍 Discovered ${allFiles.length} files`);
+    }
+
+    // 2. Get existing hashes from DB
+    const existingHashes = await this.getExistingFileHashes(projectId);
+    if (verbose) {
+      console.log(`📊 Found ${existingHashes.size} files with hashes in database`);
+    }
+
+    // 3. Compute hashes for current files in parallel (fast - just read + hash)
+    const limit = pLimit(20); // Higher concurrency since we're just reading
+    const newHashes = new Map<string, string>();
+    const changedFiles: string[] = [];
+    const unchangedFiles = new Set<string>();
+
+    await Promise.all(
+      allFiles.map(file =>
+        limit(async () => {
+          try {
+            const relPath = pathModule.relative(rootPath, file);
+            const hash = await IncrementalIngestionManager.computeFileHash(file);
+            newHashes.set(relPath, hash);
+
+            const existingHash = existingHashes.get(relPath);
+            if (existingHash === hash) {
+              // File unchanged - skip parsing
+              unchangedFiles.add(relPath);
+            } else {
+              // File new or changed - needs parsing
+              changedFiles.push(file);
+            }
+          } catch (err) {
+            // File might have been deleted, include it for processing
+            changedFiles.push(file);
+          }
+        })
+      )
+    );
+
+    if (verbose) {
+      console.log(`✅ Hash comparison: ${changedFiles.length} changed, ${unchangedFiles.size} unchanged`);
+      if (unchangedFiles.size > 0 && changedFiles.length === 0) {
+        console.log(`⚡ All files unchanged - skipping parsing entirely`);
+      }
+    }
+
+    return { allFiles, changedFiles, unchangedFiles, newHashes };
   }
 
   /**
@@ -560,6 +693,8 @@ export class IncrementalIngestionManager {
   /**
    * High-level method to ingest content from configured source
    *
+   * OPTIMIZED: Pre-parsing hash check skips unchanged files entirely
+   *
    * @param config - Source configuration (code, documents, etc.)
    * @param options - Ingestion options including projectId
    */
@@ -576,7 +711,7 @@ export class IncrementalIngestionManager {
       const sourceType = config.type === 'code' ? 'code' : 'files';
       console.log(`\n🔄 Ingesting ${sourceType} from ${pathCount} path(s)...`);
       console.log(`   Base path: ${config.root || '.'}`);
-      console.log(`   Mode: ${incremental ? 'incremental' : 'full'}`);
+      console.log(`   Mode: ${incremental ? 'incremental (with pre-parsing hash check)' : 'full'}`);
       if (projectId) {
         console.log(`   Project: ${projectId}`);
       }
@@ -585,10 +720,43 @@ export class IncrementalIngestionManager {
       }
     }
 
-    // Create adapter and parse
+    // ===== PRE-PARSING OPTIMIZATION =====
+    // Check file hashes BEFORE parsing to skip unchanged files entirely
+    // This is the key optimization that makes re-ingestion fast
+    let skipFiles: Set<string> | undefined;
+    let newHashes: Map<string, string> | undefined;
+
+    if (incremental && projectId) {
+      const filterStart = Date.now();
+      const filterResult = await this.filterChangedFiles(config, projectId, verbose);
+      const filterMs = Date.now() - filterStart;
+
+      skipFiles = filterResult.unchangedFiles;
+      newHashes = filterResult.newHashes;
+
+      if (verbose) {
+        console.log(`   Pre-parsing check took ${filterMs}ms`);
+      }
+
+      // If ALL files are unchanged, return early with zero changes
+      if (filterResult.changedFiles.length === 0 && filterResult.unchangedFiles.size > 0) {
+        if (verbose) {
+          console.log(`\n⚡ No files changed - skipping parsing entirely!`);
+        }
+        return {
+          unchanged: filterResult.unchangedFiles.size,
+          updated: 0,
+          created: 0,
+          deleted: 0
+        };
+      }
+    }
+
+    // Create adapter and parse (only changed files if incremental)
     const adapter = getAdapter();
     const parseResult = await adapter.parse({
       source: config,
+      skipFiles, // Pass unchanged files to skip
       onProgress: undefined
     });
 
@@ -607,14 +775,33 @@ export class IncrementalIngestionManager {
       console.log(`\n✅ Parsed ${countStr} from source`);
     }
 
+    // Add rawContentHash to File nodes (for future incremental checks)
+    if (newHashes) {
+      for (const node of parseResult.graph.nodes) {
+        if (node.labels.includes('File') && node.properties.path) {
+          const hash = newHashes.get(node.properties.path as string);
+          if (hash) {
+            node.properties.rawContentHash = hash;
+          }
+        }
+      }
+    }
+
     // Ingest with projectId
     if (incremental) {
-      return await this.ingestIncremental(parseResult.graph, {
+      const stats = await this.ingestIncremental(parseResult.graph, {
         projectId,
         verbose,
         dryRun,
         trackChanges
       });
+
+      // Add skipped files to unchanged count
+      if (skipFiles) {
+        stats.unchanged += skipFiles.size;
+      }
+
+      return stats;
     } else {
       // Full ingestion - add projectId to nodes
       if (projectId) {

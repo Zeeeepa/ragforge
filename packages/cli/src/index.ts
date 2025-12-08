@@ -53,6 +53,11 @@ import {
   runTestTool,
   printTestToolHelp
 } from './commands/test-tool.js';
+import {
+  startDaemon,
+  stopDaemon,
+  getDaemonStatus,
+} from './commands/daemon.js';
 
 import { VERSION } from './version.js';
 
@@ -74,6 +79,7 @@ Usage:
   ragforge agent [options]           Launch RagForge agent (RAG + File + Project tools)
   ragforge mcp-server [options]      Start as MCP server (for Claude Code)
   ragforge test-tool <name> [opts]   Test a tool directly (for debugging)
+  ragforge daemon <cmd>              Brain daemon management (start|stop|status)
   ragforge init [options]            Complete setup (introspect + generate)
   ragforge help <command>            Show detailed help for a specific command
 
@@ -107,6 +113,49 @@ Examples:
 
 function printVersion(): void {
   console.log(VERSION);
+}
+
+function printDaemonHelp(): void {
+  console.log(`
+ragforge daemon - Brain Daemon Management
+
+The Brain Daemon keeps BrainManager alive between tool calls for faster execution
+and persistent file watchers. It auto-starts when using test-tool and shuts down
+after 5 minutes of inactivity.
+
+Usage:
+  ragforge daemon start [-v]    Start the daemon (foreground)
+  ragforge daemon stop          Stop the running daemon
+  ragforge daemon status        Show daemon status and statistics
+
+Options:
+  -v, --verbose    Show verbose output during daemon startup
+
+Endpoints (port 6969):
+  GET  /health     Health check
+  GET  /status     Detailed daemon status
+  GET  /tools      List available tools
+  GET  /projects   List loaded projects
+  GET  /watchers   List active file watchers
+  GET  /logs       View recent daemon logs
+  POST /tool/:name Execute a tool
+  POST /shutdown   Graceful shutdown
+
+Logs: ~/.ragforge/logs/daemon.log
+
+Examples:
+  # Check if daemon is running
+  ragforge daemon status
+
+  # Start daemon in foreground (for debugging)
+  ragforge daemon start -v
+
+  # Stop the daemon
+  ragforge daemon stop
+
+  # Call a tool via daemon (auto-starts if needed)
+  ragforge test-tool get_brain_status
+`);
 }
 
 async function main(): Promise<void> {
@@ -148,6 +197,9 @@ async function main(): Promise<void> {
             break;
           case 'test-tool':
             printTestToolHelp();
+            break;
+          case 'daemon':
+            printDaemonHelp();
             break;
           case 'init':
             printInitHelp();
@@ -193,6 +245,24 @@ async function main(): Promise<void> {
       case 'test-tool': {
         const options = parseTestToolOptions(rest);
         await runTestTool(options);
+        return;
+      }
+
+      case 'daemon': {
+        const subcommand = rest[0];
+        switch (subcommand) {
+          case 'start':
+            await startDaemon({ verbose: rest.includes('-v') || rest.includes('--verbose') });
+            break;
+          case 'stop':
+            await stopDaemon();
+            break;
+          case 'status':
+            await getDaemonStatus();
+            break;
+          default:
+            printDaemonHelp();
+        }
         return;
       }
 

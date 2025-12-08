@@ -133,6 +133,7 @@ export interface QuickIngestResult {
     embeddingsGenerated?: number;
   };
   configPath: string;
+  watching?: boolean;
 }
 
 export interface BrainSearchOptions {
@@ -1001,6 +1002,18 @@ volumes:
         await this.saveProjectsRegistry();
       }
 
+      // Start file watcher if requested
+      let watching = false;
+      if (options.watch) {
+        try {
+          await this.startWatching(absolutePath, { verbose: false });
+          watching = true;
+          console.log(`[QuickIngest] File watcher started for ${projectId}`);
+        } catch (err: any) {
+          console.warn(`[QuickIngest] Could not start file watcher: ${err.message}`);
+        }
+      }
+
       const elapsed = Date.now() - startTime;
       console.log(`[QuickIngest] Completed in ${elapsed}ms`);
 
@@ -1012,6 +1025,7 @@ volumes:
           embeddingsGenerated: options.generateEmbeddings ? embeddingsGenerated : undefined,
         },
         configPath: absolutePath,
+        watching,
       };
     } finally {
       release();
@@ -1896,7 +1910,40 @@ volumes:
       },
     });
 
-    // Start watching
+    // Initial sync: catch up with any changes since last ingestion
+    console.log(`[Brain] Initial sync for project: ${projectId}...`);
+    try {
+      const syncResult = await ingestionManager.ingestFromPaths(
+        sourceConfig,
+        { projectId, verbose: options.verbose ?? false, incremental: true }
+      );
+
+      if (syncResult.created + syncResult.updated + syncResult.deleted > 0) {
+        console.log(`[Brain] Initial sync: +${syncResult.created} created, ~${syncResult.updated} updated, -${syncResult.deleted} deleted`);
+
+        // Generate embeddings for synced files if needed
+        if (this.embeddingService?.canGenerateEmbeddings()) {
+          console.log(`[Brain] Generating embeddings for synced files...`);
+          try {
+            const embedResult = await this.embeddingService.generateMultiEmbeddings({
+              projectId,
+              incrementalOnly: true,
+              verbose: options.verbose ?? false,
+            });
+            console.log(`[Brain] Embeddings: ${embedResult.totalEmbedded} generated, ${embedResult.skippedCount} cached`);
+          } catch (err: any) {
+            console.warn(`[Brain] Embedding generation failed: ${err.message}`);
+          }
+        }
+      } else {
+        console.log(`[Brain] Initial sync: no changes detected`);
+      }
+    } catch (err: any) {
+      console.warn(`[Brain] Initial sync failed: ${err.message}`);
+      // Continue with watcher anyway
+    }
+
+    // Start watching for future changes
     await watcher.start();
     this.activeWatchers.set(projectId, watcher);
 
