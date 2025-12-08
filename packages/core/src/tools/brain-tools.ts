@@ -884,8 +884,10 @@ export function generateListBrainProjectsHandler(ctx: BrainToolsContext) {
       type: string;
       lastAccessed: string;
       nodeCount: number;
+      excluded: boolean;
     }>;
     count: number;
+    excludedCount: number;
   }> => {
     // Use listProjectsWithCounts for real-time node counts from Neo4j
     const projectsWithCounts = await ctx.brain.listProjectsWithCounts();
@@ -895,12 +897,130 @@ export function generateListBrainProjectsHandler(ctx: BrainToolsContext) {
       type: p.type,
       lastAccessed: p.lastAccessed.toISOString(),
       nodeCount: p.nodeCount,
+      excluded: p.excluded ?? false,
     }));
 
     return {
       projects,
       count: projects.length,
+      excludedCount: projects.filter(p => p.excluded).length,
     };
+  };
+}
+
+// ============================================
+// Project Exclusion Tools
+// ============================================
+
+/**
+ * Generate exclude_project tool definition
+ */
+export function generateExcludeProjectTool(): GeneratedToolDefinition {
+  return {
+    name: 'exclude_project',
+    description: `Exclude a project from brain_search results.
+
+Use this to temporarily hide a project from search results without deleting it.
+Useful for:
+- Reference projects you don't want cluttering results
+- Noisy projects during focused work
+- Temporarily disabling a project
+
+The project data remains in the brain and can be included again later.
+You can still search the excluded project explicitly by passing its ID in the 'projects' parameter.
+
+Example: exclude_project({ project_id: "references-opencode-xyz" })`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: {
+          type: 'string',
+          description: 'ID of the project to exclude from brain_search',
+        },
+      },
+      required: ['project_id'],
+    },
+  };
+}
+
+/**
+ * Generate handler for exclude_project
+ */
+export function generateExcludeProjectHandler(ctx: BrainToolsContext) {
+  return async (params: { project_id: string }): Promise<{
+    success: boolean;
+    project_id: string;
+    message: string;
+  }> => {
+    const { project_id } = params;
+    const success = await ctx.brain.excludeProject(project_id);
+
+    if (success) {
+      return {
+        success: true,
+        project_id,
+        message: `Project "${project_id}" excluded from brain_search. Use include_project to re-enable.`,
+      };
+    } else {
+      return {
+        success: false,
+        project_id,
+        message: `Project "${project_id}" not found. Use list_brain_projects to see available projects.`,
+      };
+    }
+  };
+}
+
+/**
+ * Generate include_project tool definition
+ */
+export function generateIncludeProjectTool(): GeneratedToolDefinition {
+  return {
+    name: 'include_project',
+    description: `Include a previously excluded project back in brain_search results.
+
+Use this to re-enable a project that was excluded with exclude_project.
+The project will appear in brain_search results again.
+
+Example: include_project({ project_id: "references-opencode-xyz" })`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: {
+          type: 'string',
+          description: 'ID of the project to include back in brain_search',
+        },
+      },
+      required: ['project_id'],
+    },
+  };
+}
+
+/**
+ * Generate handler for include_project
+ */
+export function generateIncludeProjectHandler(ctx: BrainToolsContext) {
+  return async (params: { project_id: string }): Promise<{
+    success: boolean;
+    project_id: string;
+    message: string;
+  }> => {
+    const { project_id } = params;
+    const success = await ctx.brain.includeProject(project_id);
+
+    if (success) {
+      return {
+        success: true,
+        project_id,
+        message: `Project "${project_id}" included back in brain_search.`,
+      };
+    } else {
+      return {
+        success: false,
+        project_id,
+        message: `Project "${project_id}" not found. Use list_brain_projects to see available projects.`,
+      };
+    }
   };
 }
 
@@ -1740,6 +1860,9 @@ export function generateBrainTools(): GeneratedToolDefinition[] {
     generateBrainSearchTool(),
     generateForgetPathTool(),
     generateListBrainProjectsTool(),
+    // Project exclusion
+    generateExcludeProjectTool(),
+    generateIncludeProjectTool(),
     // File watcher management
     generateListWatchersTool(),
     generateStartWatcherTool(),
@@ -1765,6 +1888,9 @@ export function generateBrainToolHandlers(ctx: BrainToolsContext): Record<string
     brain_search: generateBrainSearchHandler(ctx),
     forget_path: generateForgetPathHandler(ctx),
     list_brain_projects: generateListBrainProjectsHandler(ctx),
+    // Project exclusion
+    exclude_project: generateExcludeProjectHandler(ctx),
+    include_project: generateIncludeProjectHandler(ctx),
     // File watcher management
     list_watchers: generateListWatchersHandler(ctx),
     start_watcher: generateStartWatcherHandler(ctx),
