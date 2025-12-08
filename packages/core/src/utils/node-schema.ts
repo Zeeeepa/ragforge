@@ -207,6 +207,115 @@ export const TYPE_INDEXES: Record<string, string[]> = {
 };
 
 /**
+ * Schema definitions for content nodes.
+ * Only REQUIRED properties are listed - these define the "shape" of each node type.
+ * Optional properties (docstring, returnType, embeddings, etc.) are NOT included.
+ *
+ * The schema hash is computed from these required properties only,
+ * ensuring nodes of the same type get the same schemaVersion regardless
+ * of which optional properties they have.
+ */
+export const NODE_SCHEMAS: Record<string, { required: string[] }> = {
+  // Code scopes (functions, classes, methods, etc.)
+  Scope: {
+    required: ['name', 'type', 'file', 'language', 'startLine', 'endLine', 'linesOfCode', 'source', 'signature'],
+  },
+
+  // Markdown documents
+  MarkdownDocument: {
+    required: ['file', 'type', 'title', 'sectionCount', 'codeBlockCount', 'linkCount', 'imageCount', 'wordCount'],
+  },
+
+  // Markdown sections (headings)
+  MarkdownSection: {
+    required: ['title', 'level', 'content', 'file', 'startLine', 'endLine', 'slug'],
+  },
+
+  // Code blocks in markdown
+  CodeBlock: {
+    required: ['file', 'language', 'code', 'rawText', 'startLine', 'endLine', 'linesOfCode'],
+  },
+
+  // Web pages
+  WebPage: {
+    required: ['url', 'title', 'textContent', 'headingCount', 'linkCount', 'depth', 'crawledAt'],
+  },
+
+  // Media files (base type)
+  MediaFile: {
+    required: ['file', 'path', 'format', 'category', 'sizeBytes'],
+  },
+
+  // Image files
+  ImageFile: {
+    required: ['file', 'path', 'format', 'category', 'sizeBytes'],
+  },
+
+  // 3D model files
+  ThreeDFile: {
+    required: ['file', 'path', 'format', 'category', 'sizeBytes'],
+  },
+
+  // Document files (PDF, Word, etc.)
+  DocumentFile: {
+    required: ['file', 'path', 'format', 'category', 'sizeBytes'],
+  },
+
+  // PDF documents
+  PDFDocument: {
+    required: ['file', 'path', 'format', 'category', 'sizeBytes'],
+  },
+
+  // Word documents
+  WordDocument: {
+    required: ['file', 'path', 'format', 'category', 'sizeBytes'],
+  },
+
+  // Spreadsheet documents
+  SpreadsheetDocument: {
+    required: ['file', 'path', 'format', 'category', 'sizeBytes'],
+  },
+
+  // Vue single file components
+  VueSFC: {
+    required: ['file', 'type', 'templateStartLine', 'templateEndLine'],
+  },
+
+  // Svelte components
+  SvelteComponent: {
+    required: ['file', 'type', 'templateStartLine', 'templateEndLine'],
+  },
+
+  // CSS/SCSS stylesheets
+  Stylesheet: {
+    required: ['file', 'type', 'ruleCount'],
+  },
+
+  // Data files (JSON, YAML, etc.)
+  DataFile: {
+    required: ['file', 'type', 'format'],
+  },
+
+  // Generic/unknown code files
+  GenericFile: {
+    required: ['file', 'type', 'language', 'linesOfCode'],
+  },
+
+  // HTML documents
+  WebDocument: {
+    required: ['file', 'type', 'title'],
+  },
+};
+
+/**
+ * Get the required properties for a node type.
+ * Returns undefined if the type is not defined (fallback to dynamic computation).
+ */
+export function getRequiredProperties(nodeType: string): string[] | undefined {
+  return NODE_SCHEMAS[nodeType]?.required;
+}
+
+/**
  * Get additional indexes needed for a node type
  *
  * @param label - The node label
