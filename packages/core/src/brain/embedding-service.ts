@@ -16,6 +16,7 @@
  */
 
 import * as crypto from 'crypto';
+import neo4j from 'neo4j-driver';
 import type { Neo4jClient } from '../runtime/client/neo4j-client.js';
 import { GeminiEmbeddingProvider } from '../runtime/embedding/embedding-provider.js';
 
@@ -208,11 +209,10 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
     limit: 500,
   },
   {
-    label: 'MarkdownDocument',
-    query: `MATCH (m:MarkdownDocument {projectId: $projectId})
-            RETURN m.uuid AS uuid, m.path AS path, m.rawText AS rawText, m.title AS title,
+    label: 'MarkupDocument',
+    query: `MATCH (m:MarkupDocument {projectId: $projectId})
+            RETURN m.uuid AS uuid, m.file AS path, m.title AS title,
                    m.embedding_name_hash AS embedding_name_hash,
-                   m.embedding_content_hash AS embedding_content_hash,
                    m.embedding_description_hash AS embedding_description_hash
             LIMIT $limit`,
     embeddings: [
@@ -226,17 +226,58 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
         },
       },
       {
-        propertyName: 'embedding_content',
-        hashProperty: 'embedding_content_hash',
-        textExtractor: (r) => r.get('rawText') || '',
-      },
-      {
         propertyName: 'embedding_description',
         hashProperty: 'embedding_description_hash',
         textExtractor: (r) => r.get('title') || '',
       },
     ],
     limit: 500,
+  },
+  {
+    label: 'MarkdownSection',
+    query: `MATCH (s:MarkdownSection {projectId: $projectId})
+            RETURN s.uuid AS uuid, s.title AS title, s.content AS content, s.ownContent AS ownContent,
+                   s.embedding_name_hash AS embedding_name_hash,
+                   s.embedding_content_hash AS embedding_content_hash
+            LIMIT $limit`,
+    embeddings: [
+      {
+        propertyName: 'embedding_name',
+        hashProperty: 'embedding_name_hash',
+        textExtractor: (r) => r.get('title') || '',
+      },
+      {
+        propertyName: 'embedding_content',
+        hashProperty: 'embedding_content_hash',
+        textExtractor: (r) => r.get('ownContent') || r.get('content') || '',
+      },
+    ],
+    limit: 2000,
+  },
+  {
+    label: 'CodeBlock',
+    query: `MATCH (c:CodeBlock {projectId: $projectId})
+            WHERE c.code IS NOT NULL AND size(c.code) > 10
+            RETURN c.uuid AS uuid, c.language AS language, c.code AS code,
+                   c.embedding_name_hash AS embedding_name_hash,
+                   c.embedding_content_hash AS embedding_content_hash
+            LIMIT $limit`,
+    embeddings: [
+      {
+        propertyName: 'embedding_name',
+        hashProperty: 'embedding_name_hash',
+        textExtractor: (r) => {
+          const lang = r.get('language') || 'code';
+          return `${lang} code block`;
+        },
+      },
+      {
+        propertyName: 'embedding_content',
+        hashProperty: 'embedding_content_hash',
+        textExtractor: (r) => r.get('code') || '',
+      },
+    ],
+    limit: 2000,
   },
   {
     label: 'DataFile',
@@ -592,7 +633,7 @@ export class EmbeddingService {
     }
   ): Promise<{ totalNodes: number; embeddedCount: number; skippedCount: number }> {
     const { projectId, incrementalOnly, maxTextLength, batchSize, verbose } = options;
-    const limit = config.limit ?? 2000;
+    const limit = neo4j.int(config.limit ?? 2000);
 
     // Fetch nodes
     const result = await this.neo4jClient.run(config.query, { projectId, limit });
@@ -778,7 +819,7 @@ export class EmbeddingService {
     skippedCount: number;
   }> {
     const { projectId, incrementalOnly, maxTextLength, batchSize, verbose, embeddingTypes } = options;
-    const limit = config.limit ?? 2000;
+    const limit = neo4j.int(config.limit ?? 2000);
 
     // Fetch nodes
     const result = await this.neo4jClient.run(config.query, { projectId, limit });
@@ -848,16 +889,31 @@ export class EmbeddingService {
           hash: n.newHash,
         }));
 
-        // Dynamic property names
+        // Use specific queries for each embedding type (Neo4j doesn't support dynamic property names)
         const embeddingProp = embeddingConfig.propertyName;
         const hashProp = embeddingConfig.hashProperty;
 
-        await this.neo4jClient.run(
-          `UNWIND $batch AS item
+        let cypher: string;
+        if (embeddingProp === 'embedding_name') {
+          cypher = `UNWIND $batch AS item
            MATCH (n {uuid: item.uuid})
-           SET n[\`${embeddingProp}\`] = item.embedding, n[\`${hashProp}\`] = item.hash`,
-          { batch }
-        );
+           SET n.embedding_name = item.embedding, n.embedding_name_hash = item.hash`;
+        } else if (embeddingProp === 'embedding_content') {
+          cypher = `UNWIND $batch AS item
+           MATCH (n {uuid: item.uuid})
+           SET n.embedding_content = item.embedding, n.embedding_content_hash = item.hash`;
+        } else if (embeddingProp === 'embedding_description') {
+          cypher = `UNWIND $batch AS item
+           MATCH (n {uuid: item.uuid})
+           SET n.embedding_description = item.embedding, n.embedding_description_hash = item.hash`;
+        } else {
+          // Fallback for legacy 'embedding' property
+          cypher = `UNWIND $batch AS item
+           MATCH (n {uuid: item.uuid})
+           SET n.embedding = item.embedding, n.embedding_hash = item.hash`;
+        }
+
+        await this.neo4jClient.run(cypher, { batch });
       }
 
       embeddedByType[embeddingType] += nodesToEmbed.length;

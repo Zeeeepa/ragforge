@@ -32,6 +32,7 @@ import { FileWatcher, type FileWatcherConfig } from '../runtime/adapters/file-wa
 import { IncrementalIngestionManager } from '../runtime/adapters/incremental-ingestion.js';
 import { IngestionLock, getGlobalIngestionLock } from '../tools/ingestion-lock.js';
 import neo4j from 'neo4j-driver';
+import { matchesGlob } from '../runtime/utils/pattern-matching.js';
 
 const execAsync = promisify(exec);
 
@@ -153,6 +154,8 @@ export interface BrainSearchOptions {
   embeddingType?: 'name' | 'content' | 'description' | 'all';
   /** Text pattern match */
   textMatch?: string;
+  /** Glob pattern to filter by file path. Matches against the 'file' or 'path' property of nodes */
+  glob?: string;
   /** Result limit */
   limit?: number;
   /** Result offset */
@@ -976,12 +979,12 @@ volumes:
           console.warn('[QuickIngest] ⚠️ GEMINI_API_KEY not found, skipping embeddings');
         } else {
           try {
-            const embeddingResult = await this.embeddingService.generateEmbeddings({
+            const embeddingResult = await this.embeddingService.generateMultiEmbeddings({
               projectId,
               incrementalOnly: true,
               verbose: true,
             });
-            embeddingsGenerated = embeddingResult.embeddedCount;
+            embeddingsGenerated = embeddingResult.totalEmbedded;
           } catch (err: any) {
             console.error(`[QuickIngest] ⚠️ Embedding generation failed: ${err.message}`);
           }
@@ -1104,6 +1107,274 @@ volumes:
   }
 
   // ============================================
+  // Content Update (for OCR, descriptions, etc.)
+  // ============================================
+
+  /**
+   * Update media content with extracted text/description
+   * Used by read_image, describe_image, analyze_visual, etc.
+   */
+  async updateMediaContent(params: {
+    filePath: string;
+    textContent?: string;
+    description?: string;
+    ocrConfidence?: number;
+    extractionMethod?: string;
+    generateEmbeddings?: boolean;
+    /** Source files used to create this file (creates GENERATED_FROM relationships) */
+    sourceFiles?: string[];
+  }): Promise<{ updated: boolean; nodeId?: string }> {
+    if (!this.neo4jClient) {
+      throw new Error('Brain not initialized. Call initialize() first.');
+    }
+
+    const { filePath, textContent, description, ocrConfidence, extractionMethod, generateEmbeddings, sourceFiles } = params;
+    const pathModule = await import('path');
+    const fs = await import('fs/promises');
+
+    // Check if file is in a known project
+    const projectsResult = await this.neo4jClient.run(
+      `MATCH (p:Project) RETURN p.projectId as projectId, p.rootPath as projectPath`
+    );
+
+    let projectId: string | null = null;
+    for (const record of projectsResult.records) {
+      const projectPath = record.get('projectPath') as string;
+      if (projectPath && filePath.startsWith(projectPath)) {
+        projectId = record.get('projectId') as string;
+        break;
+      }
+    }
+
+    // If file is not in any project, don't ingest
+    if (!projectId) {
+      console.log(`[BrainManager] File not in any project, skipping ingestion: ${filePath}`);
+      return { updated: false };
+    }
+
+    // Find existing node by file path
+    const fileName = pathModule.basename(filePath);
+    const findResult = await this.neo4jClient.run(
+      `MATCH (n) WHERE (n.file = $fileName OR n.path = $filePath) AND n.projectId = $projectId
+       RETURN n.uuid as uuid, labels(n) as labels LIMIT 1`,
+      { fileName, filePath, projectId }
+    );
+
+    let uuid: string;
+    let labels: string[];
+
+    if (findResult.records.length === 0) {
+      // Node doesn't exist - create it based on file extension
+      const ext = pathModule.extname(filePath).toLowerCase();
+
+      // Determine node type based on extension
+      const imageExts = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg'];
+      const pdfExts = ['.pdf'];
+      const docExts = ['.docx', '.doc'];
+      const spreadsheetExts = ['.xlsx', '.xls', '.csv'];
+      const threeDExts = ['.glb', '.gltf', '.obj', '.fbx'];
+
+      let nodeLabels: string[];
+      let category: string;
+      let uuidPrefix: string;
+
+      if (imageExts.includes(ext)) {
+        nodeLabels = ['ImageFile', 'MediaFile'];
+        category = 'image';
+        uuidPrefix = 'media';
+      } else if (pdfExts.includes(ext)) {
+        nodeLabels = ['PDFDocument', 'DocumentFile'];
+        category = 'document';
+        uuidPrefix = 'doc';
+      } else if (docExts.includes(ext)) {
+        nodeLabels = ['WordDocument', 'DocumentFile'];
+        category = 'document';
+        uuidPrefix = 'doc';
+      } else if (spreadsheetExts.includes(ext)) {
+        nodeLabels = ['SpreadsheetDocument', 'DocumentFile'];
+        category = 'document';
+        uuidPrefix = 'doc';
+      } else if (threeDExts.includes(ext)) {
+        nodeLabels = ['ThreeDFile', 'MediaFile'];
+        category = '3d';
+        uuidPrefix = 'media';
+      } else {
+        // Unknown type - skip
+        console.log(`[BrainManager] Unknown file type, skipping: ${ext}`);
+        return { updated: false };
+      }
+
+      uuid = `${uuidPrefix}:${crypto.randomUUID()}`;
+      labels = nodeLabels;
+
+      // Get file stats if possible
+      let sizeBytes = 0;
+      try {
+        const stats = await fs.stat(filePath);
+        sizeBytes = stats.size;
+      } catch {
+        // File might not exist yet or be inaccessible
+      }
+
+      // Build CREATE query with appropriate labels
+      const labelsStr = nodeLabels.join(':');
+      await this.neo4jClient.run(
+        `CREATE (n:${labelsStr} {
+          uuid: $uuid,
+          file: $fileName,
+          path: $filePath,
+          format: $format,
+          category: $category,
+          sizeBytes: $sizeBytes,
+          projectId: $projectId,
+          indexedAt: $indexedAt
+        })`,
+        {
+          uuid,
+          fileName,
+          filePath,
+          format: ext.replace('.', ''),
+          category,
+          sizeBytes,
+          projectId,
+          indexedAt: new Date().toISOString(),
+        }
+      );
+      console.log(`[BrainManager] Created new ${nodeLabels[0]} node: ${uuid} (project: ${projectId})`);
+    } else {
+      uuid = findResult.records[0].get('uuid');
+      labels = findResult.records[0].get('labels') as string[];
+    }
+
+    // Build SET clause dynamically
+    const updates: string[] = [];
+    const updateParams: Record<string, any> = { uuid };
+
+    if (textContent) {
+      updates.push('n.textContent = $textContent');
+      updateParams.textContent = textContent;
+    }
+    if (description) {
+      updates.push('n.description = $description');
+      updateParams.description = description;
+    }
+    if (ocrConfidence !== undefined) {
+      updates.push('n.ocrConfidence = $ocrConfidence');
+      updateParams.ocrConfidence = ocrConfidence;
+    }
+    if (extractionMethod) {
+      updates.push('n.extractionMethod = $extractionMethod');
+      updateParams.extractionMethod = extractionMethod;
+    }
+    updates.push('n.contentUpdatedAt = $updatedAt');
+    updateParams.updatedAt = new Date().toISOString();
+
+    if (updates.length > 0) {
+      await this.neo4jClient.run(
+        `MATCH (n {uuid: $uuid}) SET ${updates.join(', ')}`,
+        updateParams
+      );
+    }
+
+    // Mark for embedding regeneration if requested
+    if (generateEmbeddings) {
+      // Mark node as dirty so embeddings will be regenerated on next ingest
+      await this.neo4jClient.run(
+        'MATCH (n {uuid: $uuid}) SET n.embeddingsDirty = true',
+        { uuid }
+      );
+      console.log(`[BrainManager] Marked node for embedding regeneration: ${uuid}`);
+    }
+
+    // Create GENERATED_FROM relationships to source files
+    if (sourceFiles && sourceFiles.length > 0) {
+      for (const sourceFilePath of sourceFiles) {
+        // Find or create source node
+        const sourceFileName = pathModule.basename(sourceFilePath);
+        const sourceExt = pathModule.extname(sourceFilePath).toLowerCase();
+
+        // Find existing source node
+        const sourceResult = await this.neo4jClient.run(
+          `MATCH (n) WHERE (n.file = $fileName OR n.path = $filePath) AND n.projectId = $projectId
+           RETURN n.uuid as uuid LIMIT 1`,
+          { fileName: sourceFileName, filePath: sourceFilePath, projectId }
+        );
+
+        let sourceUuid: string;
+
+        if (sourceResult.records.length === 0) {
+          // Create source node if it doesn't exist
+          const imageExts = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg'];
+          const threeDExts = ['.glb', '.gltf', '.obj', '.fbx'];
+
+          let sourceLabels: string[];
+          let sourceCategory: string;
+
+          if (imageExts.includes(sourceExt)) {
+            sourceLabels = ['ImageFile', 'MediaFile'];
+            sourceCategory = 'image';
+          } else if (threeDExts.includes(sourceExt)) {
+            sourceLabels = ['ThreeDFile', 'MediaFile'];
+            sourceCategory = '3d';
+          } else {
+            // Skip unknown source types
+            console.log(`[BrainManager] Unknown source file type, skipping relationship: ${sourceExt}`);
+            continue;
+          }
+
+          sourceUuid = `media:${crypto.randomUUID()}`;
+
+          // Get file stats if possible
+          let sizeBytes = 0;
+          try {
+            const stats = await fs.stat(sourceFilePath);
+            sizeBytes = stats.size;
+          } catch {
+            // File might not exist or be inaccessible
+          }
+
+          const labelsStr = sourceLabels.join(':');
+          await this.neo4jClient.run(
+            `CREATE (n:${labelsStr} {
+              uuid: $uuid,
+              file: $fileName,
+              path: $filePath,
+              format: $format,
+              category: $category,
+              sizeBytes: $sizeBytes,
+              projectId: $projectId,
+              indexedAt: $indexedAt
+            })`,
+            {
+              uuid: sourceUuid,
+              fileName: sourceFileName,
+              filePath: sourceFilePath,
+              format: sourceExt.replace('.', ''),
+              category: sourceCategory,
+              sizeBytes,
+              projectId,
+              indexedAt: new Date().toISOString(),
+            }
+          );
+          console.log(`[BrainManager] Created source node: ${sourceUuid}`);
+        } else {
+          sourceUuid = sourceResult.records[0].get('uuid');
+        }
+
+        // Create GENERATED_FROM relationship (if not exists)
+        await this.neo4jClient.run(
+          `MATCH (target {uuid: $targetUuid}), (source {uuid: $sourceUuid})
+           MERGE (target)-[:GENERATED_FROM]->(source)`,
+          { targetUuid: uuid, sourceUuid }
+        );
+        console.log(`[BrainManager] Created GENERATED_FROM relationship: ${uuid} -> ${sourceUuid}`);
+      }
+    }
+
+    return { updated: true, nodeId: uuid };
+  }
+
+  // ============================================
   // Search
   // ============================================
 
@@ -1153,10 +1424,10 @@ volumes:
       });
     } else {
       // Text search (fallback)
-      // Search in name, content, source, and rawText (for markdown documents)
+      // Search in: name, content, source, rawText (markdown), code (codeblocks), textContent (documents)
       const cypher = `
         MATCH (n)
-        WHERE (n.name CONTAINS $query OR n.content CONTAINS $query OR n.source CONTAINS $query OR n.rawText CONTAINS $query) ${projectFilter} ${nodeTypeFilter}
+        WHERE (n.name CONTAINS $query OR n.content CONTAINS $query OR n.source CONTAINS $query OR n.rawText CONTAINS $query OR n.code CONTAINS $query OR n.textContent CONTAINS $query) ${projectFilter} ${nodeTypeFilter}
         RETURN n, 1.0 as score
         ORDER BY n.name
         SKIP $offset
@@ -1166,13 +1437,13 @@ volumes:
       const result = await this.neo4jClient.run(cypher, params);
 
       results = result.records.map(record => {
-        const node = record.get('n').properties;
+        const rawNode = record.get('n').properties;
         const score = record.get('score');
-        const projectId = node.projectId || 'unknown';
+        const projectId = rawNode.projectId || 'unknown';
         const project = this.registeredProjects.get(projectId);
 
         return {
-          node,
+          node: this.stripEmbeddingFields(rawNode),
           score,
           projectId,
           projectPath: project?.path || 'unknown',
@@ -1181,14 +1452,28 @@ volumes:
       });
     }
 
+    // Apply glob filter if specified
+    if (options.glob) {
+      const globPattern = options.glob;
+      results = results.filter(r => {
+        const filePath = r.node.file || r.node.path || '';
+        return matchesGlob(filePath, globPattern, true);
+      });
+    }
+
     // Get total count (approximate for text search)
     const countCypher = `
       MATCH (n)
-      WHERE (n.name CONTAINS $query OR n.content CONTAINS $query OR n.rawText CONTAINS $query) ${projectFilter} ${nodeTypeFilter}
+      WHERE (n.name CONTAINS $query OR n.content CONTAINS $query OR n.source CONTAINS $query OR n.rawText CONTAINS $query OR n.code CONTAINS $query OR n.textContent CONTAINS $query) ${projectFilter} ${nodeTypeFilter}
       RETURN count(n) as total
     `;
     const countResult = await this.neo4jClient.run(countCypher, params);
-    const totalCount = countResult.records[0]?.get('total')?.toNumber() || 0;
+    let totalCount = countResult.records[0]?.get('total')?.toNumber() || 0;
+
+    // Adjust count if glob filter was applied
+    if (options.glob) {
+      totalCount = results.length;
+    }
 
     return {
       results,
@@ -1258,19 +1543,19 @@ volumes:
         });
 
         for (const record of result.records) {
-          const node = record.get('n').properties;
-          const uuid = node.uuid;
+          const rawNode = record.get('n').properties;
+          const uuid = rawNode.uuid;
 
           // Skip duplicates
           if (seenUuids.has(uuid)) continue;
           seenUuids.add(uuid);
 
           const score = record.get('score');
-          const projectId = node.projectId || 'unknown';
+          const projectId = rawNode.projectId || 'unknown';
           const project = this.registeredProjects.get(projectId);
 
           allResults.push({
-            node,
+            node: this.stripEmbeddingFields(rawNode),
             score,
             projectId,
             projectPath: project?.path || 'unknown',
@@ -1292,12 +1577,12 @@ volumes:
         const fallbackResult = await this.neo4jClient!.run(fallbackCypher, params);
 
         for (const record of fallbackResult.records) {
-          const node = record.get('n').properties;
-          const uuid = node.uuid;
+          const rawNode = record.get('n').properties;
+          const uuid = rawNode.uuid;
 
           if (seenUuids.has(uuid)) continue;
 
-          const nodeEmbedding = node[embeddingProp];
+          const nodeEmbedding = rawNode[embeddingProp];
           if (!nodeEmbedding || !Array.isArray(nodeEmbedding)) continue;
 
           // Compute cosine similarity manually
@@ -1306,11 +1591,11 @@ volumes:
 
           seenUuids.add(uuid);
 
-          const projectId = node.projectId || 'unknown';
+          const projectId = rawNode.projectId || 'unknown';
           const project = this.registeredProjects.get(projectId);
 
           allResults.push({
-            node,
+            node: this.stripEmbeddingFields(rawNode),
             score,
             projectId,
             projectPath: project?.path || 'unknown',
@@ -1343,6 +1628,19 @@ volumes:
 
     if (normA === 0 || normB === 0) return 0;
     return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+  }
+
+  /**
+   * Strip embedding fields from node properties (they're huge and not useful in results)
+   */
+  private stripEmbeddingFields(node: Record<string, any>): Record<string, any> {
+    const result: Record<string, any> = {};
+    for (const [key, value] of Object.entries(node)) {
+      // Skip embedding fields and their hashes
+      if (key.startsWith('embedding') || key.endsWith('_hash')) continue;
+      result[key] = value;
+    }
+    return result;
   }
 
   // ============================================
@@ -1546,12 +1844,12 @@ volumes:
         if (stats.created + stats.updated > 0 && this.embeddingService?.canGenerateEmbeddings()) {
           console.log(`[Brain] Regenerating embeddings for ${stats.created + stats.updated} changed nodes...`);
           try {
-            const result = await this.embeddingService.generateEmbeddings({
+            const result = await this.embeddingService.generateMultiEmbeddings({
               projectId,
               incrementalOnly: true,
               verbose: options.verbose ?? false,
             });
-            console.log(`[Brain] Embeddings: ${result.embeddedCount} generated, ${result.skippedCount} cached`);
+            console.log(`[Brain] Embeddings: ${result.totalEmbedded} generated, ${result.skippedCount} cached`);
           } catch (err: any) {
             console.warn(`[Brain] Embedding generation failed: ${err.message}`);
           }
@@ -1781,12 +2079,12 @@ volumes:
 
         // Generate embeddings for this project
         if (this.embeddingService?.canGenerateEmbeddings()) {
-          const result = await this.embeddingService.generateEmbeddings({
+          const result = await this.embeddingService.generateMultiEmbeddings({
             projectId,
             incrementalOnly: true,
             verbose: false,
           });
-          totalEmbeddingsGenerated += result.embeddedCount;
+          totalEmbeddingsGenerated += result.totalEmbedded;
         }
       }
 

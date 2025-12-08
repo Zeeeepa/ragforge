@@ -146,20 +146,22 @@ export function generateGenerateImageTool(): GeneratedToolDefinition {
     section: 'media_ops',
     description: `Generate an image from a text prompt using AI.
 
-Uses Gemini's image generation (gemini-2.0-flash-exp) to create images from text descriptions.
+Uses Gemini's image generation to create images from text descriptions.
 Good for creating concept art, reference images, icons, diagrams, etc.
 
 Parameters:
 - prompt: Text description of the image to generate
 - output_path: Where to save the generated image (PNG)
 - aspect_ratio: Aspect ratio ('1:1', '16:9', '9:16', '4:3', '3:4', default: '1:1')
+- enhance_prompt: Use AI to enhance the prompt for better results (default: false)
 
 Note: Requires GEMINI_API_KEY environment variable.
 
 Example:
   generate_image({
     prompt: "A cute robot mascot, 3D render style, white background",
-    output_path: "assets/robot-mascot.png"
+    output_path: "assets/robot-mascot.png",
+    enhance_prompt: true
   })`,
     inputSchema: {
       type: 'object',
@@ -177,8 +179,58 @@ Example:
           enum: ['1:1', '16:9', '9:16', '4:3', '3:4'],
           description: 'Aspect ratio (default: 1:1)',
         },
+        enhance_prompt: {
+          type: 'boolean',
+          description: 'Use AI to enhance the prompt for better image generation (default: false)',
+        },
       },
       required: ['prompt', 'output_path'],
+    },
+  };
+}
+
+/**
+ * Generate edit_image tool (AI image editing)
+ */
+export function generateEditImageTool(): GeneratedToolDefinition {
+  return {
+    name: 'edit_image',
+    section: 'media_ops',
+    description: `Edit an existing image using AI with a text prompt.
+
+Uses Gemini's image editing to modify images based on text instructions.
+Can add, remove, or modify elements, change style, adjust colors, rotate, etc.
+
+Parameters:
+- image_path: Path to the input image to edit
+- prompt: Text instruction describing the desired edit
+- output_path: Where to save the edited image (PNG)
+
+Note: Requires GEMINI_API_KEY environment variable.
+
+Example:
+  edit_image({
+    image_path: "assets/photo.png",
+    prompt: "Add a red hat to the person",
+    output_path: "assets/photo-with-hat.png"
+  })`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        image_path: {
+          type: 'string',
+          description: 'Path to the input image to edit',
+        },
+        prompt: {
+          type: 'string',
+          description: 'Text instruction describing the desired edit',
+        },
+        output_path: {
+          type: 'string',
+          description: 'Where to save the edited image (PNG)',
+        },
+      },
+      required: ['image_path', 'prompt', 'output_path'],
     },
   };
 }
@@ -233,6 +285,17 @@ export interface ImageToolsContext {
   ocrService?: any;
   /** Callback to ingest a created/modified file */
   onFileCreated?: (filePath: string, fileType: 'image' | '3d' | 'document') => Promise<void>;
+  /** Callback to update extracted content in brain (OCR text, descriptions, etc.) */
+  onContentExtracted?: (params: {
+    filePath: string;
+    textContent?: string;
+    description?: string;
+    ocrConfidence?: number;
+    extractionMethod?: string;
+    generateEmbeddings?: boolean;
+    /** Source files used to create this file (creates GENERATED_FROM relationships) */
+    sourceFiles?: string[];
+  }) => Promise<{ updated: boolean }>;
 }
 
 /**
@@ -287,12 +350,29 @@ export function generateReadImageHandler(ctx: ImageToolsContext): (args: any) =>
         };
       }
 
+      // Update brain with extracted content if callback available
+      let ingested = false;
+      if (ctx.onContentExtracted && result.text) {
+        try {
+          const ingestResult = await ctx.onContentExtracted({
+            filePath: absolutePath,
+            textContent: result.text,
+            extractionMethod: `ocr-${result.provider}`,
+            generateEmbeddings: true,
+          });
+          ingested = ingestResult.updated;
+        } catch (err) {
+          console.warn('[read_image] Failed to update brain:', err);
+        }
+      }
+
       return {
         path: imagePath,
         absolute_path: absolutePath,
         text: result.text,
         provider: result.provider,
         processing_time_ms: result.processingTimeMs,
+        ingested,
       };
     }
 
@@ -322,12 +402,29 @@ export function generateReadImageHandler(ctx: ImageToolsContext): (args: any) =>
         };
       }
 
+      // Update brain with extracted content if callback available
+      let ingested = false;
+      if (ctx.onContentExtracted && result.text) {
+        try {
+          const ingestResult = await ctx.onContentExtracted({
+            filePath: absolutePath,
+            textContent: result.text,
+            extractionMethod: `ocr-${result.provider}`,
+            generateEmbeddings: true,
+          });
+          ingested = ingestResult.updated;
+        } catch (err) {
+          console.warn('[read_image] Failed to update brain:', err);
+        }
+      }
+
       return {
         path: imagePath,
         absolute_path: absolutePath,
         text: result.text,
         provider: result.provider,
         processing_time_ms: result.processingTimeMs,
+        ingested,
       };
     } catch (importError: any) {
       return {
@@ -396,12 +493,29 @@ export function generateDescribeImageHandler(ctx: ImageToolsContext): (args: any
         };
       }
 
+      // Update brain with description if callback available
+      let ingested = false;
+      if (ctx.onContentExtracted && result.text) {
+        try {
+          const ingestResult = await ctx.onContentExtracted({
+            filePath: absolutePath,
+            description: result.text,
+            extractionMethod: `vision-${result.provider}`,
+            generateEmbeddings: true,
+          });
+          ingested = ingestResult.updated;
+        } catch (err) {
+          console.warn('[describe_image] Failed to update brain:', err);
+        }
+      }
+
       return {
         path: imagePath,
         absolute_path: absolutePath,
         description: result.text,
         provider: result.provider,
         processing_time_ms: result.processingTimeMs,
+        ingested,
       };
     } catch (importError: any) {
       return {
@@ -416,7 +530,7 @@ export function generateDescribeImageHandler(ctx: ImageToolsContext): (args: any
  */
 export function generateGenerateImageHandler(ctx: ImageToolsContext): (args: any) => Promise<any> {
   return async (params: any) => {
-    const { prompt, output_path, aspect_ratio = '1:1' } = params;
+    const { prompt, output_path, aspect_ratio = '1:1', enhance_prompt = false } = params;
     const fs = await import('fs/promises');
     const pathModule = await import('path');
 
@@ -433,6 +547,17 @@ export function generateGenerateImageHandler(ctx: ImageToolsContext): (args: any
     const startTime = Date.now();
 
     try {
+      // Enhance prompt if requested
+      let finalPrompt = prompt;
+      let enhancement: { enhanced: string; reasoning: string } | undefined;
+
+      if (enhance_prompt) {
+        console.log('🎨 Enhancing prompt...');
+        enhancement = await enhanceImagePrompt(prompt, apiKey);
+        finalPrompt = enhancement.enhanced;
+        console.log(`✨ Enhanced: "${finalPrompt.substring(0, 80)}..."`);
+      }
+
       // Use Gemini 2.5 Flash Image (Nano Banana)
       const { GoogleGenAI } = await import('@google/genai');
       const genAI = new GoogleGenAI({ apiKey });
@@ -444,8 +569,8 @@ export function generateGenerateImageHandler(ctx: ImageToolsContext): (args: any
       for (let attempt = 0; attempt < maxRetries; attempt++) {
         // Add explicit prefix on retry to force image generation
         const effectivePrompt = attempt === 0
-          ? prompt
-          : `Generate an image: ${prompt}`;
+          ? finalPrompt
+          : `Generate an image: ${finalPrompt}`;
 
         const response = await genAI.models.generateContent({
           model: 'gemini-2.5-flash-image-preview',
@@ -465,22 +590,34 @@ export function generateGenerateImageHandler(ctx: ImageToolsContext): (args: any
           await fs.mkdir(pathModule.dirname(absoluteOutputPath), { recursive: true });
           await fs.writeFile(absoluteOutputPath, buffer);
 
-          // Ingest the created image into the knowledge graph
-          if (ctx.onFileCreated) {
+          // Ingest the created image into the knowledge graph with description
+          let ingested = false;
+          if (ctx.onContentExtracted) {
             try {
-              await ctx.onFileCreated(absoluteOutputPath, 'image');
+              const description = `Generated from prompt: "${finalPrompt}"`;
+              const ingestResult = await ctx.onContentExtracted({
+                filePath: absoluteOutputPath,
+                description,
+                extractionMethod: 'ai-generated',
+                generateEmbeddings: true,
+              });
+              ingested = ingestResult.updated;
             } catch (e) {
               console.warn(`[image-tools] Failed to ingest created image: ${e}`);
             }
           }
 
           return {
-            prompt,
+            prompt: finalPrompt,
+            original_prompt: enhance_prompt ? prompt : undefined,
+            enhanced: enhance_prompt,
+            enhancement_reasoning: enhancement?.reasoning,
             output_path,
             absolute_path: absoluteOutputPath,
             aspect_ratio,
             processing_time_ms: Date.now() - startTime,
             retries: attempt,
+            ingested,
           };
         }
 
@@ -497,6 +634,110 @@ export function generateGenerateImageHandler(ctx: ImageToolsContext): (args: any
       return { error: `No image after ${maxRetries} attempts: ${lastError.substring(0, 200)}` };
     } catch (err: any) {
       return { error: `Image generation failed: ${err.message}` };
+    }
+  };
+}
+
+/**
+ * Generate handler for edit_image
+ */
+export function generateEditImageHandler(ctx: ImageToolsContext): (args: any) => Promise<any> {
+  return async (params: any) => {
+    const { image_path, prompt, output_path } = params;
+    const fs = await import('fs/promises');
+    const pathModule = await import('path');
+
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return { error: 'GEMINI_API_KEY environment variable is not set' };
+    }
+
+    // Resolve paths
+    const absoluteImagePath = pathModule.isAbsolute(image_path)
+      ? image_path
+      : pathModule.join(ctx.projectRoot, image_path);
+
+    const absoluteOutputPath = pathModule.isAbsolute(output_path)
+      ? output_path
+      : pathModule.join(ctx.projectRoot, output_path);
+
+    // Check input image exists
+    try {
+      await fs.access(absoluteImagePath);
+    } catch {
+      return { error: `Input image not found: ${image_path}` };
+    }
+
+    const startTime = Date.now();
+
+    try {
+      // Read input image
+      const imageData = await fs.readFile(absoluteImagePath);
+      const base64Image = imageData.toString('base64');
+      const ext = pathModule.extname(absoluteImagePath).toLowerCase();
+      const mimeType = ext === '.png' ? 'image/png' : 'image/jpeg';
+
+      // Use Gemini 2.5 Flash Image for editing
+      const { GoogleGenAI } = await import('@google/genai');
+      const genAI = new GoogleGenAI({ apiKey });
+
+      const response = await genAI.models.generateContent({
+        model: 'gemini-2.5-flash-image-preview',
+        contents: [
+          { text: prompt },
+          { inlineData: { mimeType, data: base64Image } },
+        ],
+        config: {
+          responseModalities: ['TEXT', 'IMAGE'],
+        },
+      });
+
+      // Extract image from response
+      const parts = response.candidates?.[0]?.content?.parts ?? [];
+      const imgPart = parts.find((p: any) => p.inlineData?.data);
+      const textPart = parts.find((p: any) => p.text);
+
+      if (imgPart) {
+        // Success - save edited image
+        const buffer = Buffer.from(imgPart.inlineData!.data!, 'base64');
+        await fs.mkdir(pathModule.dirname(absoluteOutputPath), { recursive: true });
+        await fs.writeFile(absoluteOutputPath, buffer);
+
+        // Ingest the edited image into the knowledge graph with description and source relationship
+        let ingested = false;
+        if (ctx.onContentExtracted) {
+          try {
+            const description = `Edited from "${image_path}" with prompt: "${prompt}"`;
+            const ingestResult = await ctx.onContentExtracted({
+              filePath: absoluteOutputPath,
+              description,
+              extractionMethod: 'ai-edited',
+              generateEmbeddings: true,
+              sourceFiles: [absoluteImagePath], // Link to source image
+            });
+            ingested = ingestResult.updated;
+          } catch (e) {
+            console.warn(`[image-tools] Failed to ingest edited image: ${e}`);
+          }
+        }
+
+        return {
+          image_path,
+          prompt,
+          output_path,
+          absolute_path: absoluteOutputPath,
+          processing_time_ms: Date.now() - startTime,
+          model_response: textPart?.text,
+          ingested,
+        };
+      }
+
+      // No image in response
+      return {
+        error: `No edited image generated. Model response: ${textPart?.text || 'none'}`,
+      };
+    } catch (err: any) {
+      return { error: `Image editing failed: ${err.message}` };
     }
   };
 }
@@ -581,6 +822,80 @@ export function generateGenerateMultiviewImagesHandler(ctx: ImageToolsContext): 
       return { error: `Multiview generation failed: ${err.message}` };
     }
   };
+}
+
+/**
+ * Enhance an image prompt for better generation results
+ * Uses StructuredLLMExecutor for consistency
+ * Inspired by PromptEnhancerAgent from lr-tchatagent-web
+ */
+async function enhanceImagePrompt(
+  basePrompt: string,
+  apiKey: string
+): Promise<{ enhanced: string; reasoning: string }> {
+  try {
+    const { StructuredLLMExecutor, GeminiAPIProvider } = await import('../runtime/index.js');
+
+    const llmProvider = new GeminiAPIProvider({
+      apiKey,
+      model: 'gemini-2.0-flash',
+      temperature: 0.7,
+    });
+
+    const executor = new StructuredLLMExecutor();
+
+    const results = await executor.executeLLMBatch(
+      [{ basePrompt }],
+      {
+        inputFields: ['basePrompt'],
+        llmProvider,
+        systemPrompt: `Tu es l'agent Prompt Enhancer, un expert passionné par l'art de créer des prompts parfaits pour Gemini 2.5 Flash Image.
+
+PERSONNALITÉ:
+- Tu adores transformer des prompts basiques en chefs-d'œuvre visuels
+- Tu es méthodique et utilises des techniques avancées d'amélioration
+
+RÈGLES DE PRÉSERVATION:
+1. Préserve le sujet principal et ses caractéristiques
+2. Si le genre est mentionné (féminin/masculin), le conserver
+3. Préserve le type de personnage (vampire, sorcière, robot, etc.)
+4. Ne change PAS le sujet, seulement améliore la description
+
+AMÉLIORATIONS À AJOUTER:
+- Composition et cadrage (centered, full body, close-up, etc.)
+- Éclairage et atmosphère (studio lighting, dramatic shadows, etc.)
+- Style artistique (digital art, 3D render, photorealistic, etc.)
+- Couleurs et ambiance (vibrant, moody, pastel, etc.)
+- Qualité technique (highly detailed, 8K, sharp focus, etc.)`,
+        userTask: `Améliore ce prompt pour obtenir une meilleure image. Max 80 mots.`,
+        outputSchema: {
+          enhancedPrompt: {
+            type: 'string',
+            description: 'Le prompt amélioré, prêt pour Gemini 2.5 Flash Image',
+            required: true,
+          },
+          reasoning: {
+            type: 'string',
+            description: 'Courte explication des améliorations (1 phrase)',
+            required: true,
+          },
+        },
+      }
+    );
+
+    // Extract result (executeLLMBatch returns array or object with items)
+    const result = Array.isArray(results) ? results[0] : (results as any).items?.[0];
+
+    if (result?.enhancedPrompt) {
+      return {
+        enhanced: result.enhancedPrompt,
+        reasoning: result.reasoning || '',
+      };
+    }
+  } catch (err) {
+    console.warn('[enhanceImagePrompt] Failed:', err);
+  }
+  return { enhanced: basePrompt, reasoning: '' };
 }
 
 /**
@@ -857,6 +1172,7 @@ export function generateImageTools(ctx: ImageToolsContext): ImageToolsResult {
       generateDescribeImageTool(),
       generateListImagesTool(),
       generateGenerateImageTool(),
+      generateEditImageTool(),
       generateGenerateMultiviewImagesTool(),
       generateAnalyzeVisualTool(),
     ],
@@ -865,6 +1181,7 @@ export function generateImageTools(ctx: ImageToolsContext): ImageToolsResult {
       describe_image: generateDescribeImageHandler(ctx),
       list_images: generateListImagesHandler(ctx),
       generate_image: generateGenerateImageHandler(ctx),
+      edit_image: generateEditImageHandler(ctx),
       generate_multiview_images: generateGenerateMultiviewImagesHandler(ctx),
       analyze_visual: generateAnalyzeVisualHandler(ctx),
     },
@@ -967,13 +1284,13 @@ export function generateAnalyzeVisualHandler(ctx: ImageToolsContext): (args: any
     let tempFile: string | null = null;
 
     // If PDF, convert the specified page to an image first
+    let targetPageBuffer: Buffer | null = null;
     if (isPdf) {
       try {
         const { pdf } = await import('pdf-to-img');
         const document = await pdf(absolutePath, { scale: 2.0 });
 
         let pageIndex = 0;
-        let targetPageBuffer: Buffer | null = null;
 
         for await (const pageImage of document) {
           pageIndex++;
@@ -987,7 +1304,7 @@ export function generateAnalyzeVisualHandler(ctx: ImageToolsContext): (args: any
           return { error: `Page ${page} not found in PDF (document has ${pageIndex} pages)` };
         }
 
-        // Save to temp file
+        // Save to temp file for OCR
         tempFile = pathModule.join(os.tmpdir(), `ragforge-pdf-page-${Date.now()}.png`);
         await fs.writeFile(tempFile, targetPageBuffer);
         imageToAnalyze = tempFile;
@@ -999,7 +1316,60 @@ export function generateAnalyzeVisualHandler(ctx: ImageToolsContext): (args: any
       return { error: `Unsupported format: ${ext}. Supported: ${imageExtensions.join(', ')}, .pdf` };
     }
 
-    // Use Gemini Vision to analyze
+    // For PDFs: try Tesseract first (free), fallback to Gemini if confidence < 60%
+    const OCR_CONFIDENCE_THRESHOLD = 60;
+
+    if (isPdf && targetPageBuffer) {
+      try {
+        const { createWorker } = await import('tesseract.js');
+        const worker = await createWorker('eng');
+        const startTime = Date.now();
+
+        const { data } = await worker.recognize(targetPageBuffer);
+        await worker.terminate();
+
+        const processingTimeMs = Date.now() - startTime;
+
+        if (data.confidence >= OCR_CONFIDENCE_THRESHOLD && data.text.trim().length > 20) {
+          // Good Tesseract result - use it (free)
+          if (tempFile) await fs.unlink(tempFile).catch(() => {});
+
+          // Auto-ingest extracted content to brain if callback provided
+          let ingested = false;
+          if (ctx.onContentExtracted && data.text) {
+            try {
+              const ingestResult = await ctx.onContentExtracted({
+                filePath: absolutePath,
+                textContent: data.text,
+                ocrConfidence: data.confidence,
+                extractionMethod: 'ocr-tesseract',
+                generateEmbeddings: true,
+              });
+              ingested = ingestResult.updated;
+            } catch (ingestError: any) {
+              console.warn(`[analyze_visual] Failed to ingest content: ${ingestError.message}`);
+            }
+          }
+
+          return {
+            path: filePath,
+            page,
+            prompt,
+            response: data.text,
+            provider: 'tesseract',
+            confidence: data.confidence,
+            processing_time_ms: processingTimeMs,
+            ingested,
+          };
+        }
+        // Low confidence - fall through to Gemini Vision
+        console.log(`[analyze_visual] Tesseract confidence ${data.confidence.toFixed(1)}% < ${OCR_CONFIDENCE_THRESHOLD}%, using Gemini Vision`);
+      } catch (tesseractErr: any) {
+        console.warn(`[analyze_visual] Tesseract failed, using Gemini Vision: ${tesseractErr.message}`);
+      }
+    }
+
+    // Use Gemini Vision to analyze (for images, or PDF with low OCR confidence)
     try {
       const { getOCRService } = await import('../runtime/index.js');
       const ocrService = getOCRService({ primaryProvider: 'gemini' });
@@ -1028,6 +1398,22 @@ export function generateAnalyzeVisualHandler(ctx: ImageToolsContext): (args: any
         };
       }
 
+      // Auto-ingest extracted content to brain if callback provided
+      let ingested = false;
+      if (ctx.onContentExtracted && result.text) {
+        try {
+          const ingestResult = await ctx.onContentExtracted({
+            filePath: absolutePath,
+            textContent: result.text,
+            extractionMethod: 'gemini-vision',
+            generateEmbeddings: true,
+          });
+          ingested = ingestResult.updated;
+        } catch (ingestError: any) {
+          console.warn(`[analyze_visual] Failed to ingest content: ${ingestError.message}`);
+        }
+      }
+
       return {
         path: filePath,
         page: isPdf ? page : undefined,
@@ -1035,6 +1421,7 @@ export function generateAnalyzeVisualHandler(ctx: ImageToolsContext): (args: any
         response: result.text,
         provider: 'gemini-vision',
         processing_time_ms: processingTimeMs,
+        ingested,
       };
     } catch (importError: any) {
       if (tempFile) await fs.unlink(tempFile).catch(() => {});

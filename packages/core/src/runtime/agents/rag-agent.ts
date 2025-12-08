@@ -1301,6 +1301,17 @@ export async function createRagAgent(options: RagAgentOptions): Promise<RagAgent
     const shellCtx: ShellToolsContext = {
       projectRoot: options.projectRoot || process.cwd,
       onConfirmationRequired: options.onShellConfirmation,
+      // Trigger file tracker update when shell commands modify files
+      onFilesModified: options.onFileModified
+        ? async (cwd: string) => {
+            // For shell commands, we don't know exactly which files changed
+            // Just signal that files in cwd may have been modified
+            if (options.verbose) {
+              console.log(`   📁 Shell command modified files in: ${cwd}`);
+            }
+            // Could trigger a directory re-scan here if needed
+          }
+        : undefined,
     };
 
     const shellTools = generateShellTools(shellCtx);

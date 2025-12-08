@@ -66,7 +66,7 @@ export class IncrementalIngestionManager {
   async getExistingHashes(
     nodeIds: string[],
     projectId?: string
-  ): Promise<Map<string, { uuid: string; hash: string; source?: string; name?: string; file?: string; labels?: string[] }>> {
+  ): Promise<Map<string, { uuid: string; hash: string; source?: string; textContent?: string; name?: string; file?: string; labels?: string[] }>> {
     if (nodeIds.length === 0) {
       return new Map();
     }
@@ -77,22 +77,23 @@ export class IncrementalIngestionManager {
       ? `
         MATCH (n)
         WHERE n.uuid IN $nodeIds AND n.projectId = $projectId
-        RETURN n.uuid AS uuid, n.hash AS hash, n.source AS source, n.name AS name, n.file AS file, labels(n) AS labels
+        RETURN n.uuid AS uuid, n.hash AS hash, n.source AS source, n.textContent AS textContent, n.name AS name, n.file AS file, labels(n) AS labels
         `
       : `
         MATCH (n)
         WHERE n.uuid IN $nodeIds
-        RETURN n.uuid AS uuid, n.hash AS hash, n.source AS source, n.name AS name, n.file AS file, labels(n) AS labels
+        RETURN n.uuid AS uuid, n.hash AS hash, n.source AS source, n.textContent AS textContent, n.name AS name, n.file AS file, labels(n) AS labels
         `;
 
     const result = await this.client.run(query, { nodeIds, projectId });
 
-    const hashes = new Map<string, { uuid: string; hash: string; source?: string; name?: string; file?: string; labels?: string[] }>();
+    const hashes = new Map<string, { uuid: string; hash: string; source?: string; textContent?: string; name?: string; file?: string; labels?: string[] }>();
     for (const record of result.records) {
       hashes.set(record.get('uuid'), {
         uuid: record.get('uuid'),
         hash: record.get('hash'),
         source: record.get('source'),
+        textContent: record.get('textContent'),
         name: record.get('name'),
         file: record.get('file'),
         labels: record.get('labels')
@@ -250,7 +251,11 @@ export class IncrementalIngestionManager {
 
       // Determine unique field based on node type
       // File and Directory use 'path', others use 'uuid'
-      const isFileOrDirectory = labels.includes('File') || labels.includes('Directory');
+      // Note: ImageFile, ThreeDFile, DocumentFile are MediaFile subtypes and use 'uuid'
+      const labelsArray = labels.split(':');
+      const isMediaFile = labelsArray.includes('MediaFile') || labelsArray.includes('ImageFile')
+        || labelsArray.includes('ThreeDFile') || labelsArray.includes('DocumentFile');
+      const isFileOrDirectory = (labelsArray.includes('File') || labelsArray.includes('Directory')) && !isMediaFile;
       const uniqueField = isFileOrDirectory ? 'path' : 'uuid';
       const uniqueValue = isFileOrDirectory ? 'nodeData.props.path' : 'nodeData.uuid';
 
@@ -456,46 +461,83 @@ export class IncrementalIngestionManager {
           metadata?: Record<string, any>;
         }> = [];
 
-        // Add created scopes
+        // Helper to get content from different node types
+        const getNodeContent = (node: ParsedNode): string | undefined => {
+          // Scope nodes use 'source'
+          if (node.labels.includes('Scope')) return node.properties.source as string;
+          // Document nodes use 'textContent'
+          if (node.labels.includes('DocumentFile') || node.labels.includes('PDFDocument') ||
+              node.labels.includes('WordDocument') || node.labels.includes('SpreadsheetDocument')) {
+            return node.properties.textContent as string;
+          }
+          // Markdown sections use 'rawText'
+          if (node.labels.includes('MarkdownSection')) return node.properties.rawText as string;
+          // Code blocks use 'code'
+          if (node.labels.includes('CodeBlock')) return node.properties.code as string;
+          // Web pages use 'textContent'
+          if (node.labels.includes('WebPage')) return node.properties.textContent as string;
+          return undefined;
+        };
+
+        // Helper to get entity type from labels
+        const getEntityType = (node: ParsedNode): string => {
+          if (node.labels.includes('Scope')) return 'Scope';
+          if (node.labels.includes('PDFDocument')) return 'PDFDocument';
+          if (node.labels.includes('WordDocument')) return 'WordDocument';
+          if (node.labels.includes('SpreadsheetDocument')) return 'SpreadsheetDocument';
+          if (node.labels.includes('DocumentFile')) return 'DocumentFile';
+          if (node.labels.includes('MarkdownSection')) return 'MarkdownSection';
+          if (node.labels.includes('CodeBlock')) return 'CodeBlock';
+          if (node.labels.includes('WebPage')) return 'WebPage';
+          return node.labels[0] || 'Unknown';
+        };
+
+        // Add created content nodes
         for (const node of created) {
-          const scopeSource = node.properties.source as string;
-          const scopeName = node.properties.name as string;
-          const scopeFile = node.properties.file as string;
+          const content = getNodeContent(node);
+          if (!content) continue; // Skip nodes without trackable content
+
+          const nodeName = node.properties.name as string || node.properties.path as string || node.id;
+          const nodeFile = node.properties.file as string || node.properties.path as string || '';
           const newHash = node.properties.hash as string;
+          const entityType = getEntityType(node);
 
           changesToTrack.push({
-            entityType: 'Scope',
+            entityType,
             entityUuid: node.id,
-            entityLabel: `${scopeFile}:${scopeName}`,
+            entityLabel: nodeFile ? `${nodeFile}:${nodeName}` : nodeName,
             oldContent: null,
-            newContent: scopeSource,
+            newContent: content,
             oldHash: null,
             newHash,
             changeType: 'created',
-            metadata: { name: scopeName, file: scopeFile }
+            metadata: { name: nodeName, file: nodeFile }
           });
         }
 
-        // Add modified scopes
+        // Add modified content nodes
         for (const node of modified) {
           const existing = existingHashes.get(node.id);
           if (!existing) continue;
 
-          const scopeSource = node.properties.source as string;
-          const scopeName = node.properties.name as string;
-          const scopeFile = node.properties.file as string;
+          const content = getNodeContent(node);
+          if (!content) continue; // Skip nodes without trackable content
+
+          const nodeName = node.properties.name as string || node.properties.path as string || node.id;
+          const nodeFile = node.properties.file as string || node.properties.path as string || '';
           const newHash = node.properties.hash as string;
+          const entityType = getEntityType(node);
 
           changesToTrack.push({
-            entityType: 'Scope',
+            entityType,
             entityUuid: node.id,
-            entityLabel: `${scopeFile}:${scopeName}`,
-            oldContent: existing.source || '',
-            newContent: scopeSource,
+            entityLabel: nodeFile ? `${nodeFile}:${nodeName}` : nodeName,
+            oldContent: existing.source || existing.textContent || '',
+            newContent: content,
             oldHash: existing.hash,
             newHash,
             changeType: 'updated',
-            metadata: { name: scopeName, file: scopeFile }
+            metadata: { name: nodeName, file: nodeFile }
           });
         }
 
@@ -503,7 +545,7 @@ export class IncrementalIngestionManager {
         await this.changeTracker.trackEntityChangesBatch(changesToTrack, 10);
 
         if (verbose) {
-          console.log(`   Tracked ${created.length} created and ${modified.length} updated scope(s)`);
+          console.log(`   Tracked ${changesToTrack.length} content change(s)`);
         }
       }
     }

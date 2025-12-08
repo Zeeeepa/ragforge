@@ -317,7 +317,38 @@ async function prepareToolsForMcp(
   // Add file tools (read, write, edit)
   // Note: These return ready handlers, not generators
   // Fallback to cwd for standalone mode (no project loaded)
-  const fileTools = generateFileTools({ projectRoot: () => ctx.currentProjectPath || process.cwd() });
+  const fileTools = generateFileTools({
+    projectRoot: () => ctx.currentProjectPath || process.cwd(),
+    // Trigger re-ingestion when files are modified
+    onFileModified: ctx.brainManager
+      ? async (filePath: string, changeType: 'created' | 'updated' | 'deleted') => {
+          log('debug', `File ${changeType}: ${filePath}`);
+          // For media/document files, use updateMediaContent
+          // For code files, the file watcher handles re-ingestion automatically
+          if (changeType !== 'deleted' && ctx.brainManager) {
+            const pathModule = await import('path');
+            const ext = pathModule.extname(filePath).toLowerCase();
+            const mediaExts = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.pdf', '.docx', '.xlsx', '.glb', '.gltf'];
+
+            if (mediaExts.includes(ext)) {
+              try {
+                await ctx.brainManager.updateMediaContent({
+                  filePath,
+                  extractionMethod: `file-tool-${changeType}`,
+                  generateEmbeddings: true,
+                });
+                log('debug', `Re-ingested media: ${filePath}`);
+              } catch (e: any) {
+                log('debug', `Re-ingestion failed: ${e.message}`);
+              }
+            } else {
+              // Code files: file watcher will handle re-ingestion if watching is enabled
+              log('debug', `Code file modified: ${filePath} (file watcher will handle)`);
+            }
+          }
+        }
+      : undefined,
+  });
   allTools.push(...fileTools.tools);
   for (const [name, handler] of Object.entries(fileTools.handlers)) {
     allHandlers[name] = handler;
@@ -334,6 +365,11 @@ async function prepareToolsForMcp(
   const shellTools = generateShellTools({
     projectRoot: () => ctx.currentProjectPath || process.cwd(),
     onConfirmationRequired: async () => true, // Auto-confirm for MCP (client can handle security)
+    // Trigger file tracker update when shell commands modify files
+    onFilesModified: async (cwd: string) => {
+      log('debug', `Shell command modified files in: ${cwd}`);
+      // For now, just log - could trigger a directory re-scan if needed
+    },
   });
   allTools.push(...shellTools.tools);
   for (const [name, handler] of Object.entries(shellTools.handlers)) {
@@ -415,6 +451,28 @@ async function prepareToolsForMcp(
   const projectRoot = ctx.currentProjectPath || process.cwd();
   const imageToolsCtx: ImageToolsContext = {
     projectRoot: projectRoot,
+    // Auto-ingest generated/edited images
+    onContentExtracted: ctx.brainManager
+      ? async (params) => {
+          log('debug', `Image content extracted: ${params.filePath}`);
+          try {
+            await ctx.brainManager!.updateMediaContent({
+              filePath: params.filePath,
+              textContent: params.textContent,
+              description: params.description,
+              ocrConfidence: params.ocrConfidence,
+              extractionMethod: params.extractionMethod,
+              generateEmbeddings: params.generateEmbeddings,
+              sourceFiles: params.sourceFiles,
+            });
+            log('debug', `Image ingested: ${params.filePath}`);
+            return { updated: true };
+          } catch (e: any) {
+            log('debug', `Image ingestion failed: ${e.message}`);
+            return { updated: false };
+          }
+        }
+      : undefined,
   };
   const imageTools = generateImageTools(imageToolsCtx);
   allTools.push(...imageTools.tools);
@@ -426,6 +484,27 @@ async function prepareToolsForMcp(
   // Add 3D tools
   const threeDToolsCtx: ThreeDToolsContext = {
     projectRoot: projectRoot,
+    // Auto-ingest generated 3D models
+    onContentExtracted: ctx.brainManager
+      ? async (params) => {
+          log('debug', `3D content extracted: ${params.filePath}`);
+          try {
+            await ctx.brainManager!.updateMediaContent({
+              filePath: params.filePath,
+              textContent: params.textContent,
+              description: params.description,
+              extractionMethod: params.extractionMethod,
+              generateEmbeddings: params.generateEmbeddings,
+              sourceFiles: params.sourceFiles,
+            });
+            log('debug', `3D model ingested: ${params.filePath}`);
+            return { updated: true };
+          } catch (e: any) {
+            log('debug', `3D ingestion failed: ${e.message}`);
+            return { updated: false };
+          }
+        }
+      : undefined,
   };
   const threeDTools = generate3DTools(threeDToolsCtx);
   allTools.push(...threeDTools.tools);

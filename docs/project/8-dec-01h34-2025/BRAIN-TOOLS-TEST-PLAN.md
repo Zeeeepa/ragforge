@@ -10,7 +10,7 @@
 ### Code (via CodeSourceAdapter)
 | Type | Extension | Parser | Status |
 |------|-----------|--------|--------|
-| TypeScript | `.ts`, `.tsx` | TypeScriptLanguageParser | ⬜ |
+| TypeScript | `.ts`, `.tsx` | TypeScriptLanguageParser | ✅ Testé |
 | JavaScript | `.js`, `.jsx` | TypeScriptLanguageParser | ⬜ |
 | Python | `.py` | PythonLanguageParser | ⬜ |
 | Vue SFC | `.vue` | VueParser | ⬜ |
@@ -60,8 +60,8 @@
 ### Recherche
 | Outil | Params | Status |
 |-------|--------|--------|
-| `brain_search` | query, limit, types, projects, semantic, embedding_type | ✅ Testé (text) |
-| `brain_search` (semantic) | semantic=true | ⬜ |
+| `brain_search` | query, limit, types, projects, semantic, embedding_type, glob | ✅ Testé (text) |
+| `brain_search` (semantic) | semantic=true | ✅ Testé |
 
 ### Gestion
 | Outil | Params | Status |
@@ -84,17 +84,17 @@
 ### Types d'Embeddings (multi-embeddings)
 | Type | Champ | Description | Status |
 |------|-------|-------------|--------|
-| Name | `embedding_name` | Noms, signatures | ⬜ |
-| Content | `embedding_content` | Code, texte | ⬜ |
-| Description | `embedding_description` | Docstrings, descriptions | ⬜ |
+| Name | `embedding_name` | Noms, signatures | ✅ Testé |
+| Content | `embedding_content` | Code, texte | ✅ Testé |
+| Description | `embedding_description` | Docstrings, JSDoc | ✅ Testé |
 
 ### Recherche Sémantique
 | Test | Query | embedding_type | Status |
 |------|-------|----------------|--------|
-| Par nom | "find the auth function" | name | ⬜ |
-| Par contenu | "code that validates JWT" | content | ⬜ |
-| Par description | "documented as authentication" | description | ⬜ |
-| Tous | "authentication logic" | all | ⬜ |
+| Par nom | "validate" | name | ✅ Testé |
+| Par contenu | "check if path is safe" | content | ✅ Testé |
+| Par description | "validates command is safe" | description | ✅ Testé |
+| Tous | "authentication logic" | all | ✅ Testé |
 
 ---
 
@@ -102,8 +102,11 @@
 
 ### Priorité Haute
 - [x] `cleanup_brain --project_id=X` : Supprimer un projet spécifique ✅ FAIT
-- [ ] Test de la recherche sémantique avec embeddings
-- [ ] Bug: CodeBlocks dans markdown n'ont pas de `projectId` (326 nodes orphelins)
+- [x] Test de la recherche sémantique avec embeddings ✅ FAIT
+- [x] Bug: CodeBlocks dans markdown n'ont pas de `projectId` ✅ CORRIGÉ
+- [x] Bug: JSDoc/docstrings non extraites pour TypeScript ✅ CORRIGÉ
+- [x] Ajout du filtre `glob` à brain_search ✅ FAIT
+- [x] Multi-embeddings (name, content, description) ✅ FAIT
 
 ### Priorité Moyenne
 - [ ] Test ingestion de chaque type de fichier
@@ -157,3 +160,11 @@ npx tsx packages/cli/src/index.ts test-tool get_brain_status
 | 01:37 | ingest_directory (code) | ✅ | 326 scopes créés |
 | 01:38 | cleanup_brain (project) | ✅ | Supprime 359 nodes, garde l'autre projet |
 | 01:38 | list_brain_projects | ✅ | 1 projet restant après suppression |
+| 01:42 | Fix projectId sur CodeBlock/Section | ✅ | Tous les nodes ont maintenant projectId |
+| 02:xx | Multi-embeddings (name, content) | ✅ | 652 embeddings générés |
+| 02:xx | Fix Neo4j dynamic property syntax | ✅ | Utilise requêtes spécifiques par type |
+| 02:xx | Semantic search by name | ✅ | Trouve CommandValidation pour "validate" |
+| 02:xx | Semantic search by content | ✅ | Trouve code par contenu |
+| 02:xx | Glob filter sur brain_search | ✅ | Filtre par pattern de fichier |
+| 02:xx | JSDoc extraction pour TypeScript | ✅ | 211/326 scopes avec docstring |
+| 02:xx | Semantic search by description | ✅ | 863 embeddings (326+326+211) |

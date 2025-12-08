@@ -388,12 +388,12 @@ Do not simply list what each view shows - create an integrated description.`;
 
     // Step 4: Generate embeddings
     if (generateEmbeddings && this.embeddingService?.canGenerateEmbeddings()) {
-      const embeddingResult = await this.embeddingService.generateEmbeddings({
+      const embeddingResult = await this.embeddingService.generateMultiEmbeddings({
         projectId,
         incrementalOnly: true,
         verbose: false,
       });
-      result.embeddingsGenerated = embeddingResult.embeddedCount;
+      result.embeddingsGenerated = embeddingResult.totalEmbedded;
     }
 
     return result;

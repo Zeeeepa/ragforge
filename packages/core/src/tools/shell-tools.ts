@@ -29,6 +29,12 @@ export interface ShellToolsContext {
   onConfirmationRequired?: (command: string, reason: string) => Promise<boolean>;
 
   /**
+   * Callback when command modifies files (for file tracker update)
+   * Called after command execution if modifies_files=true
+   */
+  onFilesModified?: (cwd: string) => Promise<void>;
+
+  /**
    * Force skip validation (DANGEROUS - for testing only)
    */
   skipValidation?: boolean;
@@ -69,10 +75,11 @@ Parameters:
 - command: Shell command to execute
 - cwd: Working directory (default: project root)
 - timeout: Max execution time in ms (default: 60000)
+- modifies_files: Set to true if command may create/modify/delete files (triggers file tracker update)
 
-Example: run_command({ command: "npm run build" })
-Example: run_command({ command: "git status" })
-Example: run_command({ command: "ls -la src" })`,
+Example: run_command({ command: "npm run build", modifies_files: true })
+Example: run_command({ command: "git status", modifies_files: false })
+Example: run_command({ command: "ls -la src", modifies_files: false })`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -90,8 +97,12 @@ Example: run_command({ command: "ls -la src" })`,
           description: 'Max execution time in ms (default: 60000)',
           optional: true,
         },
+        modifies_files: {
+          type: 'boolean',
+          description: 'Set to true if command may create, modify, or delete files. This will trigger a file tracker update after execution.',
+        },
       },
-      required: ['command'],
+      required: ['command', 'modifies_files'],
     },
   };
 }
@@ -200,6 +211,7 @@ export function generateRunCommandHandler(ctx: ShellToolsContext) {
     command: string;
     cwd?: string;
     timeout?: number;
+    modifies_files: boolean;
   }) => {
     const projectRoot = getProjectRoot(ctx);
 
@@ -250,6 +262,17 @@ export function generateRunCommandHandler(ctx: ShellToolsContext) {
       timeout: params.timeout || 60000,
     });
 
+    // Update file tracker if command may have modified files
+    let filesTrackerUpdated = false;
+    if (params.modifies_files && result.exitCode === 0 && ctx.onFilesModified) {
+      try {
+        await ctx.onFilesModified(cwd);
+        filesTrackerUpdated = true;
+      } catch (e) {
+        console.warn(`[shell-tools] Failed to update file tracker: ${e}`);
+      }
+    }
+
     return {
       command: result.command,
       exit_code: result.exitCode,
@@ -258,6 +281,7 @@ export function generateRunCommandHandler(ctx: ShellToolsContext) {
       stderr: result.stderr,
       duration_ms: result.durationMs,
       timed_out: result.timedOut,
+      files_tracker_updated: filesTrackerUpdated,
     };
   };
 }

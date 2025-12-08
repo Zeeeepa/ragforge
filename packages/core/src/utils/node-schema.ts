@@ -116,16 +116,35 @@ export function inferUniqueField(node: ParsedNode): 'path' | 'name' | 'uuid' {
 }
 
 /**
- * Check if a node is "structural" (i.e., not a Scope)
+ * Check if a node is structural (File, Directory, Project)
  *
  * Structural nodes are always upserted during incremental ingestion,
  * regardless of whether their content has changed.
  *
+ * Content nodes (Scope, DocumentFile, MarkdownSection, MediaFile, etc.) are tracked for changes.
+ *
  * @param node - A parsed node
- * @returns true if the node is structural (non-Scope)
+ * @returns true if the node is structural (File, Directory, Project only)
  */
 export function isStructuralNode(node: ParsedNode): boolean {
-  return !node.labels.includes('Scope');
+  // Content node types that should be tracked for changes (not structural)
+  const contentLabels = [
+    'Scope',           // Code scopes (functions, classes, etc.)
+    'MediaFile',       // Base media type
+    'ImageFile',       // Images
+    'ThreeDFile',      // 3D models
+    'DocumentFile',    // Documents (PDF, DOCX, etc.)
+    'MarkdownSection', // Markdown sections
+    'CodeBlock',       // Code blocks in markdown
+    'MarkupDocument',  // Markup documents
+    'SpreadsheetDocument', // Excel, CSV
+    'PDFDocument',     // PDF documents
+    'WordDocument',    // Word documents
+    'WebPage',         // Web pages
+  ];
+
+  const isContentNode = node.labels.some(l => contentLabels.includes(l));
+  return !isContentNode;
 }
 
 /**

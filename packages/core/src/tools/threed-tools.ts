@@ -203,6 +203,19 @@ export interface ThreeDToolsContext {
     modelPath: string,
     renders: Array<{ view: string; path: string }>
   ) => Promise<{ threeDFileUuid: string; imageUuids: string[] }>;
+  /**
+   * Callback when content is extracted (descriptions, etc.)
+   * Used to update brain with extracted content and mark for embedding regeneration
+   */
+  onContentExtracted?: (params: {
+    filePath: string;
+    textContent?: string;
+    description?: string;
+    extractionMethod?: string;
+    generateEmbeddings?: boolean;
+    /** Source files used to create this file (creates GENERATED_FROM relationships) */
+    sourceFiles?: string[];
+  }) => Promise<{ updated: boolean }>;
 }
 
 /**
@@ -784,10 +797,12 @@ export function generateGenerate3DFromImageHandler(ctx: ThreeDToolsContext): (ar
 
     // Read and encode all images
     const dataUris: string[] = [];
+    const absoluteImagePaths: string[] = [];
     for (const imagePath of imagePaths) {
       const absoluteImagePath = pathModule.isAbsolute(imagePath)
         ? imagePath
         : pathModule.join(ctx.projectRoot, imagePath);
+      absoluteImagePaths.push(absoluteImagePath);
 
       // Check image exists
       try {
@@ -836,9 +851,23 @@ export function generateGenerate3DFromImageHandler(ctx: ThreeDToolsContext): (ar
       await fs.mkdir(pathModule.dirname(absoluteOutputPath), { recursive: true });
       await fs.writeFile(absoluteOutputPath, modelBuffer);
 
-      // Trigger ingestion callback for the 3D model
-      if (ctx.onFileCreated) {
-        await ctx.onFileCreated(absoluteOutputPath, '3d');
+      // Ingest the 3D model with description and source relationships
+      let ingested = false;
+      if (ctx.onContentExtracted) {
+        try {
+          const imageList = absoluteImagePaths.map(p => pathModule.basename(p)).join(', ');
+          const description = `3D model generated from images: ${imageList}`;
+          const ingestResult = await ctx.onContentExtracted({
+            filePath: absoluteOutputPath,
+            description,
+            extractionMethod: 'ai-generated-3d',
+            generateEmbeddings: true,
+            sourceFiles: absoluteImagePaths,
+          });
+          ingested = ingestResult.updated;
+        } catch (e) {
+          console.warn(`[threed-tools] Failed to ingest 3D model: ${e}`);
+        }
       }
 
       return {
@@ -848,6 +877,7 @@ export function generateGenerate3DFromImageHandler(ctx: ThreeDToolsContext): (ar
         format: 'glb',
         input_images: imagePaths.length,
         processing_time_ms: Date.now() - startTime,
+        ingested,
       };
     } catch (err: any) {
       return { error: `Generation failed: ${err.message}` };
@@ -925,6 +955,24 @@ export function generateGenerate3DFromTextHandler(ctx: ThreeDToolsContext): (arg
 
       console.log('✅ 3D model generated successfully!');
 
+      // Ingest with the original text prompt and source images for better semantic search
+      let ingested = false;
+      if (ctx.onContentExtracted) {
+        try {
+          const description = `3D model generated from text prompt: "${prompt}" (style: ${style})`;
+          const ingestResult = await ctx.onContentExtracted({
+            filePath: result3D.absolute_path,
+            description,
+            extractionMethod: 'ai-generated-3d-from-text',
+            generateEmbeddings: true,
+            sourceFiles: imagePaths, // The multiview images used
+          });
+          ingested = ingestResult.updated;
+        } catch (e) {
+          console.warn(`[threed-tools] Failed to ingest 3D model: ${e}`);
+        }
+      }
+
       // Clean up temp directory
       try {
         await fs.rm(tempDir, { recursive: true });
@@ -939,6 +987,7 @@ export function generateGenerate3DFromTextHandler(ctx: ThreeDToolsContext): (arg
         absolute_path: result3D.absolute_path,
         format: 'glb',
         processing_time_ms: Date.now() - startTime,
+        ingested,
         steps: {
           multiview: {
             images_generated: imagePaths.length,
@@ -1053,14 +1102,6 @@ export function generateAnalyze3DModelHandler(ctx: ThreeDAnalyzeContext): (args:
     const pathModule = await import('path');
     const os = await import('os');
 
-    if (!ctx.threeDService) {
-      return { error: 'ThreeDService not configured. Cannot analyze 3D models.' };
-    }
-
-    if (!ctx.projectId) {
-      return { error: 'Project ID not configured.' };
-    }
-
     const startTime = Date.now();
 
     // Determine output directory
@@ -1069,6 +1110,11 @@ export function generateAnalyze3DModelHandler(ctx: ThreeDAnalyzeContext): (args:
       : pathModule.join(os.tmpdir(), `ragforge-3d-analyze-${Date.now()}`);
 
     await fs.mkdir(actualOutputDir, { recursive: true });
+
+    // Resolve model path
+    const absoluteModelPath = pathModule.isAbsolute(model_path)
+      ? model_path
+      : pathModule.join(ctx.projectRoot, model_path);
 
     try {
       console.log('📷 Step 1/3: Rendering 3D model views...');
@@ -1093,45 +1139,140 @@ export function generateAnalyze3DModelHandler(ctx: ThreeDAnalyzeContext): (args:
 
       console.log(`✅ Rendered ${renderResult.renders.length} views`);
 
-      // Step 2: Register views and create relationships
-      console.log('🔗 Step 2/3: Registering views in knowledge graph...');
+      // Mode 1: Full service mode (with threeDService)
+      if (ctx.threeDService && ctx.projectId) {
+        console.log('🔗 Step 2/3: Registering views in knowledge graph...');
 
-      const { threeDFileUuid, imageUuids } = await ctx.threeDService.registerRenderedViews(
-        model_path,
-        ctx.projectId,
-        renderResult.renders
-      );
+        const { threeDFileUuid, imageUuids } = await ctx.threeDService.registerRenderedViews(
+          model_path,
+          ctx.projectId,
+          renderResult.renders
+        );
 
-      console.log(`✅ Created ${imageUuids.length} ImageFile nodes with RENDERED_AS relationships`);
+        console.log(`✅ Created ${imageUuids.length} ImageFile nodes with RENDERED_AS relationships`);
 
-      // Step 3: Describe views
-      console.log('🔍 Step 3/3: Generating descriptions...');
+        console.log('🔍 Step 3/3: Generating descriptions...');
 
-      const descriptions = await ctx.threeDService.describeRenderedViews(
-        threeDFileUuid,
-        ctx.projectId
-      );
+        const descriptions = await ctx.threeDService.describeRenderedViews(
+          threeDFileUuid,
+          ctx.projectId
+        );
 
-      console.log(`✅ Generated ${descriptions.length} view descriptions`);
+        console.log(`✅ Generated ${descriptions.length} view descriptions`);
 
-      // Step 4: Synthesize global description
-      console.log('📝 Synthesizing global description...');
+        console.log('📝 Synthesizing global description...');
 
-      const globalDescription = await ctx.threeDService.synthesizeGlobalDescription(threeDFileUuid);
+        const globalDescription = await ctx.threeDService.synthesizeGlobalDescription(threeDFileUuid);
+
+        console.log('✅ Analysis complete!');
+
+        return {
+          model_path,
+          threeDFileUuid,
+          views_analyzed: views,
+          renders: renderResult.renders,
+          descriptions: descriptions.map(d => ({
+            view: d.view,
+            description: d.description,
+          })),
+          global_description: globalDescription,
+          processing_time_ms: Date.now() - startTime,
+          mode: 'full-service',
+        };
+      }
+
+      // Mode 2: Standalone mode (with onContentExtracted callback)
+      console.log('🔍 Step 2/2: Generating descriptions with Gemini Vision...');
+
+      const { getOCRService } = await import('../runtime/index.js');
+      const ocrService = getOCRService({ primaryProvider: 'gemini' });
+
+      if (!ocrService.isAvailable()) {
+        return {
+          error: 'Gemini Vision not available. Set GEMINI_API_KEY environment variable.',
+          renders: renderResult.renders,
+        };
+      }
+
+      const descriptions: Array<{ view: string; description: string }> = [];
+
+      for (const render of renderResult.renders) {
+        const absolutePath = pathModule.join(actualOutputDir, pathModule.basename(render.path));
+        try {
+          const result = await ocrService.extractText(absolutePath, {
+            prompt: `Describe this ${render.view} view of a 3D model. Focus on shape, features, and visual characteristics.`,
+          });
+          if (result.text) {
+            descriptions.push({ view: render.view, description: result.text });
+
+            // Ingest to brain if callback provided
+            if (ctx.onContentExtracted) {
+              await ctx.onContentExtracted({
+                filePath: absolutePath,
+                description: result.text,
+                extractionMethod: 'gemini-vision',
+                generateEmbeddings: true,
+              });
+            }
+          }
+        } catch (err: any) {
+          console.warn(`[analyze_3d_model] Failed to describe ${render.view}: ${err.message}`);
+        }
+      }
+
+      // Synthesize global description from all views
+      let globalDescription: string | undefined;
+      if (descriptions.length > 0) {
+        const allDescriptions = descriptions.map(d => `${d.view}: ${d.description}`).join('\n');
+        try {
+          const synthResult = await ocrService.extractText(
+            pathModule.join(actualOutputDir, pathModule.basename(renderResult.renders[0].path)),
+            {
+              prompt: `Based on these view descriptions of a 3D model, write a single comprehensive description:\n\n${allDescriptions}\n\nWrite a unified description of this 3D model:`,
+            }
+          );
+          globalDescription = synthResult.text;
+
+          // Ingest global description for the 3D model itself
+          let ingested = false;
+          if (ctx.onContentExtracted && globalDescription) {
+            const ingestResult = await ctx.onContentExtracted({
+              filePath: absoluteModelPath,
+              description: globalDescription,
+              extractionMethod: 'gemini-vision-synthesis',
+              generateEmbeddings: true,
+            });
+            ingested = ingestResult.updated;
+          }
+
+          console.log('✅ Analysis complete!');
+
+          return {
+            model_path,
+            views_analyzed: views,
+            renders: renderResult.renders,
+            descriptions,
+            global_description: globalDescription,
+            processing_time_ms: Date.now() - startTime,
+            mode: 'standalone',
+            ingested,
+          };
+        } catch (err: any) {
+          console.warn(`[analyze_3d_model] Failed to synthesize description: ${err.message}`);
+        }
+      }
 
       console.log('✅ Analysis complete!');
 
       return {
         model_path,
-        threeDFileUuid,
         views_analyzed: views,
         renders: renderResult.renders,
-        descriptions: descriptions.map(d => ({
-          view: d.view,
-          description: d.description,
-        })),
+        descriptions,
         global_description: globalDescription,
         processing_time_ms: Date.now() - startTime,
+        mode: 'standalone',
+        ingested: false,
       };
     } catch (err: any) {
       return { error: `Analysis failed: ${err.message}` };

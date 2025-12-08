@@ -163,6 +163,11 @@ Example usage:
 - "description": search by docstrings, descriptions (for "documented as authentication")
 - "all": search all embeddings and merge results (default)`,
         },
+        glob: {
+          type: 'string',
+          optional: true,
+          description: 'Filter results by file path glob pattern (e.g., "**/*.ts", "src/tools/*.ts"). Optional, no filtering by default.',
+        },
         limit: {
           type: 'number',
           description: 'Maximum number of results (default: 20)',
@@ -183,6 +188,7 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
     types?: string[];
     semantic?: boolean;
     embedding_type?: 'name' | 'content' | 'description' | 'all';
+    glob?: string;
     limit?: number;
   }): Promise<UnifiedSearchResult> => {
     const options: BrainSearchOptions = {
@@ -190,6 +196,7 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
       nodeTypes: params.types,
       semantic: params.semantic,
       embeddingType: params.embedding_type,
+      glob: params.glob,
       limit: params.limit,
     };
 

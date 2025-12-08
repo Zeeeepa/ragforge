@@ -18,7 +18,11 @@ import {
   BrainManager,
   generateBrainToolHandlers,
   generateSetupToolHandlers,
+  generateImageTools,
+  generate3DTools,
   type BrainToolsContext,
+  type ImageToolsContext,
+  type ThreeDToolsContext,
 } from '@luciformresearch/ragforge';
 
 export interface TestToolOptions {
@@ -122,15 +126,31 @@ export async function runTestTool(options: TestToolOptions): Promise<void> {
 
     // Create context
     log('⏳ Creating tool context...');
-    const ctx: BrainToolsContext = { brain };
+    const brainCtx: BrainToolsContext = { brain };
+    const imageCtx: ImageToolsContext = {
+      projectRoot: process.cwd(),
+      onContentExtracted: async (params) => {
+        return await brain!.updateMediaContent(params);
+      },
+    };
+    const threeDCtx: ThreeDToolsContext = {
+      projectRoot: process.cwd(),
+      onContentExtracted: async (params) => {
+        return await brain!.updateMediaContent(params);
+      },
+    };
 
     // Get all tool handlers
     log('⏳ Generating tool handlers...');
-    const brainHandlers = generateBrainToolHandlers(ctx);
-    const setupHandlers = generateSetupToolHandlers(ctx);
+    const brainHandlers = generateBrainToolHandlers(brainCtx);
+    const setupHandlers = generateSetupToolHandlers(brainCtx);
+    const imageTools = generateImageTools(imageCtx);
+    const threeDTools = generate3DTools(threeDCtx);
     const allHandlers: Record<string, (params: any) => Promise<any>> = {
       ...brainHandlers,
       ...setupHandlers,
+      ...imageTools.handlers,
+      ...threeDTools.handlers,
     };
     log(`✓ ${Object.keys(allHandlers).length} tools ready`);
 
