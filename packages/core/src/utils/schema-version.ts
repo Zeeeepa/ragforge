@@ -1,7 +1,7 @@
 /**
  * Schema Version Management
  *
- * Computes schema hashes from the NODE_SCHEMAS definition.
+ * Computes schema hashes from NODE_SCHEMAS (the single source of truth).
  * This ensures all nodes of the same type get the same schemaVersion,
  * regardless of which optional properties they have.
  *

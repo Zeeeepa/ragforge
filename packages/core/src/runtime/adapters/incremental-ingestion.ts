@@ -13,6 +13,7 @@ import { isStructuralNode } from '../../utils/node-schema.js';
 import { addSchemaVersion } from '../../utils/schema-version.js';
 import { createHash } from 'crypto';
 import { globby } from 'globby';
+import * as pathModule from 'path';
 
 export interface IncrementalStats {
   unchanged: number;
@@ -166,9 +167,9 @@ export class IncrementalIngestionManager {
     changedFiles: string[];
     unchangedFiles: Set<string>;
     newHashes: Map<string, string>;
+    rootPath: string;
   }> {
     const fs = await import('fs/promises');
-    const pathModule = await import('path');
     const pLimit = (await import('p-limit')).default;
 
     const rootPath = config.root || process.cwd();
@@ -254,7 +255,7 @@ export class IncrementalIngestionManager {
       }
     }
 
-    return { allFiles, changedFiles, unchangedFiles, newHashes };
+    return { allFiles, changedFiles, unchangedFiles, newHashes, rootPath };
   }
 
   /**
@@ -845,6 +846,18 @@ export class IncrementalIngestionManager {
           created: 0,
           deleted: 0
         };
+      }
+
+      // Delete existing nodes for changed files BEFORE re-parsing
+      // This prevents orphan nodes when function signatures change (different UUIDs)
+      if (filterResult.changedFiles.length > 0) {
+        const relPaths = filterResult.changedFiles.map(f =>
+          pathModule.relative(filterResult.rootPath, f)
+        );
+        const deletedCount = await this.deleteNodesForFiles(relPaths);
+        if (verbose && deletedCount > 0) {
+          console.log(`   🗑️ Deleted ${deletedCount} nodes from ${relPaths.length} changed files`);
+        }
       }
     }
 
