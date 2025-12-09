@@ -231,10 +231,11 @@ export class CodeSourceAdapter extends SourceAdapter {
 
   /**
    * Get or initialize Markdown parser
+   * Passes the ParserRegistry to reuse initialized parsers and avoid version conflicts
    */
   private async getMarkdownParser(): Promise<MarkdownParser> {
     if (!this.markdownParser) {
-      this.markdownParser = new MarkdownParser();
+      this.markdownParser = new MarkdownParser(this.registry);
       await this.markdownParser.initialize();
     }
     return this.markdownParser;
