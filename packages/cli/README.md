@@ -1,27 +1,17 @@
 # @luciformresearch/ragforge-cli
 
-Command-line interface for RagForge. Introspect Neo4j schemas, generate type-safe clients, manage embeddings, and bootstrap RAG projects from YAML configs.
+**Command-line interface for RagForge - Universal RAG Agent with Persistent Local Brain**
 
-### ⚖️ License – Luciform Research Source License (LRSL) v1.1
+### License – Luciform Research Source License (LRSL) v1.1
 
 **© 2025 Luciform Research. All rights reserved except as granted below.**
 
-✅ **Free to use for:**
-- 🧠 Research, education, personal exploration
-- 💻 Freelance or small-scale projects (≤ €100,000 gross monthly revenue)
-- 🏢 Internal tools (if your company revenue ≤ €100,000/month)
-
-🔒 **Commercial use above this threshold** requires a separate agreement.
-
-📧 Contact for commercial licensing: [legal@luciformresearch.com](mailto:legal@luciformresearch.com)
-
-⏰ **Grace period:** 60 days after crossing the revenue threshold
-
-📜 Full text: [LICENSE](./LICENSE)
+- **Free to use for:** Research, education, personal projects, freelance/small-scale (≤ €100k/month revenue)
+- **Commercial use above threshold** requires separate agreement
+- **Contact:** [legal@luciformresearch.com](mailto:legal@luciformresearch.com)
+- **Full text:** [LICENSE](./LICENSE)
 
 ---
-
-**Note:** This is a custom "source-available" license, NOT an OSI-approved open source license.
 
 ## Installation
 
@@ -35,403 +25,217 @@ Or use directly with npx:
 npx @luciformresearch/ragforge-cli --help
 ```
 
-## Quick Start
-
-**Three ways to start:**
-
-### 1. From Scratch (All-in-One)
-```bash
-# Introspects your Neo4j DB, generates config YAML, and builds the client
-ragforge init --project my-rag --out ./my-rag-project
-```
-
-### 2. Introspect First (Recommended for customization)
-```bash
-# Step 1: Analyze your database and generate intelligent YAML config
-ragforge introspect --project my-rag --out ./my-rag-project
-
-# Step 2: Edit ragforge.config.yaml to customize
-# (add vector indexes, configure searchable fields, etc.)
-
-# Step 3: Generate the client from your customized config
-ragforge generate --config ./my-rag-project/ragforge.config.yaml --out ./my-rag-project
-```
-
-### 3. From Existing Config
-```bash
-# If you already have a ragforge.config.yaml
-ragforge generate --config ./ragforge.config.yaml --out ./generated
-```
-
-**Then setup embeddings:**
-```bash
-# Create vector indexes in Neo4j
-ragforge embeddings:index --config ./ragforge.config.yaml
-
-# Generate embeddings for your data
-ragforge embeddings:generate --config ./ragforge.config.yaml
-```
+---
 
 ## Commands
 
-### `ragforge init`
+### `ragforge mcp`
 
-Bootstrap a new RAG project by introspecting Neo4j and generating everything.
+Start the MCP (Model Context Protocol) server for integration with Claude, GPT, and other MCP-compatible clients.
 
 ```bash
-ragforge init \
-  --project my-project \
-  --out ./my-rag-project \
-  [--uri bolt://localhost:7687] \
-  [--username neo4j] \
-  [--password password] \
-  [--force]
+ragforge mcp
+```
 
-> All artefacts (ragforge.config.yaml, schema.json, client files) are written directly into \`--out\`.
+**MCP Configuration (claude_desktop_config.json):**
+
+```json
+{
+  "mcpServers": {
+    "ragforge": {
+      "command": "ragforge",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+**Available MCP Tools:**
+
+| Category | Tools |
+|----------|-------|
+| **Brain** | `brain_search`, `ingest_directory`, `ingest_web_page`, `forget_path`, `list_brain_projects` |
+| **Files** | `read_file`, `write_file`, `edit_file`, `create_file`, `delete_path`, `move_file`, `copy_file` |
+| **Directory** | `list_directory`, `glob_files`, `grep_files`, `search_files`, `file_exists`, `get_file_info` |
+| **Shell** | `run_command`, `run_npm_script`, `git_status`, `git_diff` |
+| **Media** | `generate_image`, `edit_image`, `read_image`, `describe_image`, `list_images` |
+| **3D** | `generate_3d_from_text`, `generate_3d_from_image`, `generate_multiview_images`, `render_3d_asset`, `analyze_3d_model` |
+| **Web** | `fetch_web_page`, `search_web` |
+| **Project** | `create_project`, `list_projects`, `switch_project`, `unload_project`, `exclude_project`, `include_project` |
+| **Config** | `get_working_directory`, `get_environment_info`, `get_project_info`, `get_brain_status` |
+| **Admin** | `set_api_key`, `cleanup_brain`, `run_cypher` |
+
+---
+
+### `ragforge agent`
+
+Run the AI agent for natural language interaction with your codebase.
+
+```bash
+# Ask a question
+ragforge agent --ask "What functions handle authentication?"
+
+# Create a project
+ragforge agent --ask "Create a TypeScript project called my-api"
+
+# Use a specific model
+ragforge agent --model gemini-2.0-flash --ask "Explain this codebase"
+
+# Verbose mode
+ragforge agent --verbose --ask "Find all TODO comments"
 ```
 
 **Options:**
-- `--project <name>` - Project name
-- `--out <dir>` - Output directory (ragforge.config.yaml + client files)
-- `--uri` - Neo4j URI (or set `NEO4J_URI` env)
-- `--username` - Neo4j username (or set `NEO4J_USERNAME` env)
-- `--password` - Neo4j password (or set `NEO4J_PASSWORD` env)
-- `--force` - Overwrite existing files
-- `--auto-detect-fields` - Auto-detect searchable fields using LLM
-
-**Generates (inside \`--out\`):**
-- `ragforge.config.yaml` - Configuration file
-- `schema.json` - Introspected Neo4j schema
-- `client.ts`, `types.ts`, `queries/*`, `docs/*`, `scripts/*`, `embeddings/*`
-- `.env` - Environment variables template
+- `--ask <prompt>` - Question or task for the agent
+- `--project <path>` - Project directory (default: current directory)
+- `--model <name>` - Model to use (default: gemini-2.0-flash)
+- `--persona <text>` - Custom persona for the agent
+- `--verbose` - Enable verbose logging
 
 ---
+
+### `ragforge ingest`
+
+Manually ingest a directory into the brain.
+
+```bash
+# Ingest current directory
+ragforge ingest
+
+# Ingest specific path
+ragforge ingest --path /path/to/project
+
+# With custom name
+ragforge ingest --path ./docs --name my-docs
+
+# Generate embeddings
+ragforge ingest --path ./src --embeddings
+```
+
+**Options:**
+- `--path <dir>` - Directory to ingest (default: current directory)
+- `--name <name>` - Custom project name
+- `--embeddings` - Generate embeddings for semantic search
+- `--watch` - Watch for file changes after ingestion
+
+---
+
+### `ragforge quickstart`
+
+Interactive setup wizard for new projects.
+
+```bash
+ragforge quickstart
+```
+
+---
+
+## Configuration
+
+### Environment Variables
+
+Create `~/.ragforge/.env` (global) or `.ragforge/.env` (project-local):
+
+```env
+# Neo4j (required)
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=your-password
+
+# Gemini (required for embeddings, search, image generation)
+GEMINI_API_KEY=your-gemini-key
+
+# Replicate (optional, for 3D generation)
+REPLICATE_API_TOKEN=your-replicate-token
+```
+
+### Brain Location
+
+The brain persists in `~/.ragforge/`:
+- `projects.yaml` - Registered projects
+- `neo4j/` - Docker container data (if using auto-setup)
+- `.env` - Global credentials
+
+---
+
+## Features
+
+### Persistent Local Brain
+- **Daemon architecture** - Wakes on demand, shuts down cleanly
+- **File watching** - Incremental ingestion on file changes
+- **Diff-aware updates** - Only re-parse what changed
+- **Multi-project support** - Work on multiple codebases simultaneously
+- **Project exclusion** - Temporarily hide projects from search
+
+### Universal Ingestion
+
+**Code:** TypeScript, JavaScript, Python, Vue, Svelte, HTML, CSS, and more (with regex fallback)
+
+**Documents:** PDF, DOCX, XLSX, Markdown, JSON, YAML, CSV
+
+**Media:** Images (OCR + Vision), 3D models (glTF, GLB, OBJ)
+
+**Web:** Recursive crawling, JS rendering, grounding search
+
+### Search & Understanding
+
+- **Semantic Search** - Vector embeddings via Gemini
+- **Fuzzy Search** - Levenshtein matching
+- **Smart Grep** - Regex across all files
+- **Custom Cypher** - Direct Neo4j queries
+
+### Media Generation
+
+- **Images** - Text-to-image, editing via Gemini
+- **3D Models** - Text/image-to-3D via Trellis
+
+---
+
+## Legacy Commands
+
+These commands are for the legacy code generation workflow:
+
+### `ragforge init`
+
+Bootstrap a new RAG project by introspecting Neo4j.
+
+```bash
+ragforge init --project my-project --out ./output
+```
 
 ### `ragforge introspect`
 
-**Intelligently** introspect your Neo4j database and generate a smart YAML configuration.
-
-This command analyzes your graph schema and:
-- Detects your domain (code, e-commerce, documentation, etc.)
-- Suggests searchable entities and fields
-- Identifies relationships for filtering
-- Finds working examples from your actual data
-- Generates an optimized YAML config ready to customize
+Analyze Neo4j database and generate YAML configuration.
 
 ```bash
-ragforge introspect \
-  --project my-project \
-  --out ./output \
-  [--uri bolt://localhost:7687] \
-  [--username neo4j] \
-  [--password password] \
-  [--force]
+ragforge introspect --project my-project --out ./output
 ```
-
-**Generates:**
-- `schema.json` - Complete Neo4j schema snapshot
-- `ragforge.config.yaml` - **Intelligent configuration** with:
-  - Auto-detected entities
-  - Suggested searchable fields
-  - Relationship configurations
-  - Working examples from your data
-
----
 
 ### `ragforge generate`
 
 Generate type-safe client from YAML configuration.
 
 ```bash
-ragforge generate \
-  --config ./ragforge.config.yaml \
-  --out ./generated \
-  [--schema ./schema.json] \
-  [--force] \
-  [--rewrite-config] \
-  [--auto-detect-fields]
+ragforge generate --config ./ragforge.config.yaml --out ./generated
 ```
-
-**Options:**
-- `--config <path>` - Path to ragforge.config.yaml
-- `--out <dir>` - Output directory
-- `--schema <path>` - Path to schema.json (optional, will introspect if not provided)
-- `--force` - Overwrite existing files
-- `--rewrite-config` - Regenerate ragforge.config.yaml from the live schema before emitting code
-- `--auto-detect-fields` - **🤖 Use LLM to intelligently detect searchable fields**
-  - Analyzes your actual data in Neo4j
-  - Suggests which fields are best for filtering
-  - Detects field types and patterns
-  - Requires `GEMINI_API_KEY` environment variable
-
-**Generates:**
-- `client.ts` - Type-safe RAG client
-- `types.ts` - TypeScript types
-- `queries/*.ts` - Entity-specific query builders
-- `scripts/*.ts` - Embedding management scripts
-- `embeddings/load-config.ts` - Runtime config loader
-- `docs/client-reference.md` - API documentation
-- `agent.ts` - MCP agent template
-- `packages/runtime/` - Standalone runtime copy
-
----
 
 ### `ragforge embeddings:index`
 
-Create vector indexes in Neo4j from YAML configuration.
+Create vector indexes in Neo4j.
 
 ```bash
-ragforge embeddings:index \
-  --config ./ragforge.config.yaml \
-  [--out ./generated]
+ragforge embeddings:index --config ./ragforge.config.yaml
 ```
-
-**Note:** Reads Neo4j credentials from environment variables or `.env` file.
-
----
 
 ### `ragforge embeddings:generate`
 
-Generate embeddings for all configured vector indexes.
+Generate embeddings for configured indexes.
 
 ```bash
-ragforge embeddings:generate \
-  --config ./ragforge.config.yaml \
-  [--out ./generated]
+ragforge embeddings:generate --config ./ragforge.config.yaml
 ```
-
-**Note:** Requires `GEMINI_API_KEY` environment variable.
 
 ---
-
-## Configuration
-
-Create a `.env` file with your credentials:
-
-```env
-NEO4J_URI=bolt://localhost:7687
-NEO4J_USERNAME=neo4j
-NEO4J_PASSWORD=your-password
-NEO4J_DATABASE=neo4j
-GEMINI_API_KEY=your-api-key
-```
-
-## Example Workflow
-
-### 1. Initialize Your RAG Project
-
-```bash
-# Introspect your Neo4j database and bootstrap a project
-ragforge init --project my-rag --out ./my-rag-project
-
-cd my-rag-project
-```
-
-This creates:
-- `ragforge.config.yaml` - Configuration template from your Neo4j schema
-- `schema.json` - Snapshot of your database schema
-- `generated/` - Type-safe client and utilities
-- `.env` - Environment variable template
-
-### 2. Configure Your RAG
-
-Edit `ragforge.config.yaml` to:
-- Define which entities are searchable
-- Configure vector indexes (field, model, dimension)
-- Specify relationship filters
-- Set up reranking strategies
-
-Example config:
-```yaml
-name: my-rag
-entities:
-  - name: Document
-    searchable_fields:
-      - { name: title, type: string }
-      - { name: category, type: string }
-    vector_indexes:
-      - name: documentEmbeddings
-        field: embedding
-        source_field: content
-        model: gemini-embedding-001
-        dimension: 768
-    relationships:
-      - type: REFERENCES
-        direction: outgoing
-        target: Document
-        filters:
-          - { name: whereReferences, direction: outgoing }
-```
-
-### 3. Generate Your Client
-
-```bash
-# Regenerate with your custom config
-ragforge generate \
-  --config ./ragforge.config.yaml \
-  --out ./generated \
-  --force
-
-# Or use auto-detection for searchable fields
-ragforge generate \
-  --config ./ragforge.config.yaml \
-  --out ./generated \
-  --auto-detect-fields
-```
-
-### 4. Setup Vector Indexes
-
-```bash
-# Create vector indexes in Neo4j
-npm run embeddings:index
-
-# Generate embeddings for your data
-npm run embeddings:generate
-```
-
-### 5. Use Your RAG Framework
-
-```typescript
-// Import the generated client
-import { createRagClient } from './client.js';
-
-// Initialize
-const rag = createRagClient({
-  neo4j: {
-    uri: process.env.NEO4J_URI,
-    username: process.env.NEO4J_USERNAME,
-    password: process.env.NEO4J_PASSWORD
-  }
-});
-
-// Semantic search
-const docs = await rag
-  .document()
-  .semanticSearch('machine learning algorithms', { topK: 10 })
-  .whereCategory('technical')
-  .execute();
-
-// Relationship traversal
-const relatedDocs = await rag
-  .document()
-  .semanticSearch('neural networks', { topK: 5 })
-  .whereReferences('deep-learning-guide')
-  .execute();
-
-// Close when done
-await rag.close();
-```
-
-### 6. Run Examples
-
-```bash
-# Try the generated examples
-# (one npm script per generated file – use the filename without .ts)
-npm run examples:01-semantic-search-content
-npm run examples:02-llm-reranking
-
-# Or create your own
-tsx ./my-query.ts
-```
-
-## Generated Project Structure
-
-When you run `ragforge init` or `ragforge generate`, a complete RAG framework is created:
-
-```
-my-rag-project/
-├── ragforge.config.yaml            # Your RAG configuration
-├── schema.json                     # Introspected Neo4j schema
-├── .env                            # Environment variables
-├── package.json                    # Ready to use with npm scripts
-├── client.ts                       # Type-safe RAG client
-├── index.ts                        # Main exports
-├── types.ts                        # TypeScript type definitions
-├── queries/                        # Entity-specific query builders
-├── scripts/                        # Maintenance scripts
-├── embeddings/                     # Embedding configuration + loader
-├── docs/                           # Generated documentation
-├── examples/                       # Ready-to-run examples
-├── agent.ts                        # MCP agent factory
-├── documentation.ts                # Embedded documentation
-├── packages/runtime/               # Standalone runtime copy (dev mode)
-└── node_modules/                   # Dependencies (auto-installed)
-```
-
-### What You Get
-
-**Type-Safe Client** (`client.ts`):
-```typescript
-import { createRagClient } from './client.js';
-
-const rag = createRagClient({
-  neo4j: {
-    uri: process.env.NEO4J_URI,
-    username: process.env.NEO4J_USERNAME,
-    password: process.env.NEO4J_PASSWORD
-  }
-});
-
-// Fluent API with autocomplete
-const results = await rag
-  .scope()
-  .semanticSearchBySource('authentication logic', { topK: 10 })
-  .whereType('function')
-  .execute();
-```
-
-**Query Builders** (`queries/*.ts`):
-- One file per entity type
-- Semantic search methods for each vector index
-- Relationship filters based on your graph
-- Type-safe parameters with autocomplete
-
-**Embedding Scripts** (`scripts/*.ts`):
-```bash
-# Create vector indexes in Neo4j
-npm run embeddings:index
-
-# Generate embeddings for all entities
-npm run embeddings:generate
-```
-
-**Examples** (`examples/*.ts`) - **Auto-generated from YOUR data**:
-
-RagForge introspects your actual database and generates working examples with real data:
-
-- **`01-semantic-search-*.ts`** - One per vector index (e.g., `01-semantic-search-content.ts`, `02-semantic-search-title.ts`)
-- **`0X-relationship-*.ts`** - One per relationship type (e.g., `03-relationship-references.ts`, `04-relationship-authored_by.ts`)
-- **`0X-llm-reranking.ts`** - Semantic search + LLM-based relevance reranking
-- **`0X-metadata-tracking.ts`** - Pipeline observability and debugging
-- **`0X-complex-pipeline.ts`** - Multi-stage queries combining all features
-- **`0X-conditional-search.ts`** - Dynamic search strategies
-- **`0X-breadth-first.ts`** - Graph exploration patterns
-- **`0X-stopping-criteria.ts`** - Advanced result filtering
-
-**All examples use**:
-- Real entity names from your database
-- Actual field values that exist in your data
-- Working relationship examples guaranteed to return results
-- Your configured vector index names
-
-**How to run examples**:
-```bash
-# Using npm scripts (one per generated file – same name as the .ts file)
-npm run examples:01-semantic-search-content
-npm run examples:02-llm-reranking
-
-# Or run any generated example directly
-tsx examples/01-semantic-search-content.ts
-tsx examples/03-relationship-references.ts
-tsx examples/08-llm-reranking.ts
-# ... and all the others!
-```
-
-**Documentation** (`docs/*.md`):
-- Complete API reference
-- All available methods and filters
-- Example queries for each entity
-- MCP agent integration guide
 
 ## Development
 
@@ -444,18 +248,18 @@ npm run dev
 
 # Test
 npm test
-
-# Lint
-npm run lint
 ```
+
+---
 
 ## Part of RagForge
 
-This package is part of the [RagForge](https://github.com/LuciformResearch/ragforge) meta-framework.
+This package is part of the [RagForge](https://github.com/LuciformResearch/ragforge) framework.
 
 **Related Packages:**
-- [`@luciformresearch/ragforge-core`](https://www.npmjs.com/package/@luciformresearch/ragforge-core) - Schema analysis and code generation
-- [`@luciformresearch/ragforge-runtime`](https://www.npmjs.com/package/@luciformresearch/ragforge-runtime) - Runtime library for executing RAG queries
+- [`@luciformresearch/ragforge`](https://www.npmjs.com/package/@luciformresearch/ragforge) - Core library
+
+---
 
 ## License
 

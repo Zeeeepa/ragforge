@@ -1,6 +1,6 @@
 # RagForge
 
-**Universal RAG Agent with Persistent Memory**
+**Universal RAG Agent with Persistent Local Brain**
 
 > Transform any codebase, documents, or web content into a searchable knowledge graph with AI-powered tools.
 
@@ -17,20 +17,19 @@
 
 ## What is RagForge?
 
-RagForge is an **AI agent framework** with:
+RagForge is an **AI agent framework** with a **local persistent brain** (`~/.ragforge`):
 
-- **Persistent Brain** - Neo4j-backed knowledge graph that remembers everything
-- **Universal Ingestion** - Code, documents, images, 3D models, web pages
-- **Semantic Search** - Vector embeddings for meaning-based queries
-- **Media Tools** - Generate images and 3D models from text
-- **Web Crawling** - Fetch and ingest web pages with recursive depth
-- **Multi-Project Support** - Work on multiple codebases simultaneously
+- **Daemon architecture** - Wakes on demand, shuts down cleanly
+- **File watching** - Incremental ingestion on file changes
+- **Diff-aware updates** - Only re-parse what changed
+- **Multi-project support** - Work on multiple codebases simultaneously
+- **Optimized for scale** - Handles very large projects efficiently
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      AGENT BRAIN                            │
+│                      AGENT BRAIN (~/.ragforge)              │
 │  ┌─────────────────────────────────────────────────────┐   │
-│  │                    Neo4j                             │   │
+│  │                    Neo4j + Embeddings               │   │
 │  │  ┌──────────┐ ┌──────────┐ ┌──────────┐            │   │
 │  │  │Project A │ │Quick     │ │Web Pages │            │   │
 │  │  │(code)    │ │Ingest    │ │(docs)    │            │   │
@@ -39,15 +38,90 @@ RagForge is an **AI agent framework** with:
 │  │         Unified Semantic Search                     │   │
 │  └─────────────────────────────────────────────────────┘   │
 │                                                             │
-│  AGENT TOOLS                                                │
-│  • brain_search      - Search across all knowledge          │
-│  • ingest_directory  - Ingest any folder                    │
-│  • fetch_web_page    - Fetch & crawl web pages              │
-│  • generate_image    - Text-to-image (Gemini)               │
-│  • generate_3d       - Text/image-to-3D (Trellis)           │
-│  • write_file        - Create/edit files with auto-ingest   │
+│  FILE WATCHER → Incremental Ingestion → Graph Update       │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Ingestion Capabilities
+
+### Code
+| Language | Parser |
+|----------|--------|
+| TypeScript, TSX | Full AST with scope extraction |
+| JavaScript, JSX | Full AST parsing |
+| Python | AST with class/function extraction |
+| Vue, Svelte | SFC parsing with script extraction |
+| HTML, CSS, SCSS | Structure extraction |
+| Other languages | Regex-based fallback parser |
+
+### Documents
+| Format | Method |
+|--------|--------|
+| PDF | Tika + Gemini Vision fallback |
+| DOCX | Native parsing |
+| XLSX | Sheet/cell extraction |
+| Markdown | Section/heading parsing |
+| JSON, YAML | Structure extraction |
+| CSV | Row/column parsing |
+
+### 3D & Media
+| Format | Features |
+|--------|----------|
+| glTF, GLB | Metadata + multi-view rendering |
+| OBJ | Geometry extraction |
+| Images (PNG, JPG...) | OCR + Vision + Embeddings |
+
+### Web
+| Feature | Description |
+|---------|-------------|
+| Web crawling | Recursive depth with link following |
+| JS rendering | Playwright for dynamic pages |
+| Grounding | Web search for real-time info |
+| LRU cache | Last 6 pages for quick re-access |
+
+---
+
+## Search & Understanding
+
+| Feature | Description |
+|---------|-------------|
+| **Semantic Search** | Ultra-fast vector embeddings via Gemini |
+| **Fuzzy Search** | Levenshtein matching without ingestion |
+| **Smart Grep** | Regex search across all files |
+| **Signature filtering** | Filter by function signature, docstring, type |
+| **Custom Cypher** | Direct graph queries |
+| **Consistency locks** | Search blocked during ingestion for coherence |
+
+---
+
+## Agentic Capabilities
+
+Compatible with local models and cloud APIs:
+
+| Feature | Description |
+|---------|-------------|
+| **Structured queries** | Prompts applied to responses |
+| **Batch processing** | Efficient bulk operations |
+| **File editing** | Read/write/edit with auto-ingest |
+| **Shell execution** | Whitelisted commands |
+| **Recursive sub-agents** | Spawn agents for complex tasks |
+| **MCP exposure** | Full tool access for advanced models |
+
+---
+
+## Media Generation
+
+| Tool | Description |
+|------|-------------|
+| `generate_image` | Text-to-image via Gemini |
+| `edit_image` | AI-powered image editing |
+| `generate_multiview_images` | 4 coherent views for 3D |
+| `generate_3d_from_text` | Full text-to-3D pipeline |
+| `generate_3d_from_image` | Image-to-3D via Trellis |
+| `render_3d_asset` | Multi-view 3D rendering |
+| `analyze_3d_model` | Vision analysis of 3D assets |
 
 ---
 
@@ -73,77 +147,43 @@ REPLICATE_API_TOKEN=your-token        # For 3D generation (optional)
 ### 3. Talk to the agent
 
 ```bash
-# Ask a question about your codebase (runs in current directory)
+# Ask a question about your codebase
 ragforge agent --ask "What functions handle authentication?"
 
 # Create a new project
 ragforge agent --ask "Create a TypeScript project called my-api"
 
-# Setup an existing codebase
-ragforge agent --ask "Setup this codebase for RAG"
+# Ingest and search web content
+ragforge agent --ask "Fetch the React docs and explain hooks"
 
-# Query the knowledge graph
-ragforge agent --ask "Show me all classes that implement BaseController"
-
-# Generate code
-ragforge agent --ask "Add a new endpoint for user registration"
-```
-
-The agent will:
-- Auto-load the project from current directory (if `.ragforge/` exists)
-- Create/setup projects on demand via natural language
-- Query Neo4j knowledge graph with semantic search
-- Read/write/edit files with auto-ingestion
-
-### Agent options
-
-```bash
-# Specify a different project directory
-ragforge agent --project /path/to/project --ask "..."
-
-# Use a specific model
-ragforge agent --model gemini-2.0-flash --ask "..."
-
-# Verbose mode for debugging
-ragforge agent --verbose --ask "..."
-
-# Custom persona
-ragforge agent --persona "A friendly assistant named Raggy" --ask "..."
+# Generate media
+ragforge agent --ask "Generate a 3D model of a rubber duck"
 ```
 
 ---
 
-## Features
+## MCP Server
 
-### Code Analysis
-- **TypeScript, Python, Vue, Svelte** - Full AST parsing with scope extraction
-- **Incremental ingestion** - Only re-parse changed files
-- **Cross-file relationships** - Track imports, calls, references
-- **Semantic search** - Find code by meaning, not just keywords
+RagForge exposes all tools via **Model Context Protocol** for use with Claude, GPT, and other MCP-compatible clients:
 
-### Document Ingestion
-- **PDF, DOCX, XLSX** - Via Tika or Gemini Vision
-- **Markdown, JSON, YAML, CSV** - Native parsing
-- **Images** - OCR + visual description via Gemini Vision
-- **3D Models** - GLB/GLTF metadata extraction
+```json
+{
+  "mcpServers": {
+    "ragforge": {
+      "command": "ragforge",
+      "args": ["mcp"]
+    }
+  }
+}
+```
 
-### Web Knowledge
-- **`fetch_web_page`** - Render JS-heavy pages with Playwright
-- **Recursive crawl** - Follow links with `depth` parameter
-- **LRU cache** - Last 6 pages cached for quick re-access
-- **`ingest_web_page`** - Save to brain for long-term memory
-
-### Media Generation
-- **`generate_image`** - Text-to-image via Gemini
-- **`generate_multiview_images`** - 4 coherent views for 3D reconstruction
-- **`generate_3d_from_image`** - Image-to-3D via Trellis (Replicate)
-- **`render_3d_asset`** - Render GLB to images with Three.js
-
-### Agent Brain
-- **Persistent memory** - Neo4j knowledge graph
-- **Cross-project search** - Query all loaded knowledge
-- **UUID deduplication** - Deterministic IDs prevent duplicates
-- **File watching** - Auto-ingest on file changes
+Available tools via MCP:
+- `brain_search`, `ingest_directory`, `ingest_web_page`
+- `read_file`, `write_file`, `edit_file`, `delete_path`
+- `run_command`, `git_status`, `git_diff`
+- `generate_image`, `generate_3d_from_text`, `render_3d_asset`
+- `fetch_web_page`, `search_web`
+- `exclude_project`, `include_project` (filter brain search)
 
 ---
 
@@ -152,7 +192,7 @@ ragforge agent --persona "A friendly assistant named Raggy" --ask "..."
 ```
 ragforge/
 ├── packages/
-│   ├── core/              # Main package (merged core + runtime)
+│   ├── core/              # Main package
 │   │   ├── src/
 │   │   │   ├── brain/           # BrainManager, knowledge persistence
 │   │   │   ├── runtime/
@@ -163,40 +203,27 @@ ragforge/
 │   │   │   └── tools/           # Agent tools (file, image, 3D, web, brain)
 │   │   └── defaults/            # Default YAML configs
 │   │
-│   ├── cli/               # CLI commands (agent, ingest, quickstart)
-│   └── runtime/           # Shim for backwards compatibility
+│   └── cli/               # CLI commands (agent, mcp, ingest)
 │
-├── docs/
-│   └── project/           # Design docs and roadmaps
-│       └── 7-dec-11h29-2025/   # Latest session docs
-│
+├── docs/project/          # Design docs and session notes
 └── examples/              # Example projects
 ```
 
 ---
 
-## Key Tools
+## Roadmap
 
-| Tool | Description |
-|------|-------------|
-| `brain_search` | Search across all ingested knowledge |
-| `ingest_directory` | Quick-ingest any folder into the brain |
-| `fetch_web_page` | Fetch & render web pages (supports `depth` for crawling) |
-| `ingest_web_page` | Save web page to brain permanently |
-| `generate_image` | Generate image from text prompt |
-| `generate_3d_from_text` | Generate 3D model from description |
-| `write_file` / `edit_file` | Create/modify files with auto-ingestion |
-| `query_entities` | Query the knowledge graph with conditions |
-| `semantic_search` | Vector similarity search |
-
----
-
-## Documentation
-
-- **[Session 7 Dec 2025](./docs/project/7-dec-11h29-2025/README.md)** - Latest development status
-- **[Agent Brain Roadmap](./docs/project/7-dec-11h29-2025/ROADMAP-AGENT-BRAIN.md)** - Brain architecture
-- **[Media Tools](./docs/project/MEDIA-TOOLS.md)** - Image & 3D generation
-- **[Universal Ingestion](./docs/project/UNIVERSAL-FILE-INGESTION.md)** - File type support
+- [x] Persistent brain with Neo4j
+- [x] Universal file ingestion
+- [x] Semantic search with embeddings
+- [x] Web crawling & grounding
+- [x] Image & 3D generation
+- [x] MCP server integration
+- [x] Project exclusion from search
+- [ ] API crawler (Swagger/OpenAPI)
+- [ ] Database crawler (schema extraction)
+- [ ] Terminal UI with Ink (React)
+- [ ] Collaborative multi-agent workflows
 
 ---
 
@@ -221,3 +248,7 @@ npm test
 
 - [GitHub Repository](https://github.com/LuciformResearch/ragforge)
 - [npm Packages](https://www.npmjs.com/search?q=%40luciformresearch%2Fragforge)
+
+---
+
+**#RAGForge #LuciformResearch #RAG #LLM #Agentic #DevTools #AIEngineering #Neo4j #MCP**

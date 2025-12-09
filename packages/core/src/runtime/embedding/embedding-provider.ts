@@ -63,7 +63,7 @@ export class GeminiEmbeddingProvider {
     const retryWithBackoff = async <T>(
       fn: () => Promise<T>,
       maxRetries = 5,
-      baseDelay = 2000
+      baseDelay = 60000 // 1 minute - Gemini rate limits are per-minute
     ): Promise<T> => {
       for (let attempt = 0; attempt <= maxRetries; attempt++) {
         try {
@@ -75,8 +75,10 @@ export class GeminiEmbeddingProvider {
             error.message?.includes('quota') ||
             error.message?.includes('RESOURCE_EXHAUSTED');
           if (attempt < maxRetries && isRateLimit) {
-            const delay = baseDelay * Math.pow(2, attempt);
-            console.warn(`[Embedding] Rate limited, retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})...`);
+            // Add jitter (0-10s) to avoid thundering herd
+            const jitter = Math.random() * 10000;
+            const delay = baseDelay * Math.pow(1.5, attempt) + jitter;
+            console.warn(`[Embedding] Rate limited, retrying in ${Math.round(delay / 1000)}s (attempt ${attempt + 1}/${maxRetries})...`);
             await new Promise(r => setTimeout(r, delay));
           } else {
             throw error;

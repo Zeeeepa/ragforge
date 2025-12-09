@@ -1,98 +1,178 @@
-# @luciformresearch/ragforge-core
+# @luciformresearch/ragforge
 
-Core library for RagForge - YAML config parsing, Neo4j schema introspection, and TypeScript code generation for domain-specific RAG frameworks.
+**Core library for RagForge - Universal RAG Agent with Persistent Local Brain**
 
-### ⚖️ License – Luciform Research Source License (LRSL) v1.1
+### License – Luciform Research Source License (LRSL) v1.1
 
 **© 2025 Luciform Research. All rights reserved except as granted below.**
 
-✅ **Free to use for:**
-- 🧠 Research, education, personal exploration
-- 💻 Freelance or small-scale projects (≤ €100,000 gross monthly revenue)
-- 🏢 Internal tools (if your company revenue ≤ €100,000/month)
-
-🔒 **Commercial use above this threshold** requires a separate agreement.
-
-📧 Contact for commercial licensing: [legal@luciformresearch.com](mailto:legal@luciformresearch.com)
-
-⏰ **Grace period:** 60 days after crossing the revenue threshold
-
-📜 Full text: [LICENSE](./LICENSE)
+- **Free to use for:** Research, education, personal projects, freelance/small-scale (≤ €100k/month revenue)
+- **Commercial use above threshold** requires separate agreement
+- **Contact:** [legal@luciformresearch.com](mailto:legal@luciformresearch.com)
+- **Full text:** [LICENSE](./LICENSE)
 
 ---
 
-**Note:** This is a custom "source-available" license, NOT an OSI-approved open source license.
 ## Features
 
-> **TEST_MARKDOWN_WATCHER_ZEPHYR_2024** - Cette phrase unique teste l'indexation temps réel des fichiers markdown.
+### Brain Manager
+Persistent knowledge graph with Neo4j:
+- Multi-project support with automatic switching
+- File watching with incremental ingestion
+- Diff-aware updates (only re-parse what changed)
+- Daemon architecture (wakes on demand, shuts down cleanly)
+- Project exclusion from search
 
-- **Schema Introspection**: Analyze Neo4j databases to extract schema information
-- **Config Loading**: Load and validate RagForge YAML configurations
-- **Type Definitions**: Complete TypeScript types for configs and schemas
+### Universal Ingestion
 
-## Usage
+**Code:**
+- TypeScript, JavaScript, TSX, JSX (full AST)
+- Python (AST with scope extraction)
+- Vue, Svelte (SFC parsing)
+- HTML, CSS, SCSS
+- Regex-based fallback for exotic types
 
-### Schema Introspection
+**Documents:**
+- PDF (Tika + Gemini Vision fallback)
+- DOCX, XLSX (native parsing)
+- Markdown (section/heading extraction)
+- JSON, YAML, CSV
 
-```typescript
-import { SchemaIntrospector } from '@luciformresearch/ragforge-core';
+**Media:**
+- Images (OCR + Vision + Embeddings)
+- 3D models (glTF, GLB, OBJ) with multi-view rendering
 
-const introspector = new SchemaIntrospector(
-  'bolt://localhost:7687',
-  'neo4j',
-  'password'
-);
+**Web:**
+- Recursive crawling with depth control
+- JS rendering via Playwright
+- Grounding for web search
+- LRU cache (last 6 pages)
 
-const schema = await introspector.introspect();
+### Search & Understanding
 
-console.log('Nodes:', schema.nodes);
-console.log('Relationships:', schema.relationships);
-console.log('Vector Indexes:', schema.vectorIndexes);
+- **Semantic Search** - Ultra-fast vector embeddings via Gemini
+- **Fuzzy Search** - Levenshtein matching without ingestion
+- **Smart Grep** - Regex search across all files
+- **Signature filtering** - Filter by function signature, docstring, type
+- **Custom Cypher** - Direct Neo4j graph queries
+- **Consistency locks** - Search blocked during ingestion
 
-await introspector.close();
-```
+### Agent Tools
 
-### Configuration Loading
+| Category | Tools |
+|----------|-------|
+| **Brain** | `brain_search`, `ingest_directory`, `ingest_web_page`, `forget_path` |
+| **Files** | `read_file`, `write_file`, `edit_file`, `create_file`, `delete_path` |
+| **Shell** | `run_command`, `run_npm_script`, `git_status`, `git_diff` |
+| **Media** | `generate_image`, `edit_image`, `read_image`, `describe_image` |
+| **3D** | `generate_3d_from_text`, `generate_3d_from_image`, `render_3d_asset`, `analyze_3d_model` |
+| **Web** | `fetch_web_page`, `search_web` |
+| **Project** | `create_project`, `list_projects`, `switch_project`, `exclude_project` |
 
-```typescript
-import { ConfigLoader } from '@luciformresearch/ragforge-core';
+### Agentic Capabilities
 
-// Load from YAML file
-const config = await ConfigLoader.load('./ragforge.config.yaml');
+- Structured queries with prompts applied to responses
+- Batch processing for efficient bulk operations
+- Recursive sub-agents for complex tasks
+- MCP exposure for advanced model integration
+- Compatible with local and cloud models
 
-// With environment variable substitution
-const config = await ConfigLoader.loadWithEnv('./ragforge.config.yaml');
-
-// Validate programmatic config
-const validated = ConfigLoader.validate(myConfig);
-```
-
-## Types
-
-All types are exported from the package:
-
-```typescript
-import type {
-  RagForgeConfig,
-  GraphSchema,
-  EntityConfig,
-  // ... etc
-} from '@luciformresearch/ragforge-core';
-```
+---
 
 ## Installation
 
 ```bash
-npm install @luciformresearch/ragforge-core
+npm install @luciformresearch/ragforge
 ```
 
-## Part of RagForge
+---
 
-This package is part of the [RagForge](https://github.com/LuciformResearch/ragforge) meta-framework.
+## Usage
 
-**Related Packages:**
-- [`@luciformresearch/ragforge-runtime`](https://www.npmjs.com/package/@luciformresearch/ragforge-runtime) - Runtime library for executing RAG queries
+### BrainManager
+
+```typescript
+import { BrainManager } from '@luciformresearch/ragforge';
+
+// Get singleton instance
+const brain = await BrainManager.getInstance();
+
+// Ingest a directory
+await brain.quickIngest('/path/to/project', {
+  projectName: 'my-project',
+  generateEmbeddings: true,
+});
+
+// Search across all projects
+const results = await brain.search({
+  query: 'authentication handler',
+  semantic: true,
+  limit: 10,
+});
+
+// Exclude a project from search
+await brain.excludeProject('noisy-project-id');
+```
+
+### RagAgent
+
+```typescript
+import { createRagAgent } from '@luciformresearch/ragforge';
+
+const agent = await createRagAgent({
+  brain: await BrainManager.getInstance(),
+  model: 'gemini-2.0-flash',
+});
+
+// Chat with the agent
+const response = await agent.chat('What functions handle user login?');
+```
+
+### MCP Tools
+
+```typescript
+import { generateBrainTools, generateBrainToolHandlers } from '@luciformresearch/ragforge';
+
+const brain = await BrainManager.getInstance();
+const tools = generateBrainTools();
+const handlers = generateBrainToolHandlers({ brain });
+
+// Use with MCP server
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const handler = handlers[request.params.name];
+  return handler(request.params.arguments);
+});
+```
+
+---
+
+## Project Structure
+
+```
+src/
+├── brain/              # BrainManager, project registry
+├── runtime/
+│   ├── adapters/       # File parsers (code, docs, media, web)
+│   ├── agents/         # RagAgent implementation
+│   ├── embedding/      # Gemini embedding provider
+│   ├── ingestion/      # Incremental ingestion, file watcher
+│   └── projects/       # ProjectRegistry, project switching
+├── tools/              # All agent tools
+│   ├── brain-tools.ts
+│   ├── file-tools.ts
+│   ├── shell-tools.ts
+│   ├── media-tools.ts
+│   └── web-tools.ts
+└── defaults/           # Default YAML configs
+```
+
+---
+
+## Related Packages
+
 - [`@luciformresearch/ragforge-cli`](https://www.npmjs.com/package/@luciformresearch/ragforge-cli) - Command-line interface
+
+---
 
 ## Development
 
@@ -105,10 +185,9 @@ npm run dev
 
 # Test
 npm test
-
-# Lint
-npm run lint
 ```
+
+---
 
 ## License
 
