@@ -162,7 +162,7 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
                    s.embedding_name_hash AS embedding_name_hash,
                    s.embedding_content_hash AS embedding_content_hash,
                    s.embedding_description_hash AS embedding_description_hash
-            LIMIT $limit`,
+            ORDER BY s.file, s.startLine`,
     embeddings: [
       {
         propertyName: 'embedding_name',
@@ -184,7 +184,8 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
         textExtractor: (r) => r.get('docstring') || '',
       },
     ],
-    limit: 2000,
+    // No limit - process all scopes (including global file_scope modules)
+    // Memory is managed by batch processing in embedNodeTypeMulti
   },
   {
     label: 'File',
@@ -238,8 +239,7 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
     query: `MATCH (s:MarkdownSection {projectId: $projectId})
             RETURN s.uuid AS uuid, s.title AS title, s.content AS content, s.ownContent AS ownContent,
                    s.embedding_name_hash AS embedding_name_hash,
-                   s.embedding_content_hash AS embedding_content_hash
-            LIMIT $limit`,
+                   s.embedding_content_hash AS embedding_content_hash`,
     embeddings: [
       {
         propertyName: 'embedding_name',
@@ -252,7 +252,6 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
         textExtractor: (r) => r.get('ownContent') || r.get('content') || '',
       },
     ],
-    limit: 2000,
   },
   {
     label: 'CodeBlock',
@@ -819,10 +818,15 @@ export class EmbeddingService {
     skippedCount: number;
   }> {
     const { projectId, incrementalOnly, maxTextLength, batchSize, verbose, embeddingTypes } = options;
-    const limit = neo4j.int(config.limit ?? 2000);
+    
+    // Build query parameters (only include limit if config has one)
+    const params: Record<string, any> = { projectId };
+    if (config.limit) {
+      params.limit = neo4j.int(config.limit);
+    }
 
     // Fetch nodes
-    const result = await this.neo4jClient.run(config.query, { projectId, limit });
+    const result = await this.neo4jClient.run(config.query, params);
 
     if (result.records.length === 0) {
       return {
@@ -867,7 +871,7 @@ export class EmbeddingService {
 
       // Filter to only nodes that need embedding
       const nodesToEmbed = incrementalOnly
-        ? nodes.filter(n => n.newHash && n.existingHash !== n.newHash) // Incremental: only changed
+        ? nodes.filter(n => n.newHash && (n.existingHash === null || n.existingHash !== n.newHash)) // Incremental: new nodes (null hash) or changed nodes
         : nodes.filter(n => n.newHash); // Initial: embed all with valid hash
 
       const skipped = nodes.length - nodesToEmbed.length;

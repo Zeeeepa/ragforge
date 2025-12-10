@@ -401,7 +401,18 @@ export class LLMReranker {
     withSuggestions: boolean = false,
     agentIntention?: string
   ): string {
-    let prompt = `You are ranking ${this.entityContext.displayName} for relevance.\n\nUser question: "${userQuestion}"\n`;
+    // Detect if query explicitly asks for integration/usage (vs implementation)
+    const queryLower = userQuestion.toLowerCase();
+    const asksForIntegration = /\b(integrat|usage|use|how to use|config|configuration|setup|example|tutorial)\b/.test(queryLower);
+    const asksForImplementation = /\b(implement|code|source|class|function|method|definition|how it works|how does it work)\b/.test(queryLower);
+    
+    const implementationPreference = asksForIntegration 
+      ? '' 
+      : asksForImplementation 
+        ? '\nIMPORTANT: Prefer implementation details (actual code, classes, functions, source code) over integration/usage documentation, unless the query explicitly asks for integration/usage.'
+        : '\nIMPORTANT: Prefer implementation details (actual code, classes, functions, source code) over integration/usage documentation, unless the query explicitly asks for integration/usage.';
+    
+    let prompt = `You are ranking ${this.entityContext.displayName} for relevance.${implementationPreference}\n\nUser question: "${userQuestion}"\n`;
 
     if (agentIntention) {
       prompt += `Agent intention: "${agentIntention}"\n`;
@@ -475,6 +486,8 @@ IMPORTANT: You MUST respond with XML ONLY. Do NOT use JSON. Do NOT use markdown 
 Instructions:
 - Evaluate each ${this.entityContext.displayName} item's relevance to the user question
 - Score must be a single decimal number from 0.0 to 1.0
+- PREFERENCE FOR CODE-RELATED QUERIES: If the user question asks about code implementation, classes, functions, or source code details, prefer items that show actual implementation (source code, class definitions, function bodies) over items that only discuss integration/usage/configuration. However, if the query explicitly asks for integration/usage/configuration, prioritize those instead.
+- PREFERENCE FOR NON-CODE QUERIES: For other types of queries (documentation, concepts, discussions), prefer the most relevant items, and when relevance is similar, prefer more recent items (check indexedAt/createdAt dates if available).
 - For the "reason" attribute: BE SPECIFIC! Reference concrete details from BOTH:
   1. The user's question (specific keywords, concepts they asked about)
   2. The item being evaluated (specific names, properties, context)
@@ -769,6 +782,21 @@ Include query feedback in the same XML:
     weights: { vector: number; llm: number } = { vector: 0.3, llm: 0.7 }
   ): SearchResult[] {
     const evalMap = new Map(evaluations.map(e => [e.scopeId, e]));
+
+    // Log for debugging UUID matching
+    const entityIds = results.map((r, i) => this.getEntityId(r.entity, i));
+    const evaluationIds = evaluations.map(e => e.scopeId);
+    console.log('[LLMReranker.mergeScores] UUID matching debug:', JSON.stringify({
+      resultsCount: results.length,
+      evaluationsCount: evaluations.length,
+      sampleEntityIds: entityIds.slice(0, 5),
+      sampleEvaluationIds: evaluationIds.slice(0, 5),
+      matchingIds: entityIds.filter(id => evaluationIds.includes(id)).slice(0, 5),
+      missingInEvaluations: entityIds.filter(id => !evaluationIds.includes(id)).slice(0, 5),
+      missingInResults: evaluationIds.filter(id => !entityIds.includes(id)).slice(0, 5),
+      uniqueField: this.entityContext.uniqueField,
+      sampleEntityUuids: results.slice(0, 3).map(r => r.entity.uuid),
+    }, null, 2));
 
     // Only keep results that have an LLM evaluation
     return results

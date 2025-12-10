@@ -115,7 +115,93 @@ export function getDocumentFormat(filePath: string): DocumentFormat | null {
 // PDF Parsing
 // =============================================================================
 
+/**
+ * Parse PDF using pdfjs-dist (Mozilla PDF.js) - cleaner, no warnings
+ * Falls back to pdf2json if pdfjs-dist fails
+ */
 async function parsePdfWithText(filePath: string): Promise<{ text: string; pages: number; metadata: any } | null> {
+  // Try pdfjs-dist first (cleaner, no warnings)
+  try {
+    return await parsePdfWithPdfJs(filePath);
+  } catch (err) {
+    console.warn('pdfjs-dist failed, falling back to pdf2json:', err);
+    // Fallback to pdf2json
+    return await parsePdfWithPdf2Json(filePath);
+  }
+}
+
+/**
+ * Parse PDF using pdfjs-dist (Mozilla PDF.js)
+ * Pure JavaScript/TypeScript, no warnings, more robust
+ */
+async function parsePdfWithPdfJs(filePath: string): Promise<{ text: string; pages: number; metadata: any } | null> {
+  try {
+    // Use legacy build for Node.js compatibility (same as pdf-to-img)
+    // pdfjs-dist is already installed via pdf-to-img dependency
+    const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs');
+    const fs = await import('fs/promises');
+
+    // Read PDF file as Uint8Array
+    const data = new Uint8Array(await fs.readFile(filePath));
+
+    // Load PDF document
+    const loadingTask = pdfjsLib.getDocument({
+      data,
+      // Disable worker for Node.js (not needed for text extraction)
+      useWorkerFetch: false,
+      isEvalSupported: false,
+      useSystemFonts: true,
+    });
+
+    const pdfDocument = await loadingTask.promise;
+    const numPages = pdfDocument.numPages;
+
+    let fullText = '';
+    const metadata: any = {};
+
+    // Extract metadata if available
+    try {
+      const metaResult = await pdfDocument.getMetadata();
+      if (metaResult && metaResult.metadata) {
+        const meta = metaResult.metadata;
+        metadata.Title = meta.get('Title');
+        metadata.Author = meta.get('Author');
+        metadata.Subject = meta.get('Subject');
+        metadata.Creator = meta.get('Creator');
+        metadata.CreationDate = meta.get('CreationDate');
+      }
+    } catch (metaErr) {
+      // Metadata extraction is optional, continue without it
+    }
+
+    // Extract text from each page
+    for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+      const page = await pdfDocument.getPage(pageNum);
+      const textContent = await page.getTextContent();
+
+      // Combine text items from the page
+      const pageText = textContent.items
+        .map((item: any) => item.str)
+        .join(' ');
+
+      fullText += pageText + '\n';
+    }
+
+    return {
+      text: fullText.trim(),
+      pages: numPages,
+      metadata,
+    };
+  } catch (err: any) {
+    throw new Error(`pdfjs-dist parsing failed: ${err.message}`);
+  }
+}
+
+/**
+ * Parse PDF using pdf2json (fallback)
+ * Kept for compatibility but generates warnings
+ */
+async function parsePdfWithPdf2Json(filePath: string): Promise<{ text: string; pages: number; metadata: any } | null> {
   try {
     const PDFParser = (await import('pdf2json')).default;
 
@@ -134,7 +220,15 @@ async function parsePdfWithText(filePath: string): Promise<{ text: string; pages
           for (const page of pdfData.Pages) {
             for (const text of page.Texts || []) {
               for (const run of text.R || []) {
-                fullText += decodeURIComponent(run.T) + ' ';
+                try {
+                  // Try to decode URI component, fallback to raw text if it fails
+                  const decoded = decodeURIComponent(run.T);
+                  fullText += decoded + ' ';
+                } catch (err) {
+                  // If decodeURIComponent fails (malformed URI), use raw text
+                  // This can happen with some PDF encodings
+                  fullText += run.T + ' ';
+                }
               }
             }
             fullText += '\n';

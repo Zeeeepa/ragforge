@@ -32,7 +32,7 @@ import {
 // ============================================================================
 
 const DEFAULT_PORT = 6969;
-const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 const LOG_DIR = path.join(os.homedir(), '.ragforge', 'logs');
 const LOG_FILE = path.join(LOG_DIR, 'daemon.log');
 const PID_FILE = path.join(os.homedir(), '.ragforge', 'daemon.pid');
@@ -40,6 +40,8 @@ const PID_FILE = path.join(os.homedir(), '.ragforge', 'daemon.pid');
 // ============================================================================
 // Logger
 // ============================================================================
+
+type LogSubscriber = (line: string) => void;
 
 class DaemonLogger {
   private logStream: fs.FileHandle | null = null;
@@ -49,11 +51,35 @@ class DaemonLogger {
   private originalConsoleError: typeof console.error;
   private originalConsoleWarn: typeof console.warn;
 
+  // SSE subscribers for real-time log streaming
+  private subscribers: Set<LogSubscriber> = new Set();
+
   constructor() {
     // Save original console methods
     this.originalConsoleLog = console.log.bind(console);
     this.originalConsoleError = console.error.bind(console);
     this.originalConsoleWarn = console.warn.bind(console);
+  }
+
+  /**
+   * Subscribe to log events (for SSE streaming)
+   */
+  subscribe(callback: LogSubscriber): () => void {
+    this.subscribers.add(callback);
+    return () => this.subscribers.delete(callback);
+  }
+
+  /**
+   * Notify all subscribers of a new log line
+   */
+  private notifySubscribers(line: string): void {
+    for (const subscriber of this.subscribers) {
+      try {
+        subscriber(line);
+      } catch {
+        // Ignore subscriber errors
+      }
+    }
   }
 
   async initialize(): Promise<void> {
@@ -73,6 +99,38 @@ class DaemonLogger {
   }
 
   /**
+   * Safely write to original console, ignoring EPIPE errors
+   * (happens when stdout/stderr is closed, e.g. parent terminal closed)
+   */
+  private safeConsoleWrite(fn: (...args: any[]) => void, ...args: any[]): void {
+    try {
+      fn(...args);
+    } catch (err: any) {
+      // Ignore EPIPE errors - stdout/stderr is closed
+      if (err?.code !== 'EPIPE' && err?.message !== 'write EPIPE') {
+        // Re-throw other errors
+        throw err;
+      }
+    }
+  }
+
+  /**
+   * Serialize an argument for logging, handling Errors specially
+   */
+  private serializeArg(a: any): string {
+    if (typeof a === 'string') return a;
+    if (a instanceof Error) {
+      // Errors don't serialize with JSON.stringify, handle them specially
+      return a.stack || `${a.name}: ${a.message}`;
+    }
+    try {
+      return JSON.stringify(a);
+    } catch {
+      return String(a);
+    }
+  }
+
+  /**
    * Intercept console.log/error/warn and redirect to log file
    * This captures all output from BrainManager and other modules
    */
@@ -80,26 +138,26 @@ class DaemonLogger {
     const self = this;
 
     console.log = (...args: any[]) => {
-      const message = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
+      const message = args.map(a => self.serializeArg(a)).join(' ');
       self.writeRaw(message);
       // Also write to stdout in verbose mode
       if (process.env.RAGFORGE_DAEMON_VERBOSE) {
-        self.originalConsoleLog(...args);
+        self.safeConsoleWrite(self.originalConsoleLog, ...args);
       }
     };
 
     console.error = (...args: any[]) => {
-      const message = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
+      const message = args.map(a => self.serializeArg(a)).join(' ');
       self.writeRaw(`[ERROR] ${message}`);
-      // Always write errors to stderr
-      self.originalConsoleError(...args);
+      // Always write errors to stderr (but ignore EPIPE)
+      self.safeConsoleWrite(self.originalConsoleError, ...args);
     };
 
     console.warn = (...args: any[]) => {
-      const message = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
+      const message = args.map(a => self.serializeArg(a)).join(' ');
       self.writeRaw(`[WARN] ${message}`);
       if (process.env.RAGFORGE_DAEMON_VERBOSE) {
-        self.originalConsoleWarn(...args);
+        self.safeConsoleWrite(self.originalConsoleWarn, ...args);
       }
     };
   }
@@ -111,6 +169,8 @@ class DaemonLogger {
     const timestamp = getLocalTimestamp();
     const formatted = `[${timestamp}] ${message}\n`;
     this.buffer.push(formatted);
+    // Notify SSE subscribers
+    this.notifySubscribers(formatted);
   }
 
   private formatMessage(level: string, message: string, meta?: any): string {
@@ -122,10 +182,12 @@ class DaemonLogger {
   private write(level: string, message: string, meta?: any): void {
     const formatted = this.formatMessage(level, message, meta);
     this.buffer.push(formatted);
+    // Notify SSE subscribers
+    this.notifySubscribers(formatted);
 
     // Also write to console in dev mode
     if (process.env.RAGFORGE_DAEMON_VERBOSE) {
-      this.originalConsoleLog(formatted.trim());
+      this.safeConsoleWrite(this.originalConsoleLog, formatted.trim());
     }
   }
 
@@ -267,17 +329,37 @@ class BrainDaemon {
     }
   }
 
+  /**
+   * Ensure BrainManager is initialized - auto-init if needed
+   * Call this at the start of any endpoint that needs the brain
+   */
+  private async ensureBrain(): Promise<BrainManager> {
+    if (!this.brain) {
+      this.logger.info('Brain not initialized, initializing now...');
+      await this.initializeBrain();
+    }
+    return this.brain!;
+  }
+
   private setupRoutes(): void {
     // Health check
     this.server.get('/health', async () => {
       return { status: 'ok', timestamp: getLocalTimestamp() };
     });
 
-    // Daemon status
+    // Daemon status (enriched for DaemonBrainProxy cache)
     this.server.get('/status', async () => {
+      const brain = await this.ensureBrain();
       const uptime = Date.now() - this.startTime.getTime();
-      const watchers = this.brain?.getWatchedProjects() || [];
-      const projects = this.brain?.listProjects() || [];
+      const watchers = brain.getWatchedProjects();
+      const projects = brain.listProjects();
+      const ingestionLock = brain.getIngestionLock();
+      const embeddingLock = brain.getEmbeddingLock();
+      const ingestionStatus = ingestionLock.getStatus();
+      const embeddingStatus = embeddingLock.getStatus();
+      const pendingEdits = brain.getPendingEditCount();
+      const brainPath = brain.getBrainPath();
+      const config = brain.getConfig();
 
       return {
         status: 'running',
@@ -291,9 +373,13 @@ class BrainDaemon {
         idle_timeout_ms: IDLE_TIMEOUT_MS,
         brain: {
           connected: !!this.brain,
-          projects: projects.length,
-          active_watchers: watchers.length,
-          watched_projects: watchers,
+          projects,
+          watchers,
+          ingestion_status: ingestionStatus,
+          embedding_status: embeddingStatus,
+          pending_edits: pendingEdits,
+          brain_path: brainPath,
+          config,
         },
         tools: {
           count: Object.keys(this.toolHandlers).length,
@@ -307,22 +393,19 @@ class BrainDaemon {
 
     // List projects
     this.server.get('/projects', async () => {
-      if (!this.brain) {
-        return { error: 'BrainManager not initialized' };
-      }
-      return { projects: this.brain.listProjects() };
+      const brain = await this.ensureBrain();
+      return { projects: brain.listProjects() };
     });
 
     // List watchers
     this.server.get('/watchers', async () => {
-      if (!this.brain) {
-        return { error: 'BrainManager not initialized' };
-      }
-      return { watchers: this.brain.getWatchedProjects() };
+      const brain = await this.ensureBrain();
+      return { watchers: brain.getWatchedProjects() };
     });
 
     // List available tools
     this.server.get('/tools', async () => {
+      await this.ensureBrain(); // Ensure handlers are generated
       return {
         tools: Object.keys(this.toolHandlers).sort(),
         count: Object.keys(this.toolHandlers).length,
@@ -340,6 +423,9 @@ class BrainDaemon {
       this.logger.info(`Tool call: ${toolName}`, { args: Object.keys(args) });
 
       try {
+        // Ensure brain and handlers are ready
+        await this.ensureBrain();
+
         const handler = this.toolHandlers[toolName];
         if (!handler) {
           this.logger.warn(`Unknown tool: ${toolName}`);
@@ -377,6 +463,183 @@ class BrainDaemon {
       return { status: 'shutting_down' };
     });
 
+    // Queue file change (for agent processes to notify daemon)
+    this.server.post<{
+      Body: { path: string; change_type: 'created' | 'updated' | 'deleted' };
+    }>('/queue-file-change', async (request, reply) => {
+      const { path: filePath, change_type } = request.body || {};
+
+      if (!filePath || !change_type) {
+        reply.status(400);
+        return { success: false, error: 'Missing path or change_type' };
+      }
+
+      const brain = await this.ensureBrain();
+      this.logger.debug(`Queue file change: ${change_type} ${filePath}`);
+      brain.queueFileChange(filePath, change_type);
+      return { success: true };
+    });
+
+    // ============================================
+    // Brain Callback Endpoints (for MCP server proxy)
+    // ============================================
+
+    // Ingest web page content
+    this.server.post<{
+      Body: {
+        url: string;
+        title?: string;
+        textContent?: string;
+        rawHtml?: string;
+        projectName?: string;
+        generateEmbeddings?: boolean;
+      };
+    }>('/brain/ingest-web-page', async (request, reply) => {
+      const { url, title, textContent, rawHtml, projectName, generateEmbeddings } = request.body || {};
+
+      if (!url) {
+        reply.status(400);
+        return { success: false, error: 'Missing url' };
+      }
+
+      const brain = await this.ensureBrain();
+      this.logger.debug(`Ingest web page: ${url}`);
+
+      try {
+        const result = await brain.ingestWebPage({
+          url,
+          title: title || url,
+          textContent: textContent || '',
+          rawHtml: rawHtml || '',
+          projectName,
+          generateEmbeddings: generateEmbeddings ?? true,
+        });
+        return { success: true, nodeId: result.nodeId };
+      } catch (err: any) {
+        this.logger.error(`Web page ingestion failed: ${err.message}`);
+        reply.status(500);
+        return { success: false, error: err.message };
+      }
+    });
+
+    // Update media content (images, 3D models, documents)
+    this.server.post<{
+      Body: {
+        filePath: string;
+        textContent?: string;
+        description?: string;
+        ocrConfidence?: number;
+        extractionMethod?: string;
+        generateEmbeddings?: boolean;
+        sourceFiles?: string[];
+      };
+    }>('/brain/update-media-content', async (request, reply) => {
+      const { filePath, textContent, description, ocrConfidence, extractionMethod, generateEmbeddings, sourceFiles } = request.body || {};
+
+      if (!filePath) {
+        reply.status(400);
+        return { success: false, error: 'Missing filePath' };
+      }
+
+      const brain = await this.ensureBrain();
+      this.logger.debug(`Update media content: ${filePath}`);
+
+      try {
+        await brain.updateMediaContent({
+          filePath,
+          textContent,
+          description,
+          ocrConfidence,
+          extractionMethod,
+          generateEmbeddings: generateEmbeddings ?? true,
+          sourceFiles,
+        });
+        return { success: true, updated: true };
+      } catch (err: any) {
+        this.logger.error(`Media content update failed: ${err.message}`);
+        reply.status(500);
+        return { success: false, error: err.message };
+      }
+    });
+
+    // ============================================
+    // Persona Management Endpoints
+    // ============================================
+
+    // Get active persona
+    this.server.get('/persona/active', async () => {
+      const brain = await this.ensureBrain();
+      return brain.getActivePersona();
+    });
+
+    // List all personas
+    this.server.get('/persona/list', async () => {
+      const brain = await this.ensureBrain();
+      return { personas: brain.listPersonas() };
+    });
+
+    // Set active persona
+    this.server.post<{
+      Body: { identifier: string | number };
+    }>('/persona/set', async (request, reply) => {
+      const brain = await this.ensureBrain();
+      const { identifier } = request.body || {};
+      if (identifier === undefined) {
+        reply.status(400);
+        return { error: 'Missing identifier (name, id, or index)' };
+      }
+      try {
+        const persona = await brain.setActivePersona(identifier);
+        return persona;
+      } catch (err: any) {
+        reply.status(400);
+        return { error: err.message };
+      }
+    });
+
+    // Create enhanced persona
+    this.server.post<{
+      Body: { name: string; color: string; language: string; description: string };
+    }>('/persona/create', async (request, reply) => {
+      const brain = await this.ensureBrain();
+      const { name, color, language, description } = request.body || {};
+      if (!name || !color || !language || !description) {
+        reply.status(400);
+        return { error: 'Missing required fields: name, color, language, description' };
+      }
+      try {
+        const persona = await brain.createEnhancedPersona({
+          name,
+          color: color as any,
+          language,
+          description,
+        });
+        return persona;
+      } catch (err: any) {
+        reply.status(400);
+        return { error: err.message };
+      }
+    });
+
+    // Delete persona
+    this.server.post<{
+      Body: { name: string };
+    }>('/persona/delete', async (request, reply) => {
+      const brain = await this.ensureBrain();
+      const { name } = request.body || {};
+      if (!name) {
+        reply.status(400);
+        return { error: 'Missing name' };
+      }
+      try {
+        await brain.deletePersona(name);
+        return { success: true };
+      } catch (err: any) {
+        reply.status(400);
+        return { error: err.message };
+      }
+    });
+
     // View recent logs
     this.server.get<{
       Querystring: { lines?: string };
@@ -397,11 +660,75 @@ class BrainDaemon {
         return { logs: [], error: 'Could not read log file' };
       }
     });
+
+    // Stream logs via SSE (Server-Sent Events)
+    this.server.get<{
+      Querystring: { tail?: string };
+    }>('/logs/stream', async (request, reply) => {
+      const tailLines = parseInt(request.query.tail || '50', 10);
+
+      // Set SSE headers
+      reply.raw.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*',
+      });
+
+      // Send initial tail of existing logs
+      try {
+        const content = await fs.readFile(LOG_FILE, 'utf-8');
+        const allLines = content.trim().split('\n');
+        const recentLines = allLines.slice(-tailLines);
+        for (const line of recentLines) {
+          reply.raw.write(`data: ${line}\n\n`);
+        }
+      } catch {
+        // Ignore if file doesn't exist yet
+      }
+
+      // Subscribe to new log lines
+      const unsubscribe = this.logger.subscribe((line) => {
+        try {
+          // SSE format: data: <content>\n\n
+          reply.raw.write(`data: ${line.trim()}\n\n`);
+        } catch {
+          // Client disconnected
+          unsubscribe();
+        }
+      });
+
+      // Keep connection alive with heartbeat
+      const heartbeat = setInterval(() => {
+        try {
+          reply.raw.write(`: heartbeat\n\n`);
+        } catch {
+          // Client disconnected
+          clearInterval(heartbeat);
+          unsubscribe();
+        }
+      }, 15000);
+
+      // Cleanup on client disconnect
+      request.raw.on('close', () => {
+        clearInterval(heartbeat);
+        unsubscribe();
+        this.logger.debug('SSE client disconnected');
+      });
+
+      // Don't end the response - keep it open for streaming
+      // Fastify will handle this with the raw response
+    });
   }
 
   private setupErrorHandlers(): void {
     // Uncaught exceptions
-    process.on('uncaughtException', (error) => {
+    process.on('uncaughtException', (error: any) => {
+      // Ignore EPIPE errors - they happen when stdout/stderr is closed
+      // (e.g. parent terminal closed while daemon is running in verbose mode)
+      if (error?.code === 'EPIPE' || error?.message === 'write EPIPE') {
+        return;
+      }
       this.logger.error('Uncaught exception', {
         error: error.message,
         stack: error.stack
@@ -560,7 +887,11 @@ interface DaemonStatusResponse {
   request_count: number;
   last_activity: string;
   memory: { heap_used_mb: number; rss_mb: number };
-  brain: { projects: number; active_watchers: number; watched_projects: string[] };
+  brain: {
+    connected: boolean;
+    projects: Array<{ id: string; path: string; nodeCount: number; displayName?: string }>;
+    watchers: string[];
+  };
 }
 
 export async function getDaemonStatus(): Promise<void> {
@@ -579,10 +910,14 @@ export async function getDaemonStatus(): Promise<void> {
       console.log(`Last activity: ${status.last_activity}`);
       console.log(`Memory: ${status.memory.heap_used_mb}MB heap / ${status.memory.rss_mb}MB RSS`);
       console.log('─'.repeat(40));
-      console.log(`Projects: ${status.brain.projects}`);
-      console.log(`Active watchers: ${status.brain.active_watchers}`);
-      if (status.brain.watched_projects.length > 0) {
-        console.log(`Watched: ${status.brain.watched_projects.join(', ')}`);
+      console.log(`Projects: ${status.brain.projects.length}`);
+      for (const p of status.brain.projects) {
+        const name = p.displayName || p.id;
+        console.log(`  • ${name}: ${p.nodeCount} nodes`);
+      }
+      console.log(`Active watchers: ${status.brain.watchers.length}`);
+      if (status.brain.watchers.length > 0) {
+        console.log(`Watched: ${status.brain.watchers.join(', ')}`);
       }
     } else {
       console.log('❌ Daemon returned error');
@@ -601,6 +936,107 @@ export async function isDaemonRunning(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * Stream daemon logs to console (SSE client)
+ */
+export async function streamDaemonLogs(options: { tail?: number; follow?: boolean } = {}): Promise<void> {
+  const { tail = 50, follow = true } = options;
+
+  // Check if daemon is running
+  const running = await isDaemonRunning();
+  if (!running) {
+    console.log('ℹ️  Daemon is not running. Start it with: ragforge daemon start');
+    return;
+  }
+
+  if (!follow) {
+    // Just fetch recent logs and exit
+    try {
+      const response = await fetch(`http://127.0.0.1:${DEFAULT_PORT}/logs?lines=${tail}`);
+      if (response.ok) {
+        const data = await response.json() as { logs: string[] };
+        for (const line of data.logs) {
+          console.log(line);
+        }
+      }
+    } catch (err: any) {
+      console.error('Failed to fetch logs:', err.message);
+    }
+    return;
+  }
+
+  // Stream logs via SSE using native http (no buffering issues)
+  console.log(`📜 Streaming daemon logs (tail=${tail}, Ctrl+C to stop)...\n`);
+
+  const http = await import('http');
+
+  return new Promise<void>((resolve) => {
+    const req = http.request(
+      {
+        hostname: '127.0.0.1',
+        port: DEFAULT_PORT,
+        path: `/logs/stream?tail=${tail}`,
+        method: 'GET',
+        headers: {
+          'Accept': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+        },
+      },
+      (res) => {
+        if (res.statusCode !== 200) {
+          console.error(`Failed to connect to log stream: ${res.statusCode}`);
+          resolve();
+          return;
+        }
+
+        let buffer = '';
+
+        res.setEncoding('utf8');
+        res.on('data', (chunk: string) => {
+          buffer += chunk;
+
+          // Parse SSE messages
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || ''; // Keep incomplete line in buffer
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const data = line.slice(6);
+              console.log(data);
+            }
+            // Ignore heartbeat comments (lines starting with :) and empty lines
+          }
+        });
+
+        res.on('end', () => {
+          console.log('\n✓ Log stream ended');
+          resolve();
+        });
+
+        res.on('error', (err) => {
+          console.error('Stream error:', err.message);
+          resolve();
+        });
+      }
+    );
+
+    req.on('error', (err) => {
+      console.error('Connection error:', err.message);
+      resolve();
+    });
+
+    // Handle Ctrl+C gracefully
+    process.on('SIGINT', () => {
+      console.log('\n✓ Log stream stopped');
+      req.destroy();
+      resolve();
+      process.exit(0);
+    });
+
+    req.end();
+  });
 }
 
 // Export port for client usage
@@ -635,14 +1071,24 @@ if (isMainModule) {
       getDaemonStatus().then(() => process.exit(0));
       break;
 
+    case 'logs':
+      streamDaemonLogs({
+        tail: parseInt(args.find(a => a.startsWith('--tail='))?.split('=')[1] || '50', 10),
+        follow: !args.includes('--no-follow'),
+      }).then(() => process.exit(0));
+      break;
+
     default:
       console.log(`
 Brain Daemon - Keeps BrainManager alive for fast tool execution
 
 Usage:
-  daemon start [-v]    Start the daemon
+  daemon start [-v]    Start the daemon (verbose mode with -v)
   daemon stop          Stop the daemon
   daemon status        Show daemon status
+  daemon logs          Stream logs in real-time (Ctrl+C to stop)
+    --tail=N           Show last N lines (default: 50)
+    --no-follow        Show logs and exit (don't stream)
 `);
       process.exit(0);
   }

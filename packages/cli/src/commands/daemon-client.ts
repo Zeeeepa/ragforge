@@ -23,6 +23,7 @@ const STARTUP_TIMEOUT_MS = 30000; // 30 seconds to start daemon
 const STARTUP_CHECK_INTERVAL_MS = 500;
 const LOG_DIR = path.join(os.homedir(), '.ragforge', 'logs');
 const CLIENT_LOG_FILE = path.join(LOG_DIR, 'daemon-client.log');
+const DAEMON_STARTUP_LOCK_FILE = path.join(os.homedir(), '.ragforge', 'daemon-startup.lock');
 
 /**
  * Log to file for debugging
@@ -60,24 +61,125 @@ export async function isDaemonRunning(): Promise<boolean> {
 }
 
 /**
+ * Acquire startup lock to prevent multiple parallel daemon starts
+ */
+async function acquireStartupLock(): Promise<boolean> {
+  try {
+    // Check if lock file exists and is recent (less than 30 seconds old)
+    try {
+      const stats = await fs.stat(DAEMON_STARTUP_LOCK_FILE);
+      const age = Date.now() - stats.mtimeMs;
+      if (age < 30000) {
+        // Lock file exists and is recent - someone else is starting the daemon
+        return false;
+      }
+      // Lock file is stale - remove it
+      await fs.unlink(DAEMON_STARTUP_LOCK_FILE);
+    } catch {
+      // Lock file doesn't exist - we can proceed
+    }
+
+    // Create lock file with current PID
+    await fs.writeFile(DAEMON_STARTUP_LOCK_FILE, `${process.pid}\n`, 'utf-8');
+    return true;
+  } catch (err: any) {
+    await logToFile('error', `Failed to acquire startup lock: ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * Release startup lock
+ */
+async function releaseStartupLock(): Promise<void> {
+  try {
+    await fs.unlink(DAEMON_STARTUP_LOCK_FILE);
+  } catch {
+    // Ignore errors (file might not exist)
+  }
+}
+
+/**
+ * Check if port is already in use (more reliable than health check)
+ */
+async function isPortInUse(port: number): Promise<boolean> {
+  try {
+    const { createServer } = await import('net');
+    return new Promise((resolve) => {
+      const server = createServer();
+      server.once('error', (err: any) => {
+        if (err.code === 'EADDRINUSE') {
+          resolve(true);
+        } else {
+          resolve(false);
+        }
+      });
+      server.once('listening', () => {
+        server.close();
+        resolve(false);
+      });
+      server.listen(port);
+    });
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Start the daemon in background if not running
  */
 export async function ensureDaemonRunning(verbose: boolean = false): Promise<boolean> {
   await logToFile('info', 'ensureDaemonRunning called', { verbose });
 
+  // First check if daemon is already running (health check)
   const alreadyRunning = await isDaemonRunning();
   if (alreadyRunning) {
-    await logToFile('info', 'Daemon already running');
+    await logToFile('info', 'Daemon already running (health check)');
     if (verbose) {
       console.log('✓ Daemon already running');
     }
     return true;
   }
 
-  await logToFile('info', 'Daemon not running, starting...');
-  if (verbose) {
-    console.log('⏳ Starting daemon...');
+  // Also check if port is in use (more reliable - catches daemon starting)
+  const portInUse = await isPortInUse(DAEMON_PORT);
+  if (portInUse) {
+    await logToFile('info', 'Port already in use, waiting for daemon to be ready...');
+    // Wait for daemon to be ready
+    const startTime = Date.now();
+    while (Date.now() - startTime < STARTUP_TIMEOUT_MS) {
+      await new Promise(resolve => setTimeout(resolve, STARTUP_CHECK_INTERVAL_MS));
+      if (await isDaemonRunning()) {
+        await logToFile('info', 'Daemon became ready');
+        return true;
+      }
+    }
+    await logToFile('error', 'Timeout waiting for daemon on port');
+    return false;
   }
+
+  // Try to acquire startup lock to prevent parallel starts
+  const lockAcquired = await acquireStartupLock();
+  if (!lockAcquired) {
+    await logToFile('info', 'Another process is starting the daemon, waiting...');
+    // Wait for the other process to finish starting
+    const startTime = Date.now();
+    while (Date.now() - startTime < STARTUP_TIMEOUT_MS) {
+      await new Promise(resolve => setTimeout(resolve, STARTUP_CHECK_INTERVAL_MS));
+      if (await isDaemonRunning()) {
+        await logToFile('info', 'Daemon started by another process');
+        return true;
+      }
+    }
+    await logToFile('error', 'Timeout waiting for daemon started by another process');
+    return false;
+  }
+
+  try {
+    await logToFile('info', 'Daemon not running, starting...');
+    if (verbose) {
+      console.log('⏳ Starting daemon...');
+    }
 
   // Find the daemon script - try multiple locations
   const possiblePaths = [
@@ -164,6 +266,10 @@ export async function ensureDaemonRunning(verbose: boolean = false): Promise<boo
   await logToFile('error', `Failed to start daemon within timeout (${STARTUP_TIMEOUT_MS}ms, ${attempts} attempts)`);
   console.error('❌ Failed to start daemon within timeout');
   return false;
+  } finally {
+    // Always release lock, even if we return early
+    await releaseStartupLock();
+  }
 }
 
 /**
@@ -290,3 +396,55 @@ export async function getDaemonLogs(lines: number = 100): Promise<string[]> {
 }
 
 export { DAEMON_PORT, DAEMON_URL };
+
+// ============================================
+// Daemon Tool Handlers for Agent Use
+// ============================================
+
+/**
+ * List of brain tools that should be routed through daemon
+ */
+const BRAIN_TOOL_NAMES = [
+  'create_project',
+  'ingest_directory',
+  'ingest_web_page',
+  'brain_search',
+  'forget_path',
+  'list_brain_projects',
+  'exclude_project',
+  'include_project',
+  'list_watchers',
+  'start_watcher',
+  'stop_watcher',
+  'read_file',
+  'write_file',
+  'create_file',
+  'edit_file',
+  'delete_path',
+  'get_schema',
+  'run_cypher',
+  'notify_user',
+  'update_todos',
+] as const;
+
+/**
+ * Generate brain tool handlers that call the daemon via HTTP
+ *
+ * This is used by agents to route all brain tool calls through the daemon,
+ * ensuring single-point access to the database and proper file watching.
+ */
+export function generateDaemonBrainToolHandlers(): Record<string, (params: any) => Promise<any>> {
+  const handlers: Record<string, (params: any) => Promise<any>> = {};
+
+  for (const toolName of BRAIN_TOOL_NAMES) {
+    handlers[toolName] = async (params: any) => {
+      const result = await callToolViaDaemon(toolName, params);
+      if (!result.success) {
+        throw new Error(result.error || `Tool ${toolName} failed`);
+      }
+      return result.result;
+    };
+  }
+
+  return handlers;
+}

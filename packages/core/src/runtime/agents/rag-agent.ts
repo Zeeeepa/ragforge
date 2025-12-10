@@ -21,8 +21,8 @@
  * ```
  */
 
-import { generateToolsFromConfig, generateFileTools, generateImageTools, generate3DTools, generateProjectTools, IngestionLock, withIngestionLock, webToolDefinitions, createWebToolHandlers, generateFsTools, generateShellTools, generateContextTools, generateBrainTools, generateBrainToolHandlers } from '../../index.js';
-import type { ToolGenerationOptions, GeneratedToolDefinition, ToolHandlerGenerator, RagForgeConfig, FileToolsContext, ImageToolsContext, ThreeDToolsContext, ProjectToolsContext, WebToolsContext, FsToolsContext, ShellToolsContext, ContextToolsContext, BrainToolsContext } from '../../index.js';
+import { generateToolsFromConfig, generateFileTools, generateImageTools, generate3DTools, generateProjectTools, IngestionLock, webToolDefinitions, createWebToolHandlers, generateFsTools, generateShellTools, generateContextTools, generateBrainTools } from '../../index.js';
+import type { ToolGenerationOptions, GeneratedToolDefinition, ToolHandlerGenerator, RagForgeConfig, FileToolsContext, ImageToolsContext, ThreeDToolsContext, ProjectToolsContext, WebToolsContext, FsToolsContext, ShellToolsContext, ContextToolsContext } from '../../index.js';
 import { generatePlanActionsTool, type ActionPlan, type PlanExecutionResult } from '../../tools/planning-tools.js';
 import { formatLocalDate, getFilenameTimestamp } from '../utils/timestamp.js';
 import { StructuredLLMExecutor, BaseToolExecutor, type ToolCallRequest, type ToolExecutionResult } from '../llm/structured-llm-executor.js';
@@ -338,6 +338,24 @@ export interface RagAgentOptions {
   /** Tool generation options */
   toolOptions?: ToolGenerationOptions;
 
+  /** ConversationStorage instance for enriched context (optional) */
+  conversationStorage?: any; // ConversationStorage type
+
+  /** Project root for code semantic search filtering (optional) */
+  projectRoot?: string;
+
+  /** Current working directory for code semantic search (optional) */
+  cwd?: string;
+
+  /** BrainManager instance for accessing locks (optional) */
+  brainManager?: any; // BrainManager type
+
+  /** Function to get locks (optional, alternative to brainManager) */
+  getLocks?: () => Promise<{
+    embeddingLock?: { isLocked: () => boolean; getDescription?: () => string };
+    ingestionLock?: { isLocked: () => boolean; getDescription?: () => string };
+  }>;
+
   /**
    * Use native tool calling (Gemini native API) vs XML-based
    * - 'native': Use Gemini's native function calling (faster, global mode)
@@ -506,15 +524,16 @@ export interface RagAgentOptions {
   /**
    * Include brain tools (list_brain_projects, brain_search, ingest_directory, etc.)
    * Enables the agent to search and manage the knowledge base
-   * Default: false (requires brainToolsContext to be provided)
+   * Default: false (requires customBrainHandlers to be provided)
    */
   includeBrainTools?: boolean;
 
   /**
-   * Context for brain tools
-   * Required if includeBrainTools is true
+   * Brain tool handlers (required if includeBrainTools is true)
+   * Must route through daemon proxy - no local execution allowed.
+   * Use generateDaemonBrainToolHandlers() from daemon-client.ts
    */
-  brainToolsContext?: import('../../tools/brain-tools.js').BrainToolsContext;
+  customBrainHandlers?: Record<string, (params: any) => Promise<any>>;
 
   // ============================================
   // Real-time callbacks for TUI/integrations
@@ -811,7 +830,14 @@ export class RagAgent {
   private persona?: string;
   private onToolCall?: (toolName: string, args: Record<string, any>) => void;
   private onToolResult?: (toolName: string, result: any, success: boolean, durationMs: number) => void;
-  private brainToolsContext?: BrainToolsContext;
+  private conversationStorage?: any; // ConversationStorage instance for enriched context
+  private projectRoot?: string; // Project root for code semantic search
+  private cwd?: string; // Current working directory for code semantic search
+  private brainManager?: any; // BrainManager instance for accessing locks
+  private getLocks?: () => Promise<{
+    embeddingLock?: { isLocked: () => boolean; getDescription?: () => string };
+    ingestionLock?: { isLocked: () => boolean; getDescription?: () => string };
+  }>;
 
   /** Agent identity (name, color, language, persona) */
   public readonly identity: AgentIdentitySettings;
@@ -837,38 +863,27 @@ export class RagAgent {
     this.taskContext = options.taskContext;
     this.onToolCall = options.onToolCall;
     this.onToolResult = options.onToolResult;
-    this.brainToolsContext = options.brainToolsContext;
+    this.conversationStorage = options.conversationStorage;
+    this.projectRoot = options.projectRoot;
+    this.cwd = options.cwd;
+    this.brainManager = options.brainManager;
+    this.getLocks = options.getLocks;
 
-    // Initialize agent identity from brain's active persona or defaults
-    if (this.brainToolsContext) {
-      this.identity = getAgentIdentityFromBrain(this.brainToolsContext.brain);
-    } else {
-      this.identity = getAgentIdentity();
-    }
-
-    // Use identity persona (may be translated)
-    this.persona = options.persona ?? this.identity.persona;
-
-    // Log brain projects at startup
-    if (this.brainToolsContext) {
-      try {
-        const projects = this.brainToolsContext.brain.listProjects();
-        console.log(`\n✶ ${this.identity.name} initialized`);
-        if (projects && projects.length > 0) {
-          console.log('📚 Brain Projects:');
-          for (const p of projects) {
-            const status = p.excluded ? ' [excluded]' : '';
-            const type = p.type === 'ragforge-project' ? '📦' : (p.type === 'quick-ingest' ? '📂' : '🌐');
-            console.log(`  ${type} ${p.id}${status}: ${p.path}`);
-          }
-        } else {
-          console.log('📚 Brain: (No projects indexed yet)');
-        }
-        console.log('');
-      } catch {
-        // Ignore errors during startup logging
+    // Configure ConversationStorage with brainManager and LLM executor/provider for fuzzy search fallback
+    if (this.conversationStorage) {
+      if (this.brainManager) {
+        this.conversationStorage.setBrainManager(this.brainManager);
       }
+      // Set LLM executor and provider for LLM-guided fuzzy search
+      this.conversationStorage.setLLMExecutor(this.executor, this.llmProvider);
     }
+
+    // Initialize agent identity from defaults
+    // Persona can be dynamically changed via daemon proxy in the TUI
+    this.identity = getAgentIdentity();
+
+    // Use identity persona (may be translated) - this is the initial/fallback persona
+    this.persona = options.persona ?? this.identity.persona;
 
     // Create logger if logPath provided
     if (options.logPath) {
@@ -879,6 +894,14 @@ export class RagAgent {
     if (options.includeBatchAnalyze !== false) {
       this.addBatchAnalyzeTool();
     }
+  }
+
+  /**
+   * Get the current persona
+   * Note: Dynamic persona switching is now handled via daemon proxy in the TUI
+   */
+  private getCurrentPersona(): string | undefined {
+    return this.persona;
   }
 
   /**
@@ -966,8 +989,18 @@ Example: After getting search results, use this to analyze each result with a cu
    * - 'structured': Uses XML-based StructuredLLMExecutor (per-item mode)
    * - 'native': Uses Gemini native tool calling (global mode)
    * - 'auto': Uses structured for single questions
+   *
+   * @param question - The user's question
+   * @param conversationHistory - Optional conversation history (array of messages with role, content, and optional toolResults)
    */
-  async ask(question: string): Promise<AskResult> {
+  async ask(
+    question: string,
+    conversationHistory?: Array<{
+      role: 'user' | 'assistant';
+      content: string;
+      toolResults?: Array<{ toolName: string; toolArgs?: Record<string, any>; toolResult: any; success: boolean }>;
+    }>
+  ): Promise<AskResult> {
     const mode = this.toolCallMode === 'auto' ? 'structured' : this.toolCallMode;
 
     // Start logging session
@@ -1006,26 +1039,91 @@ Example: After getting search results, use this to analyze each result with a cu
       },
     };
 
+    // Get current persona (dynamically from BrainManager if available)
+    const currentPersona = this.getCurrentPersona();
+
     // Build input fields with prompts
     const inputFields = [
       { name: 'question', prompt: 'The user question or request to answer' },
-      ...(this.persona ? [{ name: 'persona', prompt: 'Your personality. Maintain this while being accurate and thorough in your descriptions.' }] : []),
+      ...(currentPersona ? [{ name: 'persona', prompt: 'Your personality. Maintain this while being accurate and thorough in your descriptions.' }] : []),
     ];
 
     // Build item with question and optional persona
     const item: Record<string, string> = { question };
-    if (this.persona) {
-      item.persona = this.persona;
+    if (currentPersona) {
+      item.persona = currentPersona;
     }
+
+    // Build enriched context if conversationStorage is available
+    let enrichedContextString: string | null = null;
+    if (this.conversationStorage && conversationId) {
+      try {
+        // Get locks from BrainManager or getLocks function if available
+        let embeddingLock: { isLocked: () => boolean; getDescription?: () => string } | undefined;
+        let ingestionLock: { isLocked: () => boolean; getDescription?: () => string } | undefined;
+
+        if (this.brainManager) {
+          // Direct access to BrainManager
+          try {
+            embeddingLock = this.brainManager.getEmbeddingLock();
+            ingestionLock = this.brainManager.getIngestionLock();
+          } catch (error: any) {
+            if (this.verbose) {
+              console.warn(`⚠️  Failed to get locks from BrainManager: ${error.message}`);
+            }
+          }
+        } else if (this.getLocks) {
+          // Use getLocks function (e.g., from DaemonBrainProxy)
+          try {
+            const locks = await this.getLocks();
+            embeddingLock = locks.embeddingLock;
+            ingestionLock = locks.ingestionLock;
+          } catch (error: any) {
+            if (this.verbose) {
+              console.warn(`⚠️  Failed to get locks via getLocks function: ${error.message}`);
+            }
+          }
+        }
+
+        // If locks are not available, code semantic search will be skipped (safer)
+        // This ensures we don't risk semantic search on potentially stale data
+
+        const enrichedContext = await this.conversationStorage.buildEnrichedContext(
+          conversationId,
+          question,
+          {
+            cwd: this.cwd,
+            projectRoot: this.projectRoot,
+            embeddingLock,
+            ingestionLock
+          }
+        );
+
+        enrichedContextString = this.conversationStorage.formatContextForAgent(enrichedContext);
+      } catch (error: any) {
+        if (this.verbose) {
+          console.warn(`⚠️  Failed to build enriched context: ${error.message}`);
+        }
+      }
+    }
+
+    // Build conversation history context if provided (fallback if enriched context not available)
+    const historyContext = enrichedContextString || (conversationHistory && conversationHistory.length > 0
+      ? this.buildHistoryContext(conversationHistory)
+      : null);
 
     try {
       if (mode === 'native') {
         // Native tool calling (global mode)
+        const systemPrompt = historyContext
+          ? `${this.buildSystemPrompt()}\n\n${historyContext}`
+          : this.buildSystemPrompt();
+
         const results = await this.executor.executeLLMBatchWithTools(
           [item],
           {
             inputFields,
-            systemPrompt: this.buildSystemPrompt(),
+            systemPrompt,
             userTask: 'Answer the question using the available tools.',
             outputSchema,
             tools: this.getToolDefinitions(),
@@ -1051,10 +1149,14 @@ Example: After getting search results, use this to analyze each result with a cu
         };
       } else {
         // Structured mode - use executeSingle (no batching, cleaner prompts)
+        const systemPrompt = historyContext
+          ? `${this.buildSystemPrompt()}\n\n${historyContext}`
+          : this.buildSystemPrompt();
+
         const result = await this.executor.executeSingle<Record<string, any>>({
           input: item,
           inputFields,
-          systemPrompt: this.buildSystemPrompt(),
+          systemPrompt,
           userTask: 'Answer the question using the available tools if needed.',
           outputSchema,
           tools: this.getToolDefinitions(),
@@ -1177,26 +1279,56 @@ Example: After getting search results, use this to analyze each result with a cu
 
   /**
    * Get brain projects info for system prompt
+   * Note: This is now handled externally via daemon proxy
+   * The CLI passes project info via brainProjectsInfo option if needed
    */
   private getBrainProjectsInfo(): string | null {
-    if (!this.brainToolsContext) return null;
+    // Brain projects are now managed via daemon - info is passed externally
+    return null;
+  }
 
-    try {
-      const brain = this.brainToolsContext.brain;
-      const projects = brain.listProjects();
-
-      if (!projects || projects.length === 0) {
-        return '(No projects indexed yet)';
+  /**
+   * Build conversation history context for the prompt
+   */
+  private buildHistoryContext(
+    history: Array<{
+      role: 'user' | 'assistant';
+      content: string;
+      toolResults?: Array<{ toolName: string; toolArgs?: Record<string, any>; toolResult: any; success: boolean }>;
+    }>
+  ): string {
+    // Limit to last 10 messages to avoid token bloat
+    const recentHistory = history.slice(-10);
+    
+    let context = '\n## Recent Conversation History\n\n';
+    context += 'Here is the recent conversation history including tool results. Use this context to understand what was discussed and what tools were used:\n\n';
+    
+    for (const msg of recentHistory) {
+      const roleLabel = msg.role === 'user' ? 'User' : 'Assistant';
+      context += `**${roleLabel}**: ${msg.content}\n`;
+      
+      // Include tool results if present
+      if (msg.toolResults && msg.toolResults.length > 0) {
+        context += '\n_Tools used in this exchange:_\n';
+        for (const toolResult of msg.toolResults) {
+          const status = toolResult.success ? '✓' : '✗';
+          const argsStr = toolResult.toolArgs ? `(${JSON.stringify(toolResult.toolArgs).substring(0, 100)}...)` : '';
+          const resultStr = typeof toolResult.toolResult === 'object'
+            ? JSON.stringify(toolResult.toolResult).substring(0, 300)
+            : String(toolResult.toolResult).substring(0, 300);
+          
+          context += `- ${status} **${toolResult.toolName}**${argsStr}\n`;
+          context += `  Result: ${resultStr}${resultStr.length >= 300 ? '...' : ''}\n`;
+        }
+        context += '\n';
       }
-
-      return projects.map(p => {
-        const status = p.excluded ? ' [excluded]' : '';
-        const type = p.type === 'ragforge-project' ? '📦' : (p.type === 'quick-ingest' ? '📂' : '🌐');
-        return `- ${type} **${p.id}**${status}: ${p.path}`;
-      }).join('\n');
-    } catch {
-      return null;
+      
+      context += '\n';
     }
+    
+    context += 'Use this history to provide context-aware responses. If the user refers to something from earlier, use this history (including tool results) to understand what they mean.\n';
+    
+    return context;
   }
 
   /**
@@ -1216,6 +1348,20 @@ Example: After getting search results, use this to analyze each result with a cu
 2. For finding code: grep_files (exact) or brain_search (semantic)
 3. For understanding projects: list_brain_projects → brain_search
 
+**CRITICAL - BE PROACTIVE AND THOROUGH**:
+- When a request is vague or conceptual, use brain_search (semantic: true) FIRST to gather context
+- Don't guess - search the knowledge base to understand existing patterns before answering
+- Multiple searches are STRONGLY ENCOURAGED when context is unclear
+- **DO NOT return a final answer until you have gathered sufficient information**
+- If you only found partial results (e.g., one grep match), continue searching with different queries
+- Use multiple tools in sequence: brain_search → grep_files → read_file → more searches if needed
+- Only provide a final answer when you have explored enough to give a complete response
+
+**PLANNING FOR COMPLEX TASKS**:
+- For tasks with 3+ steps, use update_todos to show your plan and track progress
+- Update the todo list as you complete each step (mark in_progress, then completed)
+- This helps the user follow along and see what you're doing
+
 **IMPORTANT - LANGUAGE**:
 You MUST respond in the same language as the user's question. Detect the user's language and answer in that language.
 - User writes in French → You respond in French
@@ -1224,18 +1370,9 @@ You MUST respond in the same language as the user's question. Detect the user's 
 This is critical for user experience. Do NOT respond in a different language than the user's message.
 
 **IMPORTANT - TOOLS**:
-- Prefer brain_search for conceptual queries ("how does X work?") and grep_files for exact text matches.`;
-
-    // Add brain projects info if available
-    if (this.brainToolsContext) {
-      const brainProjectsInfo = this.getBrainProjectsInfo();
-      if (brainProjectsInfo) {
-        basePrompt += `
-
-**Indexed Projects in Brain**:
-${brainProjectsInfo}`;
-      }
-    }
+- Prefer brain_search for conceptual queries ("how does X work?") and grep_files for exact text matches.
+- You can index new code with ingest_directory, but it's slow - only use for targeted projects (git repos, specific codebases), NOT entire user directories.
+- **Remember**: It's better to use too many tools than too few. When in doubt, search more.`;
 
     // Add task context if this is a sub-agent executing a plan
     if (this.taskContext) {
@@ -1347,11 +1484,11 @@ export async function createRagAgent(options: RagAgentOptions): Promise<RagAgent
 
     // Create ingestion lock for coordinating file tools with RAG queries
     ingestionLock = new IngestionLock({
-      timeout: 60000, // 60s max for re-ingestion
+      defaultTimeout: 300000, // 5 minutes max for re-ingestion
       onStatusChange: (status) => {
         if (options.verbose) {
           if (status.isLocked) {
-            console.log(`   🔒 Ingestion lock: ${status.currentFile}`);
+            console.log(`   🔒 Ingestion lock: ${status.operationCount} operation(s) active`);
           } else {
             console.log(`   🔓 Ingestion lock released`);
           }
@@ -1371,17 +1508,8 @@ export async function createRagAgent(options: RagAgentOptions): Promise<RagAgent
     tools.push(...fileTools.tools);
     Object.assign(boundHandlers, fileTools.handlers);
 
-    // Wrap RAG tool handlers with ingestion lock check
-    const ragToolNames = Object.keys(handlers);
-    for (const toolName of ragToolNames) {
-      const originalHandler = boundHandlers[toolName];
-      if (originalHandler) {
-        boundHandlers[toolName] = withIngestionLock(originalHandler, ingestionLock, {
-          waitForUnlock: true,  // Wait up to 5s for ingestion to complete
-          waitTimeout: 5000,
-        });
-      }
-    }
+    // Note: RAG tools no longer need wrapping - brain_search now handles
+    // lock coordination internally via ensureProjectSynced()
 
     if (options.verbose) {
       console.log(`   📁 File tools enabled (projectRoot: ${options.projectRoot})`);
@@ -1552,9 +1680,10 @@ export async function createRagAgent(options: RagAgentOptions): Promise<RagAgent
   }
 
   // 3h. Add brain tools if enabled (knowledge base search, project management)
-  if (options.includeBrainTools && options.brainToolsContext) {
+  // Brain tools MUST use customBrainHandlers (daemon proxy) - no local execution
+  if (options.includeBrainTools && options.customBrainHandlers) {
     const brainToolDefs = generateBrainTools();
-    const brainHandlers = generateBrainToolHandlers(options.brainToolsContext);
+    const brainHandlers = options.customBrainHandlers;
 
     // Filter out brain file tools if we already have fs tools (to avoid duplicates)
     // Brain file tools: read_file, write_file, create_file, edit_file, delete_path
@@ -1571,7 +1700,7 @@ export async function createRagAgent(options: RagAgentOptions): Promise<RagAgent
     }
 
     if (options.verbose) {
-      console.log(`   🧠 Brain tools enabled (${filteredBrainTools.length} tools: list_brain_projects, brain_search, ingest_directory, ...)`);
+      console.log(`   🧠 Brain tools enabled (${filteredBrainTools.length} tools via daemon: list_brain_projects, brain_search, ingest_directory, ...)`);
     }
   }
 

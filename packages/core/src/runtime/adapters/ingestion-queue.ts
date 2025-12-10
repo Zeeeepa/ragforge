@@ -44,6 +44,13 @@ export interface IngestionQueueConfig {
   ingestionLock?: IngestionLock;
 
   /**
+   * Embedding lock to coordinate with semantic RAG queries
+   * When provided, semantic queries will wait during embedding generation
+   * Non-semantic queries can proceed while embeddings are being generated
+   */
+  embeddingLock?: IngestionLock;
+
+  /**
    * Callback when batch starts processing
    */
   onBatchStart?: (fileCount: number) => void;
@@ -73,7 +80,7 @@ export class IngestionQueue {
   private isIngesting = false;
   private queuedBatch: Set<string> | null = null;
   private queuedDeletes: Set<string> | null = null;
-  private config: Required<Omit<IngestionQueueConfig, 'ingestionLock' | 'logger' | 'afterIngestion' | 'projectId'>> & { projectId?: string; ingestionLock?: IngestionLock; afterIngestion?: (stats: IncrementalStats) => Promise<void> };
+  private config: Required<Omit<IngestionQueueConfig, 'ingestionLock' | 'embeddingLock' | 'logger' | 'afterIngestion' | 'projectId'>> & { projectId?: string; ingestionLock?: IngestionLock; embeddingLock?: IngestionLock; afterIngestion?: (stats: IncrementalStats) => Promise<void> };
   private logger?: AgentLogger;
 
   constructor(
@@ -263,9 +270,12 @@ export class IngestionQueue {
 
     // Acquire lock to block RAG queries during ingestion
     const lock = this.config.ingestionLock;
-    const release = lock ? await lock.acquire(`batch:${totalFiles} files`) : null;
+    const opKey = lock?.acquire('watcher-batch', `batch:${totalFiles}`, {
+      description: `Watcher batch: ${totalFiles} files`,
+      timeoutMs: 120000, // 2 minutes for large batches
+    });
 
-    if (this.config.verbose && release) {
+    if (this.config.verbose && opKey) {
       console.log(`   🔒 Ingestion lock acquired (RAG queries will wait)`);
     }
 
@@ -326,13 +336,26 @@ export class IngestionQueue {
       // Log ingestion completed
       this.logger?.logIngestion('completed', { stats });
 
-      // Run afterIngestion callback (e.g., embedding generation) while lock is still held
-      // This ensures semantic queries wait until embeddings are ready
+      // Run afterIngestion callback (e.g., embedding generation)
+      // Use embeddingLock (separate from ingestionLock) so non-semantic queries can proceed
       if (this.config.afterIngestion && (stats.created + stats.updated) > 0) {
         if (this.config.verbose) {
           console.log(`   🧠 Triggering post-ingestion tasks (embeddings)...`);
         }
         this.logger?.logEmbeddings('started', { dirtyCount: stats.created + stats.updated });
+
+        // Acquire embedding lock before generating embeddings
+        // This allows non-semantic queries to proceed while embeddings are generated
+        let embeddingOpKey: string | undefined;
+        if (this.config.embeddingLock) {
+          embeddingOpKey = this.config.embeddingLock.acquire('watcher-batch', `embeddings:${stats.created + stats.updated}`, {
+            description: `Generating embeddings: ${stats.created + stats.updated} nodes`,
+            timeoutMs: 300000, // 5 minutes
+          });
+          if (this.config.verbose) {
+            console.log(`   🧠 Acquired embedding lock for ${stats.created + stats.updated} nodes`);
+          }
+        }
 
         try {
           await this.config.afterIngestion(stats);
@@ -342,6 +365,11 @@ export class IngestionQueue {
           const errMsg = embeddingError instanceof Error ? embeddingError.message : String(embeddingError);
           console.warn(`   ⚠️ Embedding generation failed: ${errMsg}`);
           this.logger?.logEmbeddings('error', { error: errMsg });
+        } finally {
+          // Release embedding lock after generation completes
+          if (embeddingOpKey && this.config.embeddingLock) {
+            this.config.embeddingLock.release(embeddingOpKey);
+          }
         }
       }
 
@@ -381,8 +409,8 @@ export class IngestionQueue {
       throw error;
     } finally {
       // Release lock to allow RAG queries
-      if (release) {
-        release();
+      if (opKey && lock) {
+        lock.release(opKey);
         if (this.config.verbose) {
           console.log(`   🔓 Ingestion lock released`);
         }

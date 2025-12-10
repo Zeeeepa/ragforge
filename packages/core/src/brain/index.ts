@@ -11,7 +11,6 @@ export {
   type PersonaDefinition,
   type TerminalColor,
   type RegisteredProject,
-  type ProjectsRegistry,
   type QuickIngestOptions,
   type QuickIngestResult,
   type BrainSearchOptions,

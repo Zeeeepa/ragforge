@@ -3,6 +3,8 @@
  *
  * Provides schema introspection, config loading, code generation,
  * LLM execution, agents, and RAG runtime.
+ * 
+ * Trigger embedding regeneration - 2025-12-10
  */
 
 // Types
@@ -138,7 +140,7 @@ export type {
 export {
   IngestionLock,
   getGlobalIngestionLock,
-  withIngestionLock,
+  getGlobalEmbeddingLock,
 } from './tools/ingestion-lock.js';
 export type { IngestionStatus, IngestionLockOptions } from './tools/ingestion-lock.js';
 
@@ -309,3 +311,4 @@ export {
 
 // Version
 export const VERSION = '0.2.0';
+// test 1765365652

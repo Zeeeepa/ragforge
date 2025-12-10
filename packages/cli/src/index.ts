@@ -62,7 +62,13 @@ import {
   startDaemon,
   stopDaemon,
   getDaemonStatus,
+  streamDaemonLogs,
 } from './commands/daemon.js';
+import {
+  parseCleanOptions,
+  runClean,
+  printCleanHelp
+} from './commands/clean.js';
 
 import { VERSION } from './version.js';
 
@@ -86,6 +92,7 @@ Usage:
   ragforge mcp-server [options]      Start as MCP server (for Claude Code)
   ragforge test-tool <name> [opts]   Test a tool directly (for debugging)
   ragforge daemon <cmd>              Brain daemon management (start|stop|status)
+  ragforge clean <path> [options]    Remove embeddings and/or all data for a project
   ragforge init [options]            Complete setup (introspect + generate)
   ragforge help <command>            Show detailed help for a specific command
 
@@ -133,19 +140,23 @@ Usage:
   ragforge daemon start [-v]    Start the daemon (foreground)
   ragforge daemon stop          Stop the running daemon
   ragforge daemon status        Show daemon status and statistics
+  ragforge daemon logs          Stream logs in real-time (Ctrl+C to stop)
 
 Options:
   -v, --verbose    Show verbose output during daemon startup
+  --tail=N         (logs) Show last N lines before streaming (default: 50)
+  --no-follow      (logs) Show recent logs and exit (don't stream)
 
 Endpoints (port 6969):
-  GET  /health     Health check
-  GET  /status     Detailed daemon status
-  GET  /tools      List available tools
-  GET  /projects   List loaded projects
-  GET  /watchers   List active file watchers
-  GET  /logs       View recent daemon logs
-  POST /tool/:name Execute a tool
-  POST /shutdown   Graceful shutdown
+  GET  /health       Health check
+  GET  /status       Detailed daemon status
+  GET  /tools        List available tools
+  GET  /projects     List loaded projects
+  GET  /watchers     List active file watchers
+  GET  /logs         View recent daemon logs (JSON)
+  GET  /logs/stream  Stream logs via SSE (real-time)
+  POST /tool/:name   Execute a tool
+  POST /shutdown     Graceful shutdown
 
 Logs: ~/.ragforge/logs/daemon.log
 
@@ -155,6 +166,12 @@ Examples:
 
   # Start daemon in foreground (for debugging)
   ragforge daemon start -v
+
+  # Stream logs in real-time
+  ragforge daemon logs
+
+  # Show last 100 log lines and exit
+  ragforge daemon logs --tail=100 --no-follow
 
   # Stop the daemon
   ragforge daemon stop
@@ -223,6 +240,9 @@ async function main(): Promise<void> {
           case 'embeddings':
             printEmbeddingsHelp();
             break;
+          case 'clean':
+            printCleanHelp();
+            break;
           default:
             printRootHelp();
         }
@@ -276,6 +296,13 @@ async function main(): Promise<void> {
           case 'status':
             await getDaemonStatus();
             break;
+          case 'logs': {
+            const tailArg = rest.find(a => a.startsWith('--tail='));
+            const tail = tailArg ? parseInt(tailArg.split('=')[1], 10) : 50;
+            const follow = !rest.includes('--no-follow');
+            await streamDaemonLogs({ tail, follow });
+            break;
+          }
           default:
             printDaemonHelp();
         }
@@ -309,6 +336,12 @@ async function main(): Promise<void> {
       case 'embeddings:generate': {
         const options = await parseEmbeddingsOptions(rest);
         await runEmbeddingsGenerate(options);
+        return;
+      }
+
+      case 'clean': {
+        const options = parseCleanOptions(rest);
+        await runClean(options);
         return;
       }
 

@@ -1,204 +1,329 @@
 /**
  * Ingestion Lock - Coordinates file modifications with RAG queries
  *
- * When a file is being modified and re-ingested, RAG queries should wait
- * or be notified that data might be stale.
+ * Uses named operations with hash to track multiple concurrent operations.
+ * The lock is active as long as AT LEAST ONE operation is in progress.
+ * Each operation is identified by type + content hash.
  */
 
+import * as crypto from 'crypto';
 import type { AgentLogger } from '../runtime/agents/rag-agent.js';
 
+/**
+ * Operation types with their priorities
+ * Lower number = higher priority
+ */
+export const OPERATION_PRIORITIES = {
+  'initial-ingest': 1, // Initial project ingestion
+  'watcher-batch': 2, // File watcher batch
+  'mcp-edit': 3, // Edit via MCP tools
+  'manual-ingest': 4, // Manual ingestion
+} as const;
+
+export type OperationType = keyof typeof OPERATION_PRIORITIES;
+
+/**
+ * A pending operation in the lock
+ */
+export interface PendingOperation {
+  /** Unique key (type:hash) */
+  key: string;
+  /** Operation type */
+  type: OperationType;
+  /** Content hash */
+  contentHash: string;
+  /** Description for logs */
+  description: string;
+  /** Start timestamp */
+  startedAt: Date;
+  /** Timeout handle */
+  timeoutHandle?: NodeJS.Timeout;
+}
+
+/**
+ * Current lock status
+ */
 export interface IngestionStatus {
+  /** Lock is active (at least one operation in progress) */
   isLocked: boolean;
-  currentFile?: string;
-  startedAt?: Date;
-  pendingFiles: string[];
+  /** Number of operations in progress */
+  operationCount: number;
+  /** List of operations */
+  operations: Array<{
+    type: OperationType;
+    description: string;
+    elapsedMs: number;
+  }>;
 }
 
 export interface IngestionLockOptions {
-  /** Timeout in ms before auto-unlock (safety net). Default: 30000 */
-  timeout?: number;
-  /** Callback when lock state changes */
+  /** Default timeout in ms (0 = no timeout). Default: 30000 */
+  defaultTimeout?: number;
+  /** Callback when status changes */
   onStatusChange?: (status: IngestionStatus) => void;
   /** Optional AgentLogger for structured logging */
   logger?: AgentLogger;
 }
 
 /**
- * Manages ingestion lock state
+ * Generate a short hash to identify an operation
+ */
+function hashContent(content: string): string {
+  return crypto.createHash('sha256').update(content).digest('hex').substring(0, 12);
+}
+
+/**
+ * Lock with named operations
+ *
+ * The lock is active as long as there is AT LEAST ONE operation in progress.
+ * Each operation is identified by a type + content hash.
  *
  * Usage:
  * ```typescript
  * const lock = new IngestionLock();
  *
- * // In file tools
- * const release = await lock.acquire('src/utils.ts');
+ * // Acquire for an operation
+ * const opKey = lock.acquire('mcp-edit', 'src/utils.ts');
  * try {
- *   await reIngestFile(...);
+ *   await doWork();
  * } finally {
- *   release();
+ *   lock.release(opKey);
  * }
  *
- * // In RAG tools (wrapper)
- * if (lock.isLocked()) {
- *   return { error: 'Ingestion in progress...', status: lock.getStatus() };
- * }
+ * // Wait for all operations to complete
+ * await lock.waitForUnlock(30000);
  * ```
  */
 export class IngestionLock {
-  private locked: boolean = false;
-  private currentFile?: string;
-  private startedAt?: Date;
-  private pendingFiles: string[] = [];
-  private timeoutHandle?: NodeJS.Timeout;
-  private waitingPromises: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
-  private options: Omit<Required<IngestionLockOptions>, 'logger'>;
+  private operations: Map<string, PendingOperation> = new Map();
+  private waiters: Array<{ resolve: () => void }> = [];
+  private options: Required<Omit<IngestionLockOptions, 'logger'>>;
   private logger?: AgentLogger;
 
   constructor(options: IngestionLockOptions = {}) {
     this.options = {
-      timeout: options.timeout ?? 30000,
+      defaultTimeout: options.defaultTimeout ?? 30000,
       onStatusChange: options.onStatusChange ?? (() => {}),
     };
     this.logger = options.logger;
   }
 
   /**
-   * Set or update the logger (useful when logger is created after lock)
+   * Set or update the logger
    */
   setLogger(logger: AgentLogger): void {
     this.logger = logger;
   }
 
   /**
-   * Check if ingestion is currently in progress
+   * Check if lock is active (at least one operation in progress)
    */
   isLocked(): boolean {
-    return this.locked;
+    return this.operations.size > 0;
   }
 
   /**
    * Get current status
    */
   getStatus(): IngestionStatus {
+    const now = Date.now();
+    const operations = Array.from(this.operations.values()).map((op) => ({
+      type: op.type,
+      description: op.description,
+      elapsedMs: now - op.startedAt.getTime(),
+    }));
+
     return {
-      isLocked: this.locked,
-      currentFile: this.currentFile,
-      startedAt: this.startedAt,
-      pendingFiles: [...this.pendingFiles],
+      isLocked: this.operations.size > 0,
+      operationCount: this.operations.size,
+      operations,
     };
   }
 
   /**
-   * Acquire the lock for a file
-   * Returns a release function to call when done
-   * @param filePath - Identifier for the lock (usually file path or operation name)
-   * @param timeoutMs - Optional timeout override. 0 = no timeout (for initial ingestions). Default uses constructor timeout.
+   * Acquire the lock for an operation.
+   *
+   * @param type - Operation type (for priority and logging)
+   * @param identifier - Unique identifier (file path, "batch:N files", etc.)
+   * @param options - Options (timeout, description)
+   * @returns Operation key (pass to release())
    */
-  async acquire(filePath: string, timeoutMs?: number): Promise<() => void> {
-    // If already locked, add to pending and wait
-    if (this.locked) {
-      this.pendingFiles.push(filePath);
-      this.notifyStatusChange();
+  acquire(
+    type: OperationType,
+    identifier: string,
+    options?: {
+      description?: string;
+      timeoutMs?: number;
+    }
+  ): string {
+    const contentHash = hashContent(identifier);
+    const key = `${type}:${contentHash}`;
 
-      await new Promise<void>((resolve, reject) => {
-        this.waitingPromises.push({ resolve, reject });
-      });
-
-      // Remove from pending when we get the lock
-      const idx = this.pendingFiles.indexOf(filePath);
-      if (idx >= 0) this.pendingFiles.splice(idx, 1);
+    // Check if already in progress (avoid duplicates)
+    if (this.operations.has(key)) {
+      console.warn(`[IngestionLock] Operation already in progress: ${key}`);
+      return key;
     }
 
-    // Acquire lock
-    this.locked = true;
-    this.currentFile = filePath;
-    this.startedAt = new Date();
-    this.notifyStatusChange();
+    const operation: PendingOperation = {
+      key,
+      type,
+      contentHash,
+      description: options?.description || identifier,
+      startedAt: new Date(),
+    };
 
-    // Log acquisition
-    this.logger?.logLock('acquired', filePath);
-
-    // Safety timeout (0 = no timeout for long-running initial ingestions)
-    const timeout = timeoutMs !== undefined ? timeoutMs : this.options.timeout;
+    // Safety timeout
+    const timeout = options?.timeoutMs ?? this.options.defaultTimeout;
     if (timeout > 0) {
-      this.timeoutHandle = setTimeout(() => {
-        console.warn(`[IngestionLock] Timeout reached for ${filePath}, force releasing`);
-        this.logger?.logLock('timeout', filePath, timeout);
-        this.release();
+      operation.timeoutHandle = setTimeout(() => {
+        console.warn(`[IngestionLock] Timeout for ${key}, force releasing`);
+        this.logger?.logLock('timeout', operation.description, timeout);
+        this.release(key);
       }, timeout);
     }
 
-    // Return release function
-    return () => this.release();
-  }
-
-  /**
-   * Release the lock
-   */
-  private release(): void {
-    if (this.timeoutHandle) {
-      clearTimeout(this.timeoutHandle);
-      this.timeoutHandle = undefined;
-    }
-
-    // Log release
-    this.logger?.logLock('released');
-
-    this.locked = false;
-    this.currentFile = undefined;
-    this.startedAt = undefined;
+    this.operations.set(key, operation);
     this.notifyStatusChange();
 
-    // Wake up next waiting promise
-    const next = this.waitingPromises.shift();
-    if (next) {
-      next.resolve();
+    // Log acquisition
+    this.logger?.logLock('acquired', operation.description);
+    console.log(
+      `[IngestionLock] Acquired: ${operation.description} ` +
+        `(${this.operations.size} active)`
+    );
+
+    return key;
+  }
+
+  /**
+   * Release a specific operation.
+   * The global lock is released when ALL operations are complete.
+   *
+   * @param key - Key returned by acquire()
+   */
+  release(key: string): void {
+    const operation = this.operations.get(key);
+
+    if (!operation) {
+      console.warn(`[IngestionLock] Unknown operation: ${key}`);
+      return;
+    }
+
+    // Clear timeout
+    if (operation.timeoutHandle) {
+      clearTimeout(operation.timeoutHandle);
+    }
+
+    const elapsed = Date.now() - operation.startedAt.getTime();
+    this.operations.delete(key);
+
+    // Log release
+    this.logger?.logLock('released', operation.description);
+    console.log(
+      `[IngestionLock] Released: ${operation.description} ` +
+        `(${elapsed}ms, ${this.operations.size} remaining)`
+    );
+
+    this.notifyStatusChange();
+
+    // If no more operations, wake up waiters
+    if (this.operations.size === 0) {
+      console.log('[IngestionLock] All operations complete, releasing waiters');
+      for (const waiter of this.waiters) {
+        waiter.resolve();
+      }
+      this.waiters = [];
     }
   }
 
   /**
-   * Wait for the lock to be released
-   * Useful for RAG tools that want to wait instead of failing
+   * Wait for all operations to complete.
+   *
+   * @param timeoutMs - Max wait time (default: 30000)
+   * @returns true if unlocked, false if timeout
    */
-  async waitForUnlock(timeoutMs: number = 5000): Promise<boolean> {
-    if (!this.locked) return true;
+  async waitForUnlock(timeoutMs: number = 30000): Promise<boolean> {
+    if (this.operations.size === 0) {
+      return true;
+    }
 
     return new Promise<boolean>((resolve) => {
-      const checkInterval = setInterval(() => {
-        if (!this.locked) {
-          clearInterval(checkInterval);
-          clearTimeout(timeout);
-          resolve(true);
-        }
-      }, 100);
+      const waiter = { resolve: () => resolve(true) };
+      this.waiters.push(waiter);
 
+      // Timeout
       const timeout = setTimeout(() => {
-        clearInterval(checkInterval);
+        const idx = this.waiters.indexOf(waiter);
+        if (idx >= 0) {
+          this.waiters.splice(idx, 1);
+        }
         resolve(false);
       }, timeoutMs);
+
+      // Cleanup timeout if resolved before
+      const originalResolve = waiter.resolve;
+      waiter.resolve = () => {
+        clearTimeout(timeout);
+        originalResolve();
+      };
     });
+  }
+
+  /**
+   * Check if a specific operation is in progress
+   */
+  hasOperation(type: OperationType, identifier: string): boolean {
+    const contentHash = hashContent(identifier);
+    const key = `${type}:${contentHash}`;
+    return this.operations.has(key);
+  }
+
+  /**
+   * Get operations of a given type
+   */
+  getOperationsByType(type: OperationType): PendingOperation[] {
+    return Array.from(this.operations.values()).filter((op) => op.type === type);
+  }
+
+  /**
+   * Get a readable description for logs/debug
+   */
+  getDescription(): string {
+    if (this.operations.size === 0) {
+      return 'No active operations';
+    }
+
+    const lines = Array.from(this.operations.values()).map((op) => {
+      const elapsed = Date.now() - op.startedAt.getTime();
+      return `  - [${op.type}] ${op.description} (${elapsed}ms)`;
+    });
+
+    return `${this.operations.size} active operations:\n${lines.join('\n')}`;
   }
 
   /**
    * Get a user-friendly message about the current status
    */
   getBlockingMessage(): string {
-    if (!this.locked) {
+    if (this.operations.size === 0) {
       return '';
     }
 
-    const elapsed = this.startedAt
-      ? Math.round((Date.now() - this.startedAt.getTime()) / 1000)
-      : 0;
+    const ops = Array.from(this.operations.values());
+    const totalElapsed = Math.max(
+      ...ops.map((op) => Date.now() - op.startedAt.getTime())
+    );
+    const elapsedSec = Math.round(totalElapsed / 1000);
 
-    let msg = `⏳ Ingestion in progress for "${this.currentFile}" (${elapsed}s)`;
+    let msg = `⏳ Ingestion in progress (${this.operations.size} operations, ${elapsedSec}s)`;
 
-    if (this.pendingFiles.length > 0) {
-      msg += `\n   Pending: ${this.pendingFiles.join(', ')}`;
+    for (const op of ops) {
+      const elapsed = Math.round((Date.now() - op.startedAt.getTime()) / 1000);
+      msg += `\n   - [${op.type}] ${op.description} (${elapsed}s)`;
     }
 
     msg += '\n   RAG queries will return fresh data once complete.';
-    msg += '\n   Please retry your query in a moment.';
 
     return msg;
   }
@@ -209,70 +334,46 @@ export class IngestionLock {
 }
 
 /**
- * Singleton instance for global lock coordination
+ * Singleton instance for global ingestion lock coordination
  */
-let globalLock: IngestionLock | null = null;
+let globalIngestionLock: IngestionLock | null = null;
 
 export function getGlobalIngestionLock(): IngestionLock {
-  if (!globalLock) {
-    globalLock = new IngestionLock({
+  if (!globalIngestionLock) {
+    globalIngestionLock = new IngestionLock({
       onStatusChange: (status) => {
         if (status.isLocked) {
-          console.log(`🔒 Ingestion lock acquired: ${status.currentFile}`);
+          console.log(
+            `🔒 Ingestion lock: ${status.operationCount} operation(s) active`
+          );
         } else {
-          console.log(`🔓 Ingestion lock released`);
+          console.log(`🔓 Ingestion lock: all operations complete`);
         }
       },
     });
   }
-  return globalLock;
+  return globalIngestionLock;
 }
 
 /**
- * Create a wrapper for RAG tool handlers that checks the lock
+ * Singleton instance for global embedding lock coordination
+ * Separate from ingestion lock to allow non-semantic queries during embedding generation
  */
-export function withIngestionLock<T extends (...args: any[]) => Promise<any>>(
-  handler: T,
-  lock: IngestionLock,
-  options: {
-    /** If true, wait for unlock instead of failing immediately */
-    waitForUnlock?: boolean;
-    /** Max wait time in ms */
-    waitTimeout?: number;
-    /** Optional logger for blocked queries */
-    logger?: AgentLogger;
-  } = {}
-): T {
-  return (async (...args: Parameters<T>) => {
-    if (lock.isLocked()) {
-      const status = lock.getStatus();
+let globalEmbeddingLock: IngestionLock | null = null;
 
-      // Log that query is blocked
-      options.logger?.logLock('blocked', status.currentFile);
-
-      if (options.waitForUnlock) {
-        const waitStart = Date.now();
-        const unlocked = await lock.waitForUnlock(options.waitTimeout ?? 5000);
-        const waitTime = Date.now() - waitStart;
-
-        if (!unlocked) {
-          options.logger?.logLock('timeout', status.currentFile, waitTime);
-          return {
-            error: 'Ingestion timeout',
-            message: lock.getBlockingMessage(),
-            status: lock.getStatus(),
-          };
+export function getGlobalEmbeddingLock(): IngestionLock {
+  if (!globalEmbeddingLock) {
+    globalEmbeddingLock = new IngestionLock({
+      onStatusChange: (status) => {
+        if (status.isLocked) {
+          console.log(
+            `🧠 Embedding lock: ${status.operationCount} operation(s) active`
+          );
+        } else {
+          console.log(`🧠 Embedding lock: all operations complete`);
         }
-      } else {
-        return {
-          error: 'Ingestion in progress',
-          message: lock.getBlockingMessage(),
-          status: lock.getStatus(),
-          retry_after_ms: 1000,
-        };
-      }
-    }
-
-    return handler(...args);
-  }) as T;
+      },
+    });
+  }
+  return globalEmbeddingLock;
 }

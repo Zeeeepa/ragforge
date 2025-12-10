@@ -37,6 +37,14 @@ export interface ConversationConfig {
   exportPath?: string;
   exportFormat?: 'json' | 'markdown';
   exportOnEveryMessage?: boolean;
+
+  // Multi-level summarization with percentage-based thresholds
+  maxContextChars?: number;             // Default: 100000 (contexte max)
+  l1ThresholdPercent?: number;          // Default: 10 (10% du max = 10k chars)
+  l2ThresholdPercent?: number;          // Default: 10 (10% du max = 10k chars)
+  lastUserQueriesPercent?: number;      // Default: 5 (5% du max = 5k chars)
+  codeSearchPercent?: number;           // Default: 10 (10% du max = 10k chars)
+  codeSearchInitialLimit?: number;      // Default: 100 résultats initiaux
 }
 
 export interface ConversationAgentOptions {

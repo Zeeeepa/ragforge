@@ -1,0 +1,46 @@
+# Configuration Cursor pour RagForge
+
+## Contexte du projet
+- Monorepo TypeScript avec Turbo
+- Framework RAG avec cerveau persistant (Neo4j)
+- Architecture basée sur des agents et des outils MCP
+- Utilise React (Ink) pour l'interface CLI
+
+## Règles de codage
+
+### TypeScript
+- Toujours utiliser TypeScript strict
+- Préférer les types explicites aux `any`
+- Utiliser les interfaces pour les contrats d'API
+- Respecter la structure monorepo (packages/cli, packages/core)
+
+### Architecture
+- Respecter la séparation des responsabilités entre packages
+- Les outils MCP doivent être dans `packages/core/src/tools/`
+- La CLI doit être dans `packages/cli/src/`
+- Utiliser les adaptateurs pour l'abstraction (ex: ingestion-queue.ts)
+
+### Code style
+- Suivre les règles ESLint et Prettier du projet
+- Utiliser async/await plutôt que les promesses chaînées
+- Gérer les erreurs explicitement avec try/catch
+- Documenter les fonctions complexes avec des commentaires JSDoc
+
+### Tests
+- Écrire des tests pour les nouvelles fonctionnalités
+- Utiliser Vitest pour les tests unitaires
+- Tester les intégrations avec Neo4j et les outils MCP
+
+### Git
+- Faire des commits atomiques
+- Utiliser des messages de commit descriptifs
+- Ne pas committer les fichiers générés (.ragforge-logs/, dist/, etc.)
+
+## Préférences de réponse
+- Répondre en français quand demandé
+- Être concis mais complet
+- Expliquer les décisions architecturales importantes
+- Proposer des alternatives quand approprié
+
+## Test de validation
+- Cette ligne est un test pour vérifier la validation Cursor

@@ -260,7 +260,7 @@ After ingestion, you can search across all ingested content using brain_search.
 
 Example usage:
 - ingest_directory({ path: "/path/to/project" })
-- ingest_directory({ path: "./docs", project_name: "my-docs", watch: true })`,
+- ingest_directory({ path: "./docs", project_name: "my-docs" })`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -282,14 +282,6 @@ Example usage:
           items: { type: 'string' },
           description: 'Glob patterns to exclude (default: node_modules, .git, dist, etc.)',
         },
-        watch: {
-          type: 'boolean',
-          description: 'Watch for file changes after ingestion (default: false)',
-        },
-        generate_embeddings: {
-          type: 'boolean',
-          description: 'Generate embeddings for semantic search (default: false)',
-        },
       },
       required: ['path'],
     },
@@ -305,14 +297,11 @@ export function generateIngestDirectoryHandler(ctx: BrainToolsContext) {
     project_name?: string;
     include?: string[];
     exclude?: string[];
-    watch?: boolean;
-    generate_embeddings?: boolean;
   }): Promise<QuickIngestResult> => {
     const options: QuickIngestOptions = {
       projectName: params.project_name,
       include: params.include,
       exclude: params.exclude,
-      watch: params.watch,
     };
 
     return ctx.brain.quickIngest(params.path, options);
@@ -342,7 +331,8 @@ This searches everything the agent has ever explored:
 Semantic search uses embeddings to find meaning, not just exact text matches.
 It works across languages and finds conceptually related content.
 
-For exact text/filename searches, prefer grep_files or glob_files instead.
+For text search (semantic=false), uses exact text matching (CONTAINS).
+For fuzzy search with typo tolerance on files, use search_files instead.
 
 Example usage:
 - brain_search({ query: "authentication logic", semantic: true })
@@ -387,6 +377,21 @@ Example usage:
           type: 'number',
           description: 'Maximum number of results (default: 20)',
         },
+        use_reranking: {
+          type: 'boolean',
+          optional: true,
+          description: `Use LLM reranking to improve result relevance using executeLLMBatch.
+When true, results are reranked using StructuredLLMExecutor.executeReranking().
+Requires GEMINI_API_KEY environment variable.`,
+        },
+        min_score: {
+          type: 'number',
+          optional: true,
+          description: `Minimum similarity score threshold (0.0 to 1.0). Results below this score will be filtered out.
+Default: 0.3 for semantic search (recommended range: 0.3-0.7), no filter for text search.
+Lower values (0.1-0.3) return more results but may include less relevant matches.
+Higher values (0.7-0.9) return fewer but more precise results.`,
+        },
       },
       required: ['query'],
     },
@@ -405,66 +410,524 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
     embedding_type?: 'name' | 'content' | 'description' | 'all';
     glob?: string;
     limit?: number;
-  }): Promise<UnifiedSearchResult & { waited_for_edits?: boolean; watchers_started?: string[] }> => {
-    // Auto-start watchers for projects that don't have one
-    // This ensures file changes are tracked without manual watcher management
+    use_reranking?: boolean;
+    min_score?: number;
+  }): Promise<UnifiedSearchResult & { waited_for_edits?: boolean; watchers_started?: string[]; flushed_projects?: string[]; reranked?: boolean }> => {
+    const { createLogger } = await import('../runtime/utils/logger.js');
+    const log = createLogger('brain_search');
+    
+    const startTime = Date.now();
+    log.info('START', { query: params.query, semantic: params.semantic ?? false });
+    
+    let waitedForSync = false;
     const watchersStarted: string[] = [];
-    const allProjects = ctx.brain.listProjects();
+    const flushedProjects: string[] = [];
 
-    for (const project of allProjects) {
-      // Use isWatching(path) to properly check - IDs might differ between registry and watcher
-      if (!ctx.brain.isWatching(project.path)) {
-        try {
-          await ctx.brain.startWatching(project.path, { skipInitialSync: true });
-          watchersStarted.push(project.id);
-          console.log(`[brain_search] Auto-started watcher for ${project.id}`);
-        } catch (err) {
-          // Silently ignore - watcher start is best-effort
-          console.warn(`[brain_search] Failed to auto-start watcher for ${project.id}:`, err);
+    try {
+      // Determine target projects (filter by params.projects if specified)
+      log.debug('Step 1: Listing projects');
+      const allProjects = ctx.brain.listProjects();
+      log.debug(`Found ${allProjects.length} total projects`);
+      
+      const targetProjects = params.projects
+        ? allProjects.filter(p => params.projects!.includes(p.id))
+        : allProjects;
+      log.debug(`Targeting ${targetProjects.length} projects`);
+
+      // For each project, ensure it's synced before searching
+      log.info('Step 2: Ensuring projects are synced', { projectCount: targetProjects.length });
+      for (let i = 0; i < targetProjects.length; i++) {
+        const project = targetProjects[i];
+        log.debug(`Syncing project ${i + 1}/${targetProjects.length}`, { projectId: project.id, path: project.path });
+        const syncStart = Date.now();
+        const syncResult = await ensureProjectSynced(ctx.brain, project.path);
+        const syncDuration = Date.now() - syncStart;
+        log.debug(`Project synced`, { 
+          projectId: project.id, 
+          duration: syncDuration, 
+          waited: syncResult.waited, 
+          watcherStarted: syncResult.watcherStarted, 
+          flushed: syncResult.flushed 
+        });
+        
+        if (syncResult.waited) waitedForSync = true;
+        if (syncResult.watcherStarted) watchersStarted.push(project.id);
+        if (syncResult.flushed) flushedProjects.push(project.id);
+      }
+      log.info('Step 2 complete - all projects synced');
+
+      // Also wait for agent edit queue (MCP tools use a separate queue)
+      log.debug('Step 3: Checking for pending MCP edits');
+      const hasPendingEdits = ctx.brain.hasPendingEdits();
+      log.debug(`Has pending edits: ${hasPendingEdits}`);
+      if (hasPendingEdits) {
+        log.info('Waiting for pending MCP edits to flush...');
+        const editWaitStart = Date.now();
+        const flushed = await ctx.brain.waitForPendingEdits(300000); // 5 minutes
+        const editWaitDuration = Date.now() - editWaitStart;
+        log.info('MCP edits wait complete', { duration: editWaitDuration, flushed });
+        waitedForSync = true;
+        if (!flushed) {
+          log.warn('Timeout waiting for MCP edits - proceeding with potentially stale data');
         }
       }
-    }
 
-    // Wait for ingestion lock (watcher might be ingesting)
-    // and for any pending MCP edits to be flushed
-    let waitedForEdits = false;
-    const ingestionLock = ctx.brain.getIngestionLock();
-
-    if (ingestionLock.isLocked()) {
-      console.log('[brain_search] Waiting for ingestion lock...');
-      const unlocked = await ingestionLock.waitForUnlock(30000);
-      waitedForEdits = true;
-      if (!unlocked) {
-        console.warn('[brain_search] Timeout waiting for ingestion lock - proceeding with potentially stale data');
+      // Final check: wait for locks (in case something started after our checks)
+      log.info('Step 4: Checking locks', { semantic: params.semantic });
+      const ingestionLock = ctx.brain.getIngestionLock();
+      const isIngestionLocked = ingestionLock.isLocked();
+      log.info(`Ingestion lock locked: ${isIngestionLocked}`);
+      
+      // Always wait for ingestion lock (data consistency)
+      if (isIngestionLocked) {
+        log.info('Waiting for ingestion lock...', { description: ingestionLock.getDescription() });
+        const lockWaitStart = Date.now();
+        const unlocked = await ingestionLock.waitForUnlock(300000); // 5 minutes
+        const lockWaitDuration = Date.now() - lockWaitStart;
+        log.info('Ingestion lock wait complete', { duration: lockWaitDuration, unlocked });
+        waitedForSync = true;
+        if (!unlocked) {
+          log.warn('Timeout waiting for ingestion lock - proceeding with potentially stale data');
+        }
       }
-    }
 
-    if (ctx.brain.hasPendingEdits()) {
-      console.log('[brain_search] Waiting for pending edits to flush...');
-      const flushed = await ctx.brain.waitForPendingEdits(30000);
-      waitedForEdits = true;
-      if (!flushed) {
-        console.warn('[brain_search] Timeout waiting for pending edits - proceeding with potentially stale data');
+      // Only wait for embedding lock if semantic search is requested
+      if (params.semantic) {
+        const embeddingLock = ctx.brain.getEmbeddingLock();
+        const isEmbeddingLocked = embeddingLock.isLocked();
+        log.info(`Embedding lock locked: ${isEmbeddingLocked}`, { semantic: true });
+        if (isEmbeddingLocked) {
+          log.info('Waiting for embedding lock (semantic search requires embeddings)...', { description: embeddingLock.getDescription() });
+          const embeddingLockWaitStart = Date.now();
+          const embeddingUnlocked = await embeddingLock.waitForUnlock(300000); // 5 minutes
+          const embeddingLockWaitDuration = Date.now() - embeddingLockWaitStart;
+          log.info('Embedding lock wait complete', { duration: embeddingLockWaitDuration, unlocked: embeddingUnlocked });
+          waitedForSync = true;
+          if (!embeddingUnlocked) {
+            log.warn('Timeout waiting for embedding lock - proceeding with potentially incomplete embeddings');
+          }
+        }
+      } else {
+        const embeddingLock = ctx.brain.getEmbeddingLock();
+        const isEmbeddingLocked = embeddingLock.isLocked();
+        log.info('Non-semantic search - skipping embedding lock wait', { 
+          embeddingLocked: isEmbeddingLocked,
+          canProceedDuringEmbedding: true,
+          description: isEmbeddingLocked ? embeddingLock.getDescription() : undefined
+        });
       }
+
+      log.info('Step 5: Executing search');
+      // For reranking with semantic search, we need more candidates to rerank
+      // Minimum 100 results for reranking, then apply limit after reranking
+      const originalLimit = params.limit || 20;
+      const searchLimit = (params.use_reranking && params.semantic) 
+        ? Math.max(originalLimit, 100) 
+        : originalLimit;
+      
+      const options: BrainSearchOptions = {
+        projects: params.projects,
+        nodeTypes: params.types,
+        semantic: params.semantic,
+        embeddingType: params.embedding_type,
+        glob: params.glob,
+        limit: searchLimit,
+        minScore: params.min_score,
+      };
+      const searchStart = Date.now();
+      let result = await ctx.brain.search(params.query, options);
+      const searchDuration = Date.now() - searchStart;
+      log.info('Search complete', { 
+        duration: searchDuration, 
+        resultCount: result.totalCount,
+        searchLimit,
+        originalLimit,
+        willRerank: params.use_reranking && params.semantic
+      });
+
+      // Apply reranking if requested
+      let reranked = false;
+      if (params.use_reranking && result.results && result.results.length > 0) {
+        log.info('Step 6: Applying LLM reranking', { resultCount: result.results.length });
+        const rerankStart = Date.now();
+        
+        try {
+          const { LLMReranker } = await import('../runtime/reranking/llm-reranker.js');
+          const { GeminiAPIProvider } = await import('../runtime/reranking/gemini-api-provider.js');
+          // EntityContext is an interface, we'll define it inline for brain search
+          
+          // Get Gemini API key from BrainManager config (loaded from ~/.ragforge/.env)
+          const geminiKey = ctx.brain.getGeminiKey() || process.env.GEMINI_API_KEY;
+          if (!geminiKey) {
+            log.warn('GEMINI_API_KEY not found in ~/.ragforge/.env or process.env, skipping reranking');
+          } else {
+            // Create provider with the key from BrainManager (not fromEnv which only checks process.env)
+            const provider = new GeminiAPIProvider({
+              apiKey: geminiKey,
+              model: 'gemini-2.0-flash',
+            });
+            
+            // Create a generic EntityContext for brain search results
+            // Brain search returns various node types (Scope, File, MarkdownSection, etc.)
+            // Using Gemini Flash 2.0 (1M tokens) - we can send much more context
+            const entityContext = {
+              type: 'BrainNode',
+              displayName: 'search results',
+              uniqueField: 'uuid',
+              queryField: 'name',
+              fields: [
+                { name: 'uuid', label: 'ID', required: true },
+                { name: 'name', label: 'Name', maxLength: 500 },
+                { name: 'title', label: 'Title', maxLength: 500 },
+                { name: 'file', label: 'File', maxLength: 500 },
+                { name: 'path', label: 'Path', maxLength: 500 },
+                { name: 'source', label: 'Source', maxLength: 20000 }, // Full source code
+                { name: 'content', label: 'Content', maxLength: 20000 }, // Full content
+                { name: 'ownContent', label: 'Own Content', maxLength: 20000 },
+                { name: 'docstring', label: 'Documentation', maxLength: 5000 }, // Full docstrings
+                { name: 'signature', label: 'Signature', maxLength: 1000 },
+                { name: 'type', label: 'Type', maxLength: 100 },
+                { name: 'rawText', label: 'Raw Text', maxLength: 20000 },
+                { name: 'textContent', label: 'Text Content', maxLength: 20000 },
+                { name: 'code', label: 'Code', maxLength: 20000 },
+                { name: 'indexedAt', label: 'Indexed At', maxLength: 50 }, // Date when item was indexed (for recency preference)
+              ],
+              enrichments: [],
+            };
+            
+            // Convert results to SearchResult format for reranking
+            const searchResults = result.results.map(r => ({
+              entity: r.node,
+              score: r.score,
+            }));
+            
+            // Create reranker with options
+            // topK should be at least the searchLimit (we'll rerank all candidates, then apply limit)
+            const reranker = new LLMReranker(provider, {
+              batchSize: 10,
+              parallel: 5,
+              minScore: 0.0,
+              topK: searchLimit, // Rerank all candidates we retrieved
+              scoreMerging: 'weighted',
+              weights: { vector: 0.3, llm: 0.7 },
+            }, entityContext);
+            
+            // Execute reranking
+            const rerankResult = await reranker.rerank({
+              userQuestion: params.query,
+              results: searchResults,
+              queryContext: `Search query: "${params.query}"\nSemantic: ${params.semantic || false}\nProjects: ${params.projects?.join(', ') || 'all'}`,
+            });
+            
+            // Log complete LLM response for debugging
+            log.info('Reranking complete LLM response', { 
+              evaluationCount: rerankResult.evaluations.length,
+              resultCount: searchResults.length,
+              evaluations: rerankResult.evaluations.map(e => ({
+                scopeId: e.scopeId,
+                score: e.score,
+                relevant: e.relevant,
+                reasoning: e.reasoning?.substring(0, 100), // First 100 chars of reasoning
+              })),
+              queryFeedback: rerankResult.queryFeedback,
+            });
+            
+            // Log UUID comparison for debugging
+            const evaluationIds = rerankResult.evaluations.map(e => e.scopeId);
+            const resultUuids = searchResults.map(r => r.entity.uuid);
+            const matchingIds = evaluationIds.filter(id => resultUuids.includes(id));
+            const missingInResults = evaluationIds.filter(id => !resultUuids.includes(id));
+            const missingInEvaluations = resultUuids.filter(uuid => !evaluationIds.includes(uuid));
+            
+            log.info('UUID comparison', {
+              totalEvaluations: evaluationIds.length,
+              totalResults: resultUuids.length,
+              matchingIds: matchingIds.length,
+              missingInResults: missingInResults.slice(0, 5), // First 5 missing
+              missingInEvaluations: missingInEvaluations.slice(0, 5), // First 5 missing
+              sampleEvaluationIds: evaluationIds.slice(0, 5),
+              sampleResultUuids: resultUuids.slice(0, 5),
+            });
+            
+            if (rerankResult.evaluations.length === 0) {
+              log.warn('No evaluations returned from reranking, keeping original results');
+              // Keep original results if no evaluations
+            } else {
+              // Merge scores using reranker's mergeScores method
+              const rerankedResults = reranker.mergeScores(
+                searchResults,
+                rerankResult.evaluations,
+                'weighted',
+                { vector: 0.3, llm: 0.7 }
+              );
+              
+              log.info('Merged reranked results', { 
+                mergedCount: rerankedResults.length,
+                originalCount: searchResults.length,
+                evaluationCount: rerankResult.evaluations.length
+              });
+              
+              if (rerankedResults.length === 0) {
+                log.warn('mergeScores returned empty array, keeping original results. This may indicate UUID mismatch between evaluations and results.');
+                // Keep original results if mergeScores filtered everything out
+              } else {
+                // Convert back to BrainSearchResult format
+                const finalResults = rerankedResults.map(r => {
+                  const originalResult = result.results.find(orig => orig.node.uuid === r.entity.uuid);
+                  if (!originalResult) {
+                    log.warn('Original result not found for UUID', { uuid: r.entity.uuid });
+                    return null;
+                  }
+                  
+                  return {
+                    ...originalResult,
+                    score: r.score,
+                    // Add score breakdown if available
+                    ...(r.scoreBreakdown && { scoreBreakdown: r.scoreBreakdown }),
+                  };
+                }).filter((r): r is typeof result.results[0] => r !== null);
+                
+                // Apply original limit after reranking (reranking was done on more candidates)
+                const limitedResults = finalResults.slice(0, originalLimit);
+                
+                result = {
+                  ...result,
+                  results: limitedResults,
+                  totalCount: limitedResults.length,
+                };
+                
+                log.info('Applied limit after reranking', {
+                  beforeLimit: finalResults.length,
+                  afterLimit: limitedResults.length,
+                  originalLimit,
+                });
+              }
+            }
+            
+            reranked = true;
+            const rerankDuration = Date.now() - rerankStart;
+            log.info('Reranking complete', { 
+              duration: rerankDuration, 
+              resultCount: result.results.length,
+              evaluations: rerankResult.evaluations.length,
+            });
+            
+            // Log query feedback if available
+            if (rerankResult.queryFeedback) {
+              log.info('Query feedback', {
+                quality: rerankResult.queryFeedback.quality,
+                suggestions: rerankResult.queryFeedback.suggestions.length,
+              });
+            }
+          }
+        } catch (error: any) {
+          log.error('Reranking failed', error);
+          // Continue with original results if reranking fails
+        }
+      }
+
+      const totalDuration = Date.now() - startTime;
+      log.info('COMPLETE', { totalDuration, reranked });
+
+      return {
+        ...result,
+        waited_for_edits: waitedForSync || undefined,
+        watchers_started: watchersStarted.length > 0 ? watchersStarted : undefined,
+        flushed_projects: flushedProjects.length > 0 ? flushedProjects : undefined,
+        reranked: reranked || undefined,
+      };
+    } catch (error: any) {
+      const totalDuration = Date.now() - startTime;
+      log.error('ERROR', error, { duration: totalDuration });
+      throw error;
     }
-
-    const options: BrainSearchOptions = {
-      projects: params.projects,
-      nodeTypes: params.types,
-      semantic: params.semantic,
-      embeddingType: params.embedding_type,
-      glob: params.glob,
-      limit: params.limit,
-    };
-
-    const result = await ctx.brain.search(params.query, options);
-
-    return {
-      ...result,
-      waited_for_edits: waitedForEdits,
-      watchers_started: watchersStarted.length > 0 ? watchersStarted : undefined,
-    };
   };
+}
+
+/**
+ * Ensure a project is synced before searching.
+ * - Starts watcher if not active (with initial sync)
+ * - Flushes pending queue if watcher is active
+ * - Waits for any ongoing ingestion
+ */
+async function ensureProjectSynced(
+  brain: BrainManager,
+  projectPath: string
+): Promise<{ waited: boolean; watcherStarted: boolean; flushed: boolean }> {
+  const { createLogger } = await import('../runtime/utils/logger.js');
+  const log = createLogger('brain_search:ensureProjectSynced');
+  
+  let waited = false;
+  let watcherStarted = false;
+  let flushed = false;
+
+  // 1. Check if watcher is active
+  const isWatching = brain.isWatching(projectPath);
+  log.debug('Checking watcher status', { projectPath, isWatching });
+  
+  if (!isWatching) {
+    log.info('Starting watcher', { projectPath });
+
+    try {
+      // Start with initial sync to detect changes since last ingestion
+      const watchStart = Date.now();
+      log.info('Calling brain.startWatching', { projectPath });
+      await brain.startWatching(projectPath, {
+        skipInitialSync: false, // Do initial sync to catch external changes
+        verbose: false,
+      });
+      const watchDuration = Date.now() - watchStart;
+      log.info('brain.startWatching completed', { duration: watchDuration });
+      watcherStarted = true;
+      waited = true;
+
+      // Wait for initial sync to complete (watcher flushes after scan)
+      log.info('Getting watcher instance', { projectPath });
+      const watcher = brain.getWatcher(projectPath);
+      if (watcher) {
+        log.info('Watcher instance obtained, checking queue');
+        const queue = watcher.getQueue();
+        const initialPending = queue.getPendingCount();
+        const initialQueued = queue.getQueuedCount();
+        log.info('Queue status before wait', { pending: initialPending, queued: initialQueued });
+        
+        log.info('Waiting for initial sync queue to empty');
+        const queueWaitStart = Date.now();
+        // Wait for both locks during initial sync (embeddings will be generated)
+        await waitForQueueEmpty(queue, brain.getIngestionLock(), 300000, brain.getEmbeddingLock()); // 5 minutes
+        const queueWaitDuration = Date.now() - queueWaitStart;
+        log.info('Initial sync queue empty', { duration: queueWaitDuration });
+      } else {
+        log.warn('Watcher instance not found after startWatching', { projectPath });
+      }
+    } catch (err: any) {
+      log.error('Failed to start watcher', err, { projectPath });
+      // Continue anyway - search will still work, just without auto-ingestion
+      // Don't re-throw to allow other projects to sync
+    }
+  } else {
+    // 2. Watcher active - check for pending files in queue
+    log.debug('Watcher already active, checking queue');
+    const watcher = brain.getWatcher(projectPath);
+    if (watcher) {
+      const queue = watcher.getQueue();
+      const pendingCount = queue.getPendingCount();
+      const queuedCount = queue.getQueuedCount();
+      const isProcessing = queue.isProcessing();
+
+      log.debug('Queue status', { pendingCount, queuedCount, isProcessing });
+
+      if (pendingCount > 0 || queuedCount > 0) {
+        log.info('Flushing queue', { pendingCount, queuedCount });
+
+        // Force immediate flush (don't wait for batch timer)
+        const flushStart = Date.now();
+        await queue.flush();
+        const flushDuration = Date.now() - flushStart;
+        log.debug('Queue flushed', { duration: flushDuration });
+        flushed = true;
+        waited = true;
+
+        // Wait for queue to be completely empty AND ingestion lock released
+        // Note: embedding lock is checked separately in brain_search handler based on semantic flag
+        log.debug('Waiting for queue to be empty');
+        const emptyWaitStart = Date.now();
+        await waitForQueueEmpty(queue, brain.getIngestionLock(), 300000); // 5 minutes, no embedding lock here
+        const emptyWaitDuration = Date.now() - emptyWaitStart;
+        log.debug('Queue empty', { duration: emptyWaitDuration });
+      }
+
+      // 3. Check if ingestion is in progress
+      if (isProcessing) {
+        log.info('Waiting for watcher ingestion to complete');
+        const processWaitStart = Date.now();
+        await waitForQueueEmpty(queue, brain.getIngestionLock(), 300000); // 5 minutes, no embedding lock here
+        const processWaitDuration = Date.now() - processWaitStart;
+        log.debug('Ingestion complete', { duration: processWaitDuration });
+        waited = true;
+      }
+    }
+  }
+  
+  log.debug('Project sync complete', { waited, watcherStarted, flushed });
+
+  return { waited, watcherStarted, flushed };
+}
+
+/**
+ * Wait for the ingestion queue to be empty, not processing, AND locks released
+ * For semantic search: waits for both ingestion and embedding locks
+ * For non-semantic search: waits only for ingestion lock
+ */
+async function waitForQueueEmpty(
+  queue: { getPendingCount: () => number; getQueuedCount: () => number; isProcessing: () => boolean },
+  ingestionLock: { isLocked: () => boolean; getDescription: () => string },
+  timeout: number,
+  embeddingLock?: { isLocked: () => boolean; getDescription: () => string }
+): Promise<boolean> {
+  const { createLogger } = await import('../runtime/utils/logger.js');
+  const log = createLogger('brain_search:waitForQueueEmpty');
+  
+  const startTime = Date.now();
+  const checkInterval = 100; // Check every 100ms
+  let lastLogTime = 0;
+  const logInterval = 5000; // Log every 5 seconds
+
+  const waitForEmbeddings = !!embeddingLock;
+  log.info('Starting wait for queue empty', { timeout, waitForEmbeddings });
+
+  while (Date.now() - startTime < timeout) {
+    const pending = queue.getPendingCount();
+    const queued = queue.getQueuedCount();
+    const processing = queue.isProcessing();
+    const ingestionLocked = ingestionLock.isLocked();
+    const embeddingLocked = embeddingLock?.isLocked() ?? false;
+    const elapsed = Date.now() - startTime;
+
+    // Log progress every 5 seconds
+    if (elapsed - lastLogTime >= logInterval) {
+      log.info('Still waiting for queue', { 
+        pending, 
+        queued, 
+        processing, 
+        ingestionLocked, 
+        embeddingLocked,
+        waitForEmbeddings,
+        elapsed, 
+        ingestionDescription: ingestionLocked ? ingestionLock.getDescription() : undefined,
+        embeddingDescription: embeddingLocked ? embeddingLock?.getDescription() : undefined
+      });
+      lastLogTime = elapsed;
+    }
+
+    // Queue is empty AND not processing AND ingestion lock released
+    // AND embedding lock released (if waiting for embeddings)
+    if (pending === 0 && queued === 0 && !processing && !ingestionLocked && (!waitForEmbeddings || !embeddingLocked)) {
+      log.info('Queue empty and ready', { duration: elapsed, waitForEmbeddings });
+      return true;
+    }
+
+    // Wait a bit before re-checking
+    await new Promise(resolve => setTimeout(resolve, checkInterval));
+  }
+
+  const finalPending = queue.getPendingCount();
+  const finalQueued = queue.getQueuedCount();
+  const finalProcessing = queue.isProcessing();
+  const finalIngestionLocked = ingestionLock.isLocked();
+  const finalEmbeddingLocked = embeddingLock?.isLocked() ?? false;
+  log.error('Timeout waiting for queue empty', { 
+    timeout, 
+    finalPending, 
+    finalQueued, 
+    finalProcessing,
+    finalIngestionLocked,
+    finalEmbeddingLocked,
+    waitForEmbeddings,
+    ingestionDescription: finalIngestionLocked ? ingestionLock.getDescription() : undefined,
+    embeddingDescription: finalEmbeddingLocked ? embeddingLock?.getDescription() : undefined
+  });
+  return false;
 }
 
 // ============================================
@@ -1846,6 +2309,130 @@ export function generateBrainDeletePathHandler(ctx: BrainToolsContext) {
 }
 
 // ============================================
+// notify_user - Send intermediate messages to user
+// ============================================
+
+/**
+ * Generate notify_user tool definition
+ * Allows the agent to communicate with the user during long operations
+ */
+export function generateNotifyUserTool(): GeneratedToolDefinition {
+  return {
+    name: 'notify_user',
+    description: `Send a message to the user during execution.
+
+Use this tool to:
+- Inform the user about long-running operations ("This will take a moment...")
+- Explain what you're about to do before starting
+- Give progress updates during complex tasks
+- Warn about potential issues or ask for patience
+
+The message appears immediately in the UI, even while other tools are running.
+
+Example: notify_user({ message: "Indexing the project, this may take a minute..." })`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        message: {
+          type: 'string',
+          description: 'The message to display to the user',
+        },
+      },
+      required: ['message'],
+    },
+  };
+}
+
+/**
+ * Generate handler for notify_user
+ * This is a no-op - the actual display is handled by the TUI via onToolCall callback
+ */
+export function generateNotifyUserHandler() {
+  return async (params: { message: string }) => {
+    // The TUI handles this via onToolCall callback
+    // We just return success
+    return { notified: true, message: params.message };
+  };
+}
+
+// ============================================
+// update_todos - Display and update a todo list
+// ============================================
+
+export interface TodoItem {
+  content: string;
+  status: 'pending' | 'in_progress' | 'completed';
+}
+
+/**
+ * Generate update_todos tool definition
+ * Allows the agent to display and update a todo list in the TUI
+ */
+export function generateUpdateTodosTool(): GeneratedToolDefinition {
+  return {
+    name: 'update_todos',
+    description: `Display and update a todo list in the UI.
+
+Use this for complex tasks that have multiple steps. The todo list appears in the UI
+and helps the user track progress.
+
+WHEN TO USE:
+- Tasks with 3+ distinct steps
+- Multi-file changes
+- Complex operations that take time
+- When you want to show the user your plan
+
+HOW TO USE:
+1. At start: Create todos with status "pending"
+2. Before starting a task: Set its status to "in_progress"
+3. After completing: Set status to "completed"
+
+Only ONE todo should be "in_progress" at a time.
+
+Example:
+update_todos({ todos: [
+  { content: "Search for authentication code", status: "completed" },
+  { content: "Read and analyze auth files", status: "in_progress" },
+  { content: "Implement the fix", status: "pending" },
+  { content: "Test the changes", status: "pending" }
+]})`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        todos: {
+          type: 'array',
+          description: 'The complete todo list (replaces previous)',
+          items: {
+            type: 'object',
+            properties: {
+              content: { type: 'string', description: 'Task description' },
+              status: {
+                type: 'string',
+                enum: ['pending', 'in_progress', 'completed'],
+                description: 'Task status'
+              },
+            },
+            required: ['content', 'status'],
+          },
+        },
+      },
+      required: ['todos'],
+    },
+  };
+}
+
+/**
+ * Generate handler for update_todos
+ * This is a no-op - the actual display is handled by the TUI via onToolCall callback
+ */
+export function generateUpdateTodosHandler() {
+  return async (params: { todos: TodoItem[] }) => {
+    // The TUI handles this via onToolCall callback
+    return { updated: true, count: params.todos.length };
+  };
+}
+
+// ============================================
 // Export all tools
 // ============================================
 
@@ -1877,6 +2464,9 @@ export function generateBrainTools(): GeneratedToolDefinition[] {
     // Advanced: schema and direct Cypher queries
     generateGetSchemaTool(),
     generateRunCypherTool(),
+    // User communication
+    generateNotifyUserTool(),
+    generateUpdateTodosTool(),
   ];
 }
 
@@ -1908,6 +2498,9 @@ export function generateBrainToolHandlers(ctx: BrainToolsContext): Record<string
     // Advanced: schema and direct Cypher queries
     get_schema: generateGetSchemaHandler(),
     run_cypher: generateRunCypherHandler(ctx),
+    // User communication
+    notify_user: generateNotifyUserHandler(),
+    update_todos: generateUpdateTodosHandler(),
   };
 }
 
@@ -2474,85 +3067,13 @@ export function generateRunCypherHandler(ctx: BrainToolsContext) {
     records?: Array<Record<string, unknown>>;
     summary?: { counters: Record<string, number> };
     error?: string;
-    waited_for_edits?: boolean;
   }> => {
-    const neo4jClient = ctx.brain.getNeo4jClient();
-
-    if (!neo4jClient) {
-      return {
-        success: false,
-        error: 'Neo4j not connected. Initialize the brain first.',
-      };
-    }
-
-    // Wait for ingestion lock and pending edits (same as brain_search)
-    let waitedForEdits = false;
-    const ingestionLock = ctx.brain.getIngestionLock();
-
-    if (ingestionLock.isLocked()) {
-      console.log('[run_cypher] Waiting for ingestion lock...');
-      const unlocked = await ingestionLock.waitForUnlock(30000);
-      waitedForEdits = true;
-      if (!unlocked) {
-        console.warn('[run_cypher] Timeout waiting for ingestion lock - proceeding with potentially stale data');
-      }
-    }
-
-    if (ctx.brain.hasPendingEdits()) {
-      console.log('[run_cypher] Waiting for pending edits to flush...');
-      const flushed = await ctx.brain.waitForPendingEdits(30000);
-      waitedForEdits = true;
-      if (!flushed) {
-        console.warn('[run_cypher] Timeout waiting for pending edits - proceeding with potentially stale data');
-      }
-    }
-
-    try {
-      const result = await neo4jClient.run(params.query, params.params || {});
-
-      // Convert records to plain objects
-      const records = result.records.map(record => {
-        const obj: Record<string, unknown> = {};
-        for (const key of record.keys) {
-          if (typeof key !== 'string') continue; // Skip symbol keys
-          const value = record.get(key);
-          // Handle Neo4j Integer type
-          if (value && typeof value === 'object' && 'toNumber' in value) {
-            obj[key] = (value as { toNumber: () => number }).toNumber();
-          } else if (value && typeof value === 'object' && 'properties' in value) {
-            // Neo4j Node - extract properties
-            obj[key] = (value as { properties: unknown }).properties;
-          } else {
-            obj[key] = value;
-          }
-        }
-        return obj;
-      });
-
-      // Extract counters from summary
-      const counters: Record<string, number> = {};
-      const stats = result.summary?.counters?.updates();
-      if (stats) {
-        for (const [key, val] of Object.entries(stats)) {
-          if (typeof val === 'number' && val > 0) {
-            counters[key] = val;
-          }
-        }
-      }
-
-      return {
-        success: true,
-        records,
-        summary: Object.keys(counters).length > 0 ? { counters } : undefined,
-        waited_for_edits: waitedForEdits || undefined,
-      };
-    } catch (err: any) {
-      return {
-        success: false,
-        error: err.message || String(err),
-        waited_for_edits: waitedForEdits || undefined,
-      };
-    }
+    // Delegate to BrainManager.runCypher which handles:
+    // - Lock waiting
+    // - Pending edits flush
+    // - Query execution
+    // - Result conversion
+    return ctx.brain.runCypher(params.query, params.params || {});
   };
 }
 

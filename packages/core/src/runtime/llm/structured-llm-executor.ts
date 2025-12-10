@@ -484,10 +484,30 @@ export class StructuredLLMExecutor {
         return value !== undefined && value !== '' && value !== null;
       });
 
-      if (hasValidOutput) {
+      // Be more conservative: only return if we have valid output AND:
+      // 1. We've used at least one tool (to ensure we've searched), OR
+      // 2. The output explicitly indicates completion (e.g., contains "complete", "done", etc.), OR
+      // 3. We're at max iterations (to avoid infinite loops)
+      const hasUsedTools = toolContext.length > 0;
+      const outputText = JSON.stringify(parsed).toLowerCase();
+      const indicatesCompletion = outputText.includes('complete') || 
+                                  outputText.includes('done') || 
+                                  outputText.includes('finished') ||
+                                  outputText.includes('trouvé') ||
+                                  outputText.includes('terminé');
+
+      if (hasValidOutput && (hasUsedTools || indicatesCompletion || iteration >= maxIterations)) {
         // Remove tool_calls from output
         const { tool_calls: _, ...output } = parsed as any;
         return output as TOutput;
+      }
+
+      // If we have output but haven't used tools yet and tools are available, encourage tool usage
+      if (hasValidOutput && !hasUsedTools && config.tools && config.tools.length > 0 && iteration < maxIterations) {
+        // Don't return yet - we want the agent to use tools first
+        // This ensures thorough investigation before answering
+        // The prompt will remind the agent to use tools
+        continue;
       }
 
       // No tool calls and no valid output - error
@@ -928,9 +948,20 @@ export class StructuredLLMExecutor {
     }
   ): Promise<{ evaluations: ItemEvaluation[]; queryFeedback?: QueryFeedback }> {
     // Add reranking-specific prompts
+    // Detect if query explicitly asks for integration/usage (vs implementation)
+    const queryLower = config.userQuestion.toLowerCase();
+    const asksForIntegration = /\b(integrat|usage|use|how to use|config|configuration|setup|example|tutorial)\b/.test(queryLower);
+    const asksForImplementation = /\b(implement|code|source|class|function|method|definition|how it works|how does it work)\b/.test(queryLower);
+    
+    const implementationPreference = asksForIntegration 
+      ? '' 
+      : asksForImplementation 
+        ? ' IMPORTANT: Prefer implementation details (actual code, classes, functions, source code) over integration/usage documentation, unless the query explicitly asks for integration/usage.'
+        : ' IMPORTANT: Prefer implementation details (actual code, classes, functions, source code) over integration/usage documentation, unless the query explicitly asks for integration/usage.';
+    
     const rerankConfig: LLMStructuredCallConfig<T, ItemEvaluation> = {
       ...config,
-      systemPrompt: config.systemPrompt || `You are ranking ${config.entityContext?.displayName || 'items'} for relevance.`,
+      systemPrompt: config.systemPrompt || `You are ranking ${config.entityContext?.displayName || 'items'} for relevance.${implementationPreference}`,
       userTask: `User question: "${config.userQuestion}"`,
       outputSchema: {
         id: {
@@ -990,11 +1021,40 @@ export class StructuredLLMExecutor {
     const itemResults = isArrayResult ? result : result.items;
     const globalMetadata = isArrayResult ? undefined : result.globalMetadata;
 
+    // Log raw LLM response for debugging (using console.log for visibility in daemon logs)
+    console.log('[executeReranking] Raw LLM response:', JSON.stringify({
+      isArrayResult,
+      itemResultsCount: itemResults.length,
+      itemsCount: items.length,
+      sampleItemResults: itemResults.slice(0, 3).map((r: any, i: number) => ({
+        index: i,
+        id: r.id,
+        score: r.score,
+        reasoning: r.reasoning?.substring(0, 100),
+        relevant: r.relevant,
+      })),
+      sampleItemIds: items.slice(0, 3).map((item: any, index: number) => {
+        const itemId = config.getItemId ? config.getItemId(item, index) : String(index);
+        return { index, itemId, entityUuid: (item as any)?.uuid };
+      }),
+    }, null, 2));
+
     // Extract evaluations
+    // IMPORTANT: Always use itemId from getItemId, NOT itemResult.id from LLM
+    // The LLM may return numeric indices (0, 1, 2) but we need the real UUIDs
     const evaluations: ItemEvaluation[] = itemResults.map((itemResult, index) => {
       const itemId = config.getItemId ? config.getItemId(items[index], index) : String(index);
+      // Always use itemId (real UUID), ignore what LLM returned in itemResult.id
+      // The LLM's id field is just for reference, we map it back to the real UUID
+      
+      // Log ID mapping for debugging (first 3 items)
+      if (index < 3) {
+        const item = items[index] as any;
+        console.log(`[executeReranking] Item ${index}: itemId=${itemId}, itemResult.id=${itemResult.id}, using itemId (UUID), entity.uuid=${item?.uuid}`);
+      }
+      
       return {
-        id: itemResult.id || itemId,
+        id: itemId, // Always use the real UUID from getItemId, not what LLM returned
         score: itemResult.score,
         reasoning: itemResult.reasoning,
         relevant: itemResult.relevant

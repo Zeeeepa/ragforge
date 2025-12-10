@@ -16,6 +16,7 @@ import { promises as fs, readFileSync } from 'fs';
 import dotenv from 'dotenv';
 import yaml from 'js-yaml';
 import { callToolViaDaemon, ensureDaemonRunning, isDaemonRunning } from './daemon-client.js';
+import { getDaemonBrainProxy, type BrainProxy } from './daemon-brain-proxy.js';
 import {
   createClient,
   ConfigLoader,
@@ -28,7 +29,6 @@ import {
   // Discovery tools (get_schema)
   generateDiscoveryTools,
   // Brain tools (ingest, search)
-  BrainManager,
   generateBrainTools,
   generateBrainToolHandlers,
   // Setup tools (set_api_key, get_brain_status)
@@ -60,7 +60,7 @@ import { ensureEnvLoaded, getEnv } from '../utils/env.js';
 export interface McpServerOptions {
   /** Project path (default: current directory) */
   project?: string;
-
+  // TEST...
   /** Config file path */
   config?: string;
 
@@ -84,7 +84,8 @@ interface McpContext {
   ragClient: ReturnType<typeof createClient> | null;
   isProjectLoaded: boolean;
   registry: ProjectRegistry;
-  brainManager: BrainManager | null;
+  /** Brain proxy - connects to daemon for all brain operations */
+  brainProxy: BrainProxy | null;
 }
 
 // ============================================
@@ -216,18 +217,17 @@ async function prepareToolsForMcp(
     registry: new ProjectRegistry({
       memoryPolicy: { maxLoadedProjects: 3, idleUnloadTimeout: 5 * 60 * 1000 },
     }),
-    brainManager: null,
+    brainProxy: null,
   };
 
-  // Try to initialize BrainManager (for brain tools)
-  // BrainManager handles its own Docker container and .env file in ~/.ragforge/
+  // Initialize Brain Proxy (connects to daemon for all brain operations)
+  // This ensures single point of access to Neo4j and file watchers
   try {
-    log('info', 'Initializing BrainManager...');
-    ctx.brainManager = await BrainManager.getInstance();
-    await ctx.brainManager.initialize();
-    log('info', 'BrainManager initialized (Docker container managed automatically)');
+    log('info', 'Initializing Brain Proxy (daemon mode)...');
+    ctx.brainProxy = await getDaemonBrainProxy();
+    log('info', 'Brain Proxy initialized (connected to daemon)');
   } catch (error: any) {
-    log('debug', `BrainManager init failed: ${error.message}`);
+    log('debug', `Brain Proxy init failed: ${error.message}`);
     log('debug', 'Brain tools will be disabled');
   }
 
@@ -323,12 +323,12 @@ async function prepareToolsForMcp(
     // Queue file changes for batched re-ingestion (non-blocking)
     // The actual ingestion happens after a debounce delay (500ms)
     // brain_search will wait for pending edits before querying
-    onFileModified: ctx.brainManager
+    onFileModified: ctx.brainProxy
       ? async (filePath: string, changeType: 'created' | 'updated' | 'deleted') => {
           log('debug', `File ${changeType}: ${filePath} (queuing for re-ingestion)`);
 
-          if (!ctx.brainManager) {
-            return { queued: false, reason: 'brainManager not available' };
+          if (!ctx.brainProxy) {
+            return { queued: false, reason: 'brainProxy not available' };
           }
 
           const pathModule = await import('path');
@@ -339,7 +339,7 @@ async function prepareToolsForMcp(
           // Media files: still need immediate processing (no queue yet for media)
           if (mediaExts.includes(ext) && changeType !== 'deleted') {
             try {
-              await ctx.brainManager.updateMediaContent({
+              await ctx.brainProxy.updateMediaContent({
                 filePath: absoluteFilePath,
                 extractionMethod: `file-tool-${changeType}`,
                 generateEmbeddings: true,
@@ -354,8 +354,8 @@ async function prepareToolsForMcp(
 
           // Code files: queue for batched ingestion (non-blocking!)
           console.log(`[MCP] 🔄 Queuing ${filePath} for re-ingestion...`);
-          ctx.brainManager.queueFileChange(absoluteFilePath, changeType);
-          const pendingCount = ctx.brainManager.getPendingEditCount();
+          ctx.brainProxy.queueFileChange(absoluteFilePath, changeType);
+          const pendingCount = ctx.brainProxy.getPendingEditCount();
           console.log(`[MCP] 📥 Queued! (${pendingCount} pending edits)`);
           log('debug', `Queued ${filePath} for re-ingestion (${pendingCount} pending)`);
 
@@ -450,17 +450,17 @@ async function prepareToolsForMcp(
   }
 
   // Add web tools (search, fetch) - if Gemini API key available
-  // Try BrainManager first, then fallback to env
-  const webGeminiKey = ctx.brainManager?.getGeminiKey() || getEnv(['GEMINI_API_KEY']);
+  // Try brain proxy config first, then fallback to env
+  const webGeminiKey = ctx.brainProxy?.getGeminiKey() || getEnv(['GEMINI_API_KEY']);
   if (webGeminiKey) {
     const webToolsCtx: WebToolsContext = {
       geminiApiKey: webGeminiKey,
       // Wire up web page ingestion to brain
-      ingestWebPage: ctx.brainManager
+      ingestWebPage: ctx.brainProxy
         ? async (params) => {
             log('debug', `Ingesting web page: ${params.url}`);
             try {
-              const result = await ctx.brainManager!.ingestWebPage({
+              const result = await ctx.brainProxy!.ingestWebPage({
                 url: params.url,
                 title: params.title,
                 textContent: params.textContent,
@@ -492,11 +492,11 @@ async function prepareToolsForMcp(
   const imageToolsCtx: ImageToolsContext = {
     projectRoot: projectRoot,
     // Auto-ingest generated/edited images
-    onContentExtracted: ctx.brainManager
+    onContentExtracted: ctx.brainProxy
       ? async (params) => {
           log('debug', `Image content extracted: ${params.filePath}`);
           try {
-            await ctx.brainManager!.updateMediaContent({
+            await ctx.brainProxy!.updateMediaContent({
               filePath: params.filePath,
               textContent: params.textContent,
               description: params.description,
@@ -525,11 +525,11 @@ async function prepareToolsForMcp(
   const threeDToolsCtx: ThreeDToolsContext = {
     projectRoot: projectRoot,
     // Auto-ingest generated 3D models
-    onContentExtracted: ctx.brainManager
+    onContentExtracted: ctx.brainProxy
       ? async (params) => {
           log('debug', `3D content extracted: ${params.filePath}`);
           try {
-            await ctx.brainManager!.updateMediaContent({
+            await ctx.brainProxy!.updateMediaContent({
               filePath: params.filePath,
               textContent: params.textContent,
               description: params.description,
@@ -557,20 +557,19 @@ async function prepareToolsForMcp(
 
   // Create onBeforeToolCall callback for auto-init and auto-watch
   const onBeforeToolCall = async (toolName: string, args: any) => {
-    // 1. Auto-init brainManager if not initialized
-    if (!ctx.brainManager) {
+    // 1. Auto-init brain proxy if not initialized
+    if (!ctx.brainProxy) {
       try {
-        log('debug', 'Auto-initializing brainManager...');
-        ctx.brainManager = await BrainManager.getInstance();
-        await ctx.brainManager.initialize();
-        log('info', 'BrainManager auto-initialized');
+        log('debug', 'Auto-initializing brain proxy...');
+        ctx.brainProxy = await getDaemonBrainProxy();
+        log('info', 'Brain proxy auto-initialized');
       } catch (e: any) {
-        log('debug', `BrainManager auto-init failed: ${e.message}`);
+        log('debug', `Brain proxy auto-init failed: ${e.message}`);
       }
     }
 
     // 2. Auto-start watcher for file paths in known projects
-    if (ctx.brainManager && args) {
+    if (ctx.brainProxy && args) {
       const pathModule = await import('path');
       // Extract file path from common arg names
       const filePath = args.path || args.file_path || args.image_path || args.model_path;
@@ -580,24 +579,20 @@ async function prepareToolsForMcp(
           : pathModule.resolve(process.cwd(), filePath);
 
         // Find project for this path
-        const projects = ctx.brainManager.listProjects();
+        const projects = ctx.brainProxy.listProjects();
         const project = projects.find(p =>
           absolutePath.startsWith(p.path + pathModule.sep) || absolutePath.startsWith(p.path)
         );
 
         if (project) {
-          // Check if watcher is running using getWatcher
-          const existingWatcher = ctx.brainManager.getWatcher(project.path);
-          const isWatching = existingWatcher?.isWatching?.();
+          // Check if watcher is running via proxy
+          const isWatching = ctx.brainProxy.isWatching(project.path);
 
           if (!isWatching) {
             try {
               log('debug', `Auto-starting watcher for project ${project.id}`);
-              // Use quickIngest with watch: true to start watcher
-              await ctx.brainManager.quickIngest(project.path, {
-                projectName: project.id,
-                watch: true,
-              });
+              // Start watcher via daemon
+              await ctx.brainProxy.startWatching(project.path);
               log('info', `Watcher auto-started for ${project.id}`);
             } catch (e: any) {
               log('debug', `Watcher auto-start failed: ${e.message}`);

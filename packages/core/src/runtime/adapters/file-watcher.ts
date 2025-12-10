@@ -86,10 +86,23 @@ export class FileWatcher {
     }
 
     // Create chokidar watcher
+    console.log(`[FileWatcher] Creating chokidar watcher with ${patterns.length} patterns:`);
+    patterns.forEach((p, i) => console.log(`[FileWatcher]   Pattern ${i + 1}: ${p}`));
+    console.log(`[FileWatcher] Exclude patterns: ${exclude.length > 0 ? exclude.join(', ') : 'none'}`);
+    const watcherStartTime = Date.now();
+    
+    // OPTIMIZATION: Chokidar watcher is functional immediately after creation.
+    // The 'ready' event only indicates that the initial scan is complete,
+    // but the watcher can already detect file changes before that.
+    // We consider the watcher ready immediately and listen to 'ready' event
+    // in the background for logging purposes only.
+
+    // Create watcher
     this.watcher = chokidar.watch(patterns, {
       ignored: exclude,
       persistent: true,
       ignoreInitial: true, // Don't trigger on startup
+      usePolling: false, // Explicitly disable polling (faster, uses native events)
       awaitWriteFinish: {
         stabilityThreshold: 300, // Wait 300ms for file writes to finish
         pollInterval: 100
@@ -97,35 +110,56 @@ export class FileWatcher {
       ...this.config.watchOptions
     });
 
-    // Set up event handlers
-    this.watcher
-      .on('add', (path) => this.handleFileEvent(path, 'add'))
-      .on('change', (path) => this.handleFileEvent(path, 'change'))
-      .on('unlink', (path) => this.handleFileEvent(path, 'unlink'))
-      .on('error', (error) => {
-        console.error('❌ Watcher error:', error);
-      });
+    console.log(`[FileWatcher] Chokidar watcher created, attaching event listeners...`);
 
-    // Wait for watcher to be ready
-    await new Promise<void>((resolve) => {
-      this.watcher!.on('ready', () => {
-        const watched = this.watcher!.getWatched();
-        const paths = Object.keys(watched);
-        const fileCount = Object.values(watched).reduce((sum, files) => sum + files.length, 0);
+    // Listen to 'ready' event in background for logging (non-blocking)
+    let readyEventReceived = false;
+    this.watcher.on('ready', () => {
+      if (readyEventReceived) {
+        console.warn(`[FileWatcher] 'ready' event received multiple times, ignoring duplicate`);
+        return;
+      }
+      readyEventReceived = true;
+      
+      const readyDuration = Date.now() - watcherStartTime;
+      const watched = this.watcher!.getWatched();
+      const paths = Object.keys(watched);
+      const fileCount = Object.values(watched).reduce((sum, files) => sum + files.length, 0);
 
-        if (this.config.verbose) {
-          console.log('✅ File watcher ready\n');
-        }
+      console.log(`[FileWatcher] Initial scan complete after ${readyDuration}ms (${fileCount} files watched)`);
 
-        // Log to AgentLogger
-        this.logger?.logWatcherStarted(patterns, fileCount);
+      // Log to AgentLogger
+      this.logger?.logWatcherStarted(patterns, fileCount);
 
-        if (this.config.onWatchStart) {
-          this.config.onWatchStart(paths);
-        }
-        resolve();
-      });
+      if (this.config.onWatchStart) {
+        this.config.onWatchStart(paths);
+      }
     });
+
+    // Set up other event handlers
+    this.watcher
+      .on('add', (path) => {
+        // Log is now in handleFileEvent (always logged, not just verbose)
+        this.handleFileEvent(path, 'add');
+      })
+      .on('change', (path) => {
+        // Log is now in handleFileEvent (always logged, not just verbose)
+        this.handleFileEvent(path, 'change');
+      })
+      .on('unlink', (path) => {
+        // Log is now in handleFileEvent (always logged, not just verbose)
+        this.handleFileEvent(path, 'unlink');
+      })
+      .on('error', (error) => {
+        console.error(`[FileWatcher] ❌ Watcher error:`, error);
+      })
+      .on('raw', (event, path, details) => {
+        console.log(`[FileWatcher] Raw event: ${event} ${path}`);
+      });
+
+    // Watcher is ready immediately - no need to wait for 'ready' event
+    // The watcher can detect file changes right away
+    console.log(`[FileWatcher] Watcher ready immediately (functional, initial scan may continue in background)`);
   }
 
   /**
@@ -230,10 +264,9 @@ export class FileWatcher {
       return;
     }
 
-    if (this.config.verbose) {
-      const emoji = eventType === 'add' ? '➕' : eventType === 'change' ? '✏️' : '➖';
-      console.log(`${emoji} ${eventType.toUpperCase()}: ${filePath}`);
-    }
+    // Always log file changes (not just in verbose mode) for observability
+    const emoji = eventType === 'add' ? '➕' : eventType === 'change' ? '✏️' : '➖';
+    console.log(`[FileWatcher] ${emoji} ${eventType.toUpperCase()}: ${filePath}`);
 
     // Log to AgentLogger
     this.logger?.logFileChange(filePath, eventType);

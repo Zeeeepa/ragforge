@@ -8,6 +8,9 @@
  * - Project registry (loaded projects)
  * - Quick ingest (ad-hoc directories)
  * - Cross-project search
+ * - End-to-end embedding generation with global scopes support
+ * - Separated ingestion and embedding locks for better performance
+ * - Automatic vector index creation for fast semantic search (20-25x faster)
  *
  * Default location: ~/.ragforge/
  */
@@ -27,12 +30,12 @@ import type { RagForgeConfig } from '../types/config.js';
 import { UniversalSourceAdapter } from '../runtime/adapters/universal-source-adapter.js';
 import type { ParseResult } from '../runtime/adapters/types.js';
 import { formatLocalDate } from '../runtime/utils/timestamp.js';
-import { EmbeddingService } from './embedding-service.js';
+import { EmbeddingService, MULTI_EMBED_CONFIGS } from './embedding-service.js';
 import { CONTENT_NODE_LABELS } from '../utils/node-schema.js';
 import { computeSchemaHash } from '../utils/schema-version.js';
 import { FileWatcher, type FileWatcherConfig } from '../runtime/adapters/file-watcher.js';
 import { IncrementalIngestionManager } from '../runtime/adapters/incremental-ingestion.js';
-import { IngestionLock, getGlobalIngestionLock } from '../tools/ingestion-lock.js';
+import { IngestionLock, getGlobalIngestionLock, getGlobalEmbeddingLock } from '../tools/ingestion-lock.js';
 import neo4j from 'neo4j-driver';
 import { matchesGlob } from '../runtime/utils/pattern-matching.js';
 
@@ -207,20 +210,14 @@ export interface RegisteredProject {
   excluded?: boolean;
 }
 
-export interface ProjectsRegistry {
-  version: number;
-  projects: RegisteredProject[];
-}
-
 export interface QuickIngestOptions {
-  /** Watch for changes after initial ingest */
-  watch?: boolean;
   /** Custom project name (used as display name) */
   projectName?: string;
   /** File patterns to include */
   include?: string[];
   /** File patterns to exclude */
   exclude?: string[];
+  // Note: watch et embeddings sont toujours activés automatiquement
 }
 
 export interface QuickIngestResult {
@@ -259,6 +256,8 @@ export interface BrainSearchOptions {
   limit?: number;
   /** Result offset */
   offset?: number;
+  /** Minimum similarity score threshold (0.0 to 1.0). Results below this score will be filtered out. Default: 0.3 for semantic search, no filter for text search. */
+  minScore?: number;
 }
 
 export interface BrainSearchResult {
@@ -332,6 +331,7 @@ export class BrainManager {
   private ingestionManager: IncrementalIngestionManager | null = null;
   private embeddingService: EmbeddingService | null = null;
   private ingestionLock: IngestionLock;
+  private embeddingLock: IngestionLock;
   private activeWatchers: Map<string, FileWatcher> = new Map();
 
   private constructor(config: BrainConfig) {
@@ -344,6 +344,7 @@ export class BrainManager {
     });
     this.sourceAdapter = new UniversalSourceAdapter();
     this.ingestionLock = getGlobalIngestionLock();
+    this.embeddingLock = getGlobalEmbeddingLock();
   }
 
   /**
@@ -402,17 +403,17 @@ export class BrainManager {
     // 5. Wait for Neo4j to be ready
     await this.waitForNeo4j();
 
-    // 6. Load projects registry
-    await this.loadProjectsRegistry();
-
-    // 7. Connect to Neo4j
+    // 6. Connect to Neo4j
     await this.connectNeo4j();
 
-    // 8. Ensure indexes exist for fast lookups
+    // 7. Ensure indexes exist for fast lookups
     await this.ensureIndexes();
 
-    // 9. Check for schema updates and mark outdated nodes
+    // 8. Check for schema updates and mark outdated nodes
     await this.checkSchemaUpdates();
+
+    // 9. Load projects from Neo4j into cache (for sync listProjects())
+    await this.refreshProjectsCache();
 
     this.initialized = true;
     console.log('[Brain] Initialized successfully');
@@ -460,6 +461,117 @@ export class BrainManager {
     }
 
     console.log('[Brain] Indexes ensured');
+
+    // Ensure vector indexes for semantic search (if embeddings are enabled)
+    if (this.embeddingService?.canGenerateEmbeddings()) {
+      await this.ensureVectorIndexes();
+    }
+  }
+
+  /**
+   * Ensure vector indexes exist for fast semantic search
+   * Creates indexes based on MULTI_EMBED_CONFIGS (only for labels/types that actually have embeddings)
+   */
+  private async ensureVectorIndexes(): Promise<void> {
+    if (!this.neo4jClient || !this.embeddingService) return;
+
+    console.log('[Brain] Ensuring vector indexes...');
+
+    // Dimension for Gemini embeddings
+    const dimension = 3072;
+
+    let createdCount = 0;
+    let skippedCount = 0;
+    let errorCount = 0;
+
+    // Create indexes based on actual embedding configurations
+    for (const config of MULTI_EMBED_CONFIGS) {
+      const label = config.label;
+
+      for (const embeddingConfig of config.embeddings) {
+        const embeddingProp = embeddingConfig.propertyName;
+        // Index name format: {label}_{embeddingProp}_vector
+        // e.g., scope_embedding_name_vector, file_embedding_content_vector
+        const indexName = `${label.toLowerCase()}_${embeddingProp}_vector`;
+
+        try {
+          // Check if index already exists
+          const checkResult = await this.neo4jClient.run(
+            `SHOW INDEXES YIELD name WHERE name = $indexName RETURN count(name) as count`,
+            { indexName }
+          );
+
+          const exists = checkResult.records[0]?.get('count')?.toNumber() > 0;
+
+          if (!exists) {
+            // Create vector index
+            const createQuery = `
+              CREATE VECTOR INDEX ${indexName} IF NOT EXISTS
+              FOR (n:\`${label}\`)
+              ON n.\`${embeddingProp}\`
+              OPTIONS {
+                indexConfig: {
+                  \`vector.dimensions\`: ${dimension},
+                  \`vector.similarity_function\`: 'cosine'
+                }
+              }
+            `;
+
+            await this.neo4jClient.run(createQuery);
+            createdCount++;
+            console.log(`[Brain] Created vector index: ${indexName}`);
+          } else {
+            skippedCount++;
+          }
+        } catch (err: any) {
+          errorCount++;
+          // Ignore errors (index might already exist or Neo4j version doesn't support vector indexes)
+          if (!err.message?.includes('already exists') && !err.message?.includes('does not exist')) {
+            console.warn(`[Brain] Vector index creation warning for ${indexName}: ${err.message}`);
+          }
+        }
+      }
+    }
+
+    // Also create index for legacy 'embedding' property on common labels
+    const legacyLabels = ['Scope', 'File', 'MarkdownSection', 'CodeBlock', 'MarkdownDocument'];
+    for (const label of legacyLabels) {
+      const indexName = `${label.toLowerCase()}_embedding_vector`;
+      try {
+        const checkResult = await this.neo4jClient.run(
+          `SHOW INDEXES YIELD name WHERE name = $indexName RETURN count(name) as count`,
+          { indexName }
+        );
+        const exists = checkResult.records[0]?.get('count')?.toNumber() > 0;
+        if (!exists) {
+          const createQuery = `
+            CREATE VECTOR INDEX ${indexName} IF NOT EXISTS
+            FOR (n:\`${label}\`)
+            ON n.\`embedding\`
+            OPTIONS {
+              indexConfig: {
+                \`vector.dimensions\`: ${dimension},
+                \`vector.similarity_function\`: 'cosine'
+              }
+            }
+          `;
+          await this.neo4jClient.run(createQuery);
+          createdCount++;
+          console.log(`[Brain] Created legacy vector index: ${indexName}`);
+        } else {
+          skippedCount++;
+        }
+      } catch (err: any) {
+        errorCount++;
+        if (!err.message?.includes('already exists') && !err.message?.includes('does not exist')) {
+          console.debug(`[Brain] Legacy vector index creation skipped for ${indexName}: ${err.message}`);
+        }
+      }
+    }
+
+    if (createdCount > 0 || skippedCount > 0) {
+      console.log(`[Brain] Vector indexes ensured (${createdCount} created, ${skippedCount} already existed${errorCount > 0 ? `, ${errorCount} errors` : ''})`);
+    }
   }
 
   /**
@@ -954,43 +1066,124 @@ volumes:
   }
 
   /**
-   * Load projects registry from file
+   * Update project metadata in Neo4j (type, excluded, lastAccessed, etc.)
+   * This updates the Project node directly in the database.
    */
-  private async loadProjectsRegistry(): Promise<void> {
-    const registryPath = path.join(this.config.path, 'projects.yaml');
-
-    try {
-      const content = await fs.readFile(registryPath, 'utf-8');
-      const registry = yaml.load(content) as ProjectsRegistry;
-
-      for (const project of registry.projects || []) {
-        this.registeredProjects.set(project.id, {
-          ...project,
-          lastAccessed: new Date(project.lastAccessed),
-        });
-      }
-    } catch {
-      // Registry doesn't exist, start fresh
+  private async updateProjectMetadataInDb(
+    projectId: string,
+    metadata: {
+      type?: ProjectType | 'web-crawl';
+      excluded?: boolean;
+      lastAccessed?: Date;
+      autoCleanup?: boolean;
+      displayName?: string;
     }
+  ): Promise<void> {
+    if (!this.neo4jClient) return;
+
+    const setClause: string[] = [];
+    const params: Record<string, any> = { projectId };
+
+    if (metadata.type !== undefined) {
+      setClause.push('p.type = $type');
+      params.type = metadata.type;
+    }
+    if (metadata.excluded !== undefined) {
+      setClause.push('p.excluded = $excluded');
+      params.excluded = metadata.excluded;
+    }
+    if (metadata.lastAccessed !== undefined) {
+      setClause.push('p.lastAccessed = $lastAccessed');
+      params.lastAccessed = metadata.lastAccessed.toISOString();
+    }
+    if (metadata.autoCleanup !== undefined) {
+      setClause.push('p.autoCleanup = $autoCleanup');
+      params.autoCleanup = metadata.autoCleanup;
+    }
+    if (metadata.displayName !== undefined) {
+      setClause.push('p.displayName = $displayName');
+      params.displayName = metadata.displayName;
+    }
+
+    if (setClause.length === 0) return;
+
+    await this.neo4jClient.run(
+      `MATCH (p:Project {projectId: $projectId}) SET ${setClause.join(', ')}`,
+      params
+    );
   }
 
   /**
-   * Save projects registry to file
+   * Get project metadata from Neo4j
    */
-  private async saveProjectsRegistry(): Promise<void> {
-    // Ensure directory exists (may have been deleted by cleanup)
-    await fs.mkdir(this.config.path, { recursive: true });
+  private async getProjectFromDb(projectId: string): Promise<RegisteredProject | null> {
+    if (!this.neo4jClient) return null;
 
-    const registryPath = path.join(this.config.path, 'projects.yaml');
-    const registry: ProjectsRegistry = {
-      version: 1,
-      projects: Array.from(this.registeredProjects.values()).map(p => ({
-        ...p,
-        lastAccessed: p.lastAccessed,
-      })),
+    const result = await this.neo4jClient.run(
+      `MATCH (p:Project {projectId: $projectId})
+       OPTIONAL MATCH (n {projectId: $projectId})
+       WITH p, count(n) as nodeCount
+       RETURN p.projectId as id, p.rootPath as path, p.type as type,
+              p.lastAccessed as lastAccessed, p.excluded as excluded,
+              p.autoCleanup as autoCleanup, p.name as displayName,
+              nodeCount`,
+      { projectId }
+    );
+
+    if (result.records.length === 0) return null;
+
+    const record = result.records[0];
+    return {
+      id: record.get('id'),
+      path: record.get('path'),
+      type: record.get('type') || 'quick-ingest',
+      lastAccessed: record.get('lastAccessed') ? new Date(record.get('lastAccessed')) : new Date(),
+      nodeCount: record.get('nodeCount')?.toNumber?.() || record.get('nodeCount') || 0,
+      excluded: record.get('excluded') || false,
+      autoCleanup: record.get('autoCleanup') ?? true,
+      displayName: record.get('displayName') || undefined,
     };
-    const content = yaml.dump(registry, { indent: 2 });
-    await fs.writeFile(registryPath, content, 'utf-8');
+  }
+
+  /**
+   * List all projects from Neo4j (the source of truth)
+   */
+  private async listProjectsFromDb(): Promise<RegisteredProject[]> {
+    if (!this.neo4jClient) return [];
+
+    const result = await this.neo4jClient.run(
+      `MATCH (p:Project)
+       OPTIONAL MATCH (n {projectId: p.projectId})
+       WITH p, count(n) as nodeCount
+       RETURN p.projectId as id, p.rootPath as path, p.type as type,
+              p.lastAccessed as lastAccessed, p.excluded as excluded,
+              p.autoCleanup as autoCleanup, p.name as displayName,
+              nodeCount
+       ORDER BY p.lastAccessed DESC`
+    );
+
+    return result.records.map(record => ({
+      id: record.get('id'),
+      path: record.get('path'),
+      type: record.get('type') || 'quick-ingest',
+      lastAccessed: record.get('lastAccessed') ? new Date(record.get('lastAccessed')) : new Date(),
+      nodeCount: record.get('nodeCount')?.toNumber?.() || record.get('nodeCount') || 0,
+      excluded: record.get('excluded') || false,
+      autoCleanup: record.get('autoCleanup') ?? true,
+      displayName: record.get('displayName') || undefined,
+    }));
+  }
+
+  /**
+   * Refresh the in-memory projects cache from Neo4j
+   * This is called on init and after project changes
+   */
+  private async refreshProjectsCache(): Promise<void> {
+    const projects = await this.listProjectsFromDb();
+    this.registeredProjects.clear();
+    for (const project of projects) {
+      this.registeredProjects.set(project.id, project);
+    }
   }
 
   /**
@@ -1026,6 +1219,7 @@ volumes:
 
   /**
    * Register a project in the brain
+   * Updates the Project node in Neo4j with metadata (type, excluded, lastAccessed, etc.)
    * @param projectPath - Absolute or relative path to the project
    * @param type - Project type
    * @param displayName - Optional display name for UI purposes
@@ -1034,16 +1228,21 @@ volumes:
     const absolutePath = path.resolve(projectPath);
     // Always generate ID from path - this is the source of truth
     const projectId = ProjectRegistry.generateId(absolutePath);
+    const now = new Date();
 
-    // Check if already registered
-    if (this.registeredProjects.has(projectId)) {
-      const existing = this.registeredProjects.get(projectId)!;
-      existing.lastAccessed = new Date();
-      // Update displayName if provided
+    // Check if already registered (in cache or DB)
+    const existingInCache = this.registeredProjects.get(projectId);
+    if (existingInCache) {
+      // Update lastAccessed and displayName
+      existingInCache.lastAccessed = now;
       if (displayName) {
-        existing.displayName = displayName;
+        existingInCache.displayName = displayName;
       }
-      await this.saveProjectsRegistry();
+      // Update in DB
+      await this.updateProjectMetadataInDb(projectId, {
+        lastAccessed: now,
+        displayName: displayName || existingInCache.displayName,
+      });
       return projectId;
     }
 
@@ -1052,8 +1251,8 @@ volumes:
     for (const [existingId, existingProject] of this.registeredProjects) {
       if (absolutePath.startsWith(existingProject.path + path.sep)) {
         console.log(`[Brain] Path ${absolutePath} is inside existing project ${existingId}, reusing parent project`);
-        existingProject.lastAccessed = new Date();
-        await this.saveProjectsRegistry();
+        existingProject.lastAccessed = now;
+        await this.updateProjectMetadataInDb(existingId, { lastAccessed: now });
         return existingId;
       }
     }
@@ -1069,7 +1268,7 @@ volumes:
     if (childProjects.length > 0) {
       console.log(`[Brain] New project ${projectId} is parent of ${childProjects.length} existing project(s), cleaning up children...`);
       for (const childId of childProjects) {
-        // Delete nodes from Neo4j
+        // Delete nodes from Neo4j (including the Project node)
         const neo4j = this.getNeo4jClient();
         if (neo4j) {
           const result = await neo4j.run(
@@ -1079,28 +1278,35 @@ volumes:
           const deleted = result.records[0]?.get('deleted')?.toNumber() || 0;
           console.log(`[Brain] Deleted ${deleted} nodes from child project ${childId}`);
         }
-        // Remove from registry
+        // Remove from cache
         this.registeredProjects.delete(childId);
       }
-      await this.saveProjectsRegistry();
     }
 
-    // Count nodes for this project
+    // Count nodes for this project (may be 0 if not yet ingested)
     const nodeCount = await this.countProjectNodes(projectId);
 
-    // Register
+    // Register in cache
     const registered: RegisteredProject = {
       id: projectId,
       path: absolutePath,
       type,
-      lastAccessed: new Date(),
+      lastAccessed: now,
       nodeCount,
       autoCleanup: type === 'quick-ingest',
       displayName,
     };
-
     this.registeredProjects.set(projectId, registered);
-    await this.saveProjectsRegistry();
+
+    // The Project node will be created by the ingestion process.
+    // We just need to update its metadata after ingestion completes.
+    // For now, we'll update it if it already exists (re-ingestion case)
+    await this.updateProjectMetadataInDb(projectId, {
+      type,
+      lastAccessed: now,
+      autoCleanup: type === 'quick-ingest',
+      displayName,
+    });
 
     return projectId;
   }
@@ -1143,21 +1349,19 @@ volumes:
 
   /**
    * Clear all projects from registry (used by cleanup)
+   * Note: This only clears the cache. The Project nodes remain in Neo4j.
+   * Use forgetPath() to delete nodes from Neo4j.
    */
   async clearProjectsRegistry(): Promise<void> {
     this.registeredProjects.clear();
-    await this.saveProjectsRegistry();
   }
 
   /**
-   * Unregister a specific project from the registry
+   * Unregister a specific project from the registry (cache only)
+   * Note: The Project node remains in Neo4j. Use forgetPath() to delete nodes.
    */
   async unregisterProject(projectId: string): Promise<boolean> {
-    const deleted = this.registeredProjects.delete(projectId);
-    if (deleted) {
-      await this.saveProjectsRegistry();
-    }
-    return deleted;
+    return this.registeredProjects.delete(projectId);
   }
 
   /**
@@ -1180,7 +1384,7 @@ volumes:
     if (!project) return false;
 
     project.excluded = true;
-    await this.saveProjectsRegistry();
+    await this.updateProjectMetadataInDb(projectId, { excluded: true });
     return true;
   }
 
@@ -1193,7 +1397,7 @@ volumes:
     if (!project) return false;
 
     project.excluded = false;
-    await this.saveProjectsRegistry();
+    await this.updateProjectMetadataInDb(projectId, { excluded: false });
     return true;
   }
 
@@ -1206,7 +1410,7 @@ volumes:
     if (!project) return undefined;
 
     project.excluded = !project.excluded;
-    await this.saveProjectsRegistry();
+    await this.updateProjectMetadataInDb(projectId, { excluded: project.excluded });
     return project.excluded;
   }
 
@@ -1234,10 +1438,11 @@ volumes:
   /**
    * Quick ingest a directory into the brain
    *
-   * Uses IncrementalIngestionManager for:
-   * - Hash-based incremental detection (content changes)
-   * - Change tracking with diffs
-   * - Proper cleanup of orphaned nodes
+   * Delegates to startWatching() which handles:
+   * - Initial sync with lock
+   * - Hash-based incremental detection
+   * - Embedding generation
+   * - File watching for future changes
    */
   async quickIngest(dirPath: string, options: QuickIngestOptions = {}): Promise<QuickIngestResult> {
     const absolutePath = path.resolve(dirPath);
@@ -1261,10 +1466,16 @@ volumes:
     if (!projectId) {
       projectId = ProjectRegistry.generateId(absolutePath);
     }
-    // projectName is used as displayName only
+
     const displayName = options.projectName;
 
-    // Use provided patterns or sensible defaults
+    console.log(`[QuickIngest] Starting ingestion of ${absolutePath}`);
+    console.log(`[QuickIngest] Project ID: ${projectId}${displayName ? ` (${displayName})` : ''}`);
+
+    // Register project first (so it shows up in list even if ingestion fails)
+    await this.registerProject(absolutePath, 'quick-ingest', displayName);
+
+    // Use provided patterns or defaults
     const includePatterns = options.include || [
       '**/*.ts', '**/*.tsx', '**/*.js', '**/*.jsx',
       '**/*.py',
@@ -1282,97 +1493,38 @@ volumes:
       '**/coverage/**', '**/.next/**', '**/.nuxt/**',
     ];
 
-    console.log(`[QuickIngest] Starting ingestion of ${absolutePath}`);
-    console.log(`[QuickIngest] Project ID: ${projectId}${displayName ? ` (${displayName})` : ''}`);
-    console.log(`[QuickIngest] Patterns: ${includePatterns.length} include, ${excludePatterns.length} exclude`);
+    // Start watcher with initial sync (this does the actual ingestion)
+    // The watcher handles: lock, ingestion, embeddings, and watching
+    await this.startWatching(absolutePath, {
+      includePatterns,
+      excludePatterns,
+      verbose: true,
+      skipInitialSync: false, // Do the initial ingestion
+    });
 
-    // Acquire ingestion lock (no timeout for initial ingestions - can take minutes)
-    const release = await this.ingestionLock.acquire(`quickIngest:${projectId}`, 0);
+    // Get stats after ingestion
+    const nodeCount = await this.countProjectNodes(projectId);
 
-    try {
-      // Use IncrementalIngestionManager for unified ingestion with change tracking
-      const stats = await this.ingestionManager.ingestFromPaths(
-        {
-          type: 'files',
-          root: absolutePath,
-          include: includePatterns,
-          exclude: excludePatterns,
-          track_changes: true, // Enable change tracking by default
-        },
-        {
-          projectId,
-          incremental: true,
-          verbose: true,
-          trackChanges: true,
-        }
-      );
-
-      const nodesCreated = stats.created + stats.updated;
-      console.log(`[QuickIngest] Ingestion stats: +${stats.created} created, ~${stats.updated} updated, -${stats.deleted} deleted, =${stats.unchanged} unchanged`);
-
-      // Always generate embeddings if service is available
-      let embeddingsGenerated = 0;
-      if (this.embeddingService) {
-        if (!this.embeddingService.canGenerateEmbeddings()) {
-          console.warn('[QuickIngest] ⚠️ GEMINI_API_KEY not found, skipping embeddings');
-        } else {
-          try {
-            // Detect initial ingestion (all created, nothing updated/unchanged)
-            const isInitialIngestion = stats.created > 0 && stats.updated === 0 && stats.unchanged === 0;
-            if (isInitialIngestion) {
-              console.log(`[QuickIngest] Initial ingestion detected - skipping hash checks for embeddings`);
-            }
-            const embeddingResult = await this.embeddingService.generateMultiEmbeddings({
-              projectId,
-              incrementalOnly: !isInitialIngestion, // Skip hash checks for initial ingestion
-              verbose: true,
-            });
-            embeddingsGenerated = embeddingResult.totalEmbedded;
-          } catch (err: any) {
-            console.error(`[QuickIngest] ⚠️ Embedding generation failed: ${err.message}`);
-          }
-        }
-      }
-
-      // Register in brain with displayName if provided
-      await this.registerProject(absolutePath, 'quick-ingest', displayName);
-
-      // Update node count
-      const project = this.registeredProjects.get(projectId);
-      if (project) {
-        project.nodeCount = nodesCreated;
-        await this.saveProjectsRegistry();
-      }
-
-      // Start file watcher if requested
-      let watching = false;
-      if (options.watch) {
-        try {
-          // Skip initial sync since we just ingested
-          await this.startWatching(absolutePath, { verbose: false, skipInitialSync: true });
-          watching = true;
-          console.log(`[QuickIngest] File watcher started for ${projectId}`);
-        } catch (err: any) {
-          console.warn(`[QuickIngest] Could not start file watcher: ${err.message}`);
-        }
-      }
-
-      const elapsed = Date.now() - startTime;
-      console.log(`[QuickIngest] Completed in ${elapsed}ms`);
-
-      return {
-        projectId,
-        stats: {
-          filesProcessed: stats.created + stats.updated + stats.unchanged,
-          nodesCreated,
-          embeddingsGenerated,
-        },
-        configPath: absolutePath,
-        watching,
-      };
-    } finally {
-      release();
+    // Update node count in cache (no need to persist - it's computed from DB)
+    const project = this.registeredProjects.get(projectId);
+    if (project) {
+      project.nodeCount = nodeCount;
     }
+
+    // Watcher reste toujours actif (plus d'option pour le désactiver)
+    const elapsed = Date.now() - startTime;
+    console.log(`[QuickIngest] Completed in ${elapsed}ms`);
+
+    return {
+      projectId,
+      stats: {
+        filesProcessed: nodeCount,
+        nodesCreated: nodeCount,
+        embeddingsGenerated: 0, // Tracked by watcher
+      },
+      configPath: absolutePath,
+      watching: true, // Toujours actif
+    };
   }
 
   // ============================================
@@ -1428,12 +1580,13 @@ volumes:
       }
     );
 
-    // Update project node count
+    // Update project cache
     const project = this.registeredProjects.get(projectId);
     if (project) {
       project.nodeCount = await this.countProjectNodes(projectId);
       project.lastAccessed = new Date();
-      await this.saveProjectsRegistry();
+      // Update lastAccessed in DB
+      await this.updateProjectMetadataInDb(projectId, { lastAccessed: project.lastAccessed });
     }
 
     // Generate embeddings if requested
@@ -1492,7 +1645,13 @@ volumes:
         autoCleanup: true,
       };
       this.registeredProjects.set(projectId, registered);
-      await this.saveProjectsRegistry();
+      // Persist metadata to Neo4j (Project node will be created by ingestion)
+      await this.updateProjectMetadataInDb(projectId, {
+        type: 'web-crawl',
+        lastAccessed: new Date(),
+        autoCleanup: true,
+        displayName: projectName,
+      });
     }
 
     return projectId;
@@ -1819,19 +1978,31 @@ volumes:
 
     if (options.semantic && this.embeddingService?.canGenerateEmbeddings()) {
       // Semantic search using vector similarity
+      const minScore = options.minScore ?? 0.3; // Default threshold for semantic search
       results = await this.vectorSearch(query, {
         embeddingType,
         projectFilter,
         nodeTypeFilter,
         params,
         limit,
+        minScore,
       });
     } else {
-      // Text search (fallback)
-      // Search in: name, title, content, source, rawText (markdown), code (codeblocks), textContent (documents), url (web)
+      // Text search (exact match)
+      // Search in: name, title, content (array), source, rawText (array), code (codeblocks), textContent (documents), url (web)
+      // Note: content and rawText are arrays, so we use ANY() to search within array elements
       const cypher = `
         MATCH (n)
-        WHERE (n.name CONTAINS $query OR n.title CONTAINS $query OR n.content CONTAINS $query OR n.source CONTAINS $query OR n.rawText CONTAINS $query OR n.code CONTAINS $query OR n.textContent CONTAINS $query OR n.url CONTAINS $query) ${projectFilter} ${nodeTypeFilter}
+        WHERE (
+          n.name CONTAINS $query 
+          OR n.title CONTAINS $query 
+          OR (n.content IS NOT NULL AND ANY(text IN n.content WHERE text CONTAINS $query))
+          OR n.source CONTAINS $query 
+          OR (n.rawText IS NOT NULL AND ANY(text IN n.rawText WHERE text CONTAINS $query))
+          OR n.code CONTAINS $query 
+          OR n.textContent CONTAINS $query 
+          OR n.url CONTAINS $query
+        ) ${projectFilter} ${nodeTypeFilter}
         RETURN n, 1.0 as score
         ORDER BY n.name
         SKIP $offset
@@ -1865,6 +2036,11 @@ volumes:
       });
     }
 
+    // Apply minScore filter if specified (for text search or post-filtering)
+    if (options.minScore !== undefined) {
+      results = results.filter(r => r.score >= options.minScore!);
+    }
+
     // Get total count (approximate for text search)
     const countCypher = `
       MATCH (n)
@@ -1895,6 +2071,7 @@ volumes:
 
   /**
    * Vector similarity search using embeddings
+   * Uses Neo4j vector indexes for fast semantic search
    */
   private async vectorSearch(
     query: string,
@@ -1904,9 +2081,10 @@ volumes:
       nodeTypeFilter: string;
       params: Record<string, any>;
       limit: number;
+      minScore: number;
     }
   ): Promise<BrainSearchResult[]> {
-    const { embeddingType, projectFilter, nodeTypeFilter, params, limit } = options;
+    const { embeddingType, projectFilter, nodeTypeFilter, params, limit, minScore } = options;
 
     // Get query embedding
     const queryEmbedding = await this.embeddingService!.getQueryEmbedding(query);
@@ -1936,82 +2114,126 @@ volumes:
     const allResults: BrainSearchResult[] = [];
     const seenUuids = new Set<string>();
 
+    // Build map of label -> embedding properties
+    const labelEmbeddingMap = new Map<string, Set<string>>();
+    for (const config of MULTI_EMBED_CONFIGS) {
+      const label = config.label;
+      if (!labelEmbeddingMap.has(label)) {
+        labelEmbeddingMap.set(label, new Set());
+      }
+      for (const embeddingConfig of config.embeddings) {
+        labelEmbeddingMap.get(label)!.add(embeddingConfig.propertyName);
+      }
+    }
+
+    // Also add legacy 'embedding' property for common labels
+    const legacyLabels = ['Scope', 'File', 'MarkdownSection', 'CodeBlock', 'MarkdownDocument'];
+    for (const label of legacyLabels) {
+      if (!labelEmbeddingMap.has(label)) {
+        labelEmbeddingMap.set(label, new Set());
+      }
+      labelEmbeddingMap.get(label)!.add('embedding');
+    }
+
     for (const embeddingProp of embeddingProps) {
-      const cypher = `
-        MATCH (n)
-        WHERE n.${embeddingProp} IS NOT NULL ${projectFilter} ${nodeTypeFilter}
-        WITH n, gds.similarity.cosine(n.${embeddingProp}, $queryEmbedding) AS score
-        WHERE score > 0.3
-        RETURN n, score
-        ORDER BY score DESC
-        LIMIT $limit
-      `;
+      for (const [label, labelProps] of labelEmbeddingMap.entries()) {
+        // Only search if this label has this embedding property
+        if (!labelProps.has(embeddingProp)) continue;
 
-      try {
-        const result = await this.neo4jClient!.run(cypher, {
-          ...params,
-          queryEmbedding,
-        });
+        const indexName = `${label.toLowerCase()}_${embeddingProp}_vector`;
 
-        for (const record of result.records) {
-          const rawNode = record.get('n').properties;
-          const uuid = rawNode.uuid;
+        try {
+          // Try using vector index first (fast)
+          // Request more results to account for filters (projectFilter, nodeTypeFilter)
+          const requestTopK = Math.min(limit * 3, 100);
+          
+          const cypher = `
+            CALL db.index.vector.queryNodes($indexName, $requestTopK, $queryEmbedding)
+            YIELD node, score
+            WHERE score >= $minScore ${projectFilter} ${nodeTypeFilter}
+            RETURN node, score
+            ORDER BY score DESC
+            LIMIT $limit
+          `;
 
-          // Skip duplicates
-          if (seenUuids.has(uuid)) continue;
-          seenUuids.add(uuid);
-
-          const score = record.get('score');
-          const projectId = rawNode.projectId || 'unknown';
-          const project = this.registeredProjects.get(projectId);
-
-          allResults.push({
-            node: this.stripEmbeddingFields(rawNode),
-            score,
-            projectId,
-            projectPath: project?.path || 'unknown',
-            projectType: project?.type || 'unknown',
+          const result = await this.neo4jClient!.run(cypher, {
+            indexName,
+            requestTopK: neo4j.int(requestTopK),
+            queryEmbedding,
+            minScore,
+            ...params,
+            limit: neo4j.int(limit),
           });
-        }
-      } catch (err) {
-        // GDS might not be installed, try without it
-        console.warn(`[BrainManager] Vector search failed for ${embeddingProp}, trying fallback...`);
 
-        // Fallback: manual cosine similarity (less efficient but works without GDS)
-        const fallbackCypher = `
-          MATCH (n)
-          WHERE n.${embeddingProp} IS NOT NULL ${projectFilter} ${nodeTypeFilter}
-          RETURN n
-          LIMIT 500
-        `;
+          for (const record of result.records) {
+            const rawNode = record.get('node').properties;
+            const uuid = rawNode.uuid;
 
-        const fallbackResult = await this.neo4jClient!.run(fallbackCypher, params);
+            // Skip duplicates
+            if (seenUuids.has(uuid)) continue;
+            seenUuids.add(uuid);
 
-        for (const record of fallbackResult.records) {
-          const rawNode = record.get('n').properties;
-          const uuid = rawNode.uuid;
+            const score = record.get('score');
+            const projectId = rawNode.projectId || 'unknown';
+            const project = this.registeredProjects.get(projectId);
 
-          if (seenUuids.has(uuid)) continue;
+            allResults.push({
+              node: this.stripEmbeddingFields(rawNode),
+              score,
+              projectId,
+              projectPath: project?.path || 'unknown',
+              projectType: project?.type || 'unknown',
+            });
+          }
+        } catch (err: any) {
+          // Vector index might not exist yet, fall back to manual search
+          // This happens on first run before indexes are created
+          if (err.message?.includes('does not exist') || err.message?.includes('no such vector')) {
+            // Fallback: use MATCH with manual similarity (slower but works)
+            try {
+              const fallbackCypher = `
+                MATCH (n:\`${label}\`)
+                WHERE n.\`${embeddingProp}\` IS NOT NULL ${projectFilter} ${nodeTypeFilter}
+                RETURN n
+                LIMIT 500
+              `;
 
-          const nodeEmbedding = rawNode[embeddingProp];
-          if (!nodeEmbedding || !Array.isArray(nodeEmbedding)) continue;
+              const fallbackResult = await this.neo4jClient!.run(fallbackCypher, params);
 
-          // Compute cosine similarity manually
-          const score = this.cosineSimilarity(queryEmbedding, nodeEmbedding);
-          if (score < 0.3) continue;
+              for (const record of fallbackResult.records) {
+                const rawNode = record.get('n').properties;
+                const uuid = rawNode.uuid;
 
-          seenUuids.add(uuid);
+                if (seenUuids.has(uuid)) continue;
 
-          const projectId = rawNode.projectId || 'unknown';
-          const project = this.registeredProjects.get(projectId);
+                const nodeEmbedding = rawNode[embeddingProp];
+                if (!nodeEmbedding || !Array.isArray(nodeEmbedding)) continue;
 
-          allResults.push({
-            node: this.stripEmbeddingFields(rawNode),
-            score,
-            projectId,
-            projectPath: project?.path || 'unknown',
-            projectType: project?.type || 'unknown',
-          });
+                // Compute cosine similarity manually
+                const score = this.cosineSimilarity(queryEmbedding, nodeEmbedding);
+                if (score < minScore) continue;
+
+                seenUuids.add(uuid);
+
+                const projectId = rawNode.projectId || 'unknown';
+                const project = this.registeredProjects.get(projectId);
+
+                allResults.push({
+                  node: this.stripEmbeddingFields(rawNode),
+                  score,
+                  projectId,
+                  projectPath: project?.path || 'unknown',
+                  projectType: project?.type || 'unknown',
+                });
+              }
+            } catch (fallbackErr: any) {
+              // Ignore fallback errors - continue with next label/property
+              console.debug(`[BrainManager] Fallback search failed for ${label}.${embeddingProp}: ${fallbackErr.message}`);
+            }
+          } else {
+            // Other errors (e.g., Neo4j version doesn't support vector indexes)
+            console.debug(`[BrainManager] Vector search failed for ${indexName}: ${err.message}`);
+          }
         }
       }
     }
@@ -2073,9 +2295,8 @@ volumes:
       );
     }
 
-    // Remove from registry
+    // Remove from cache (Project node was deleted with other nodes above)
     this.registeredProjects.delete(project.id);
-    await this.saveProjectsRegistry();
 
     // Remove .ragforge/brain-link.yaml if exists
     try {
@@ -2084,6 +2305,115 @@ volumes:
     } catch {
       // Ignore if doesn't exist
     }
+  }
+
+  /**
+   * Remove only embeddings for a project (keep nodes)
+   * Also removes all hash properties to mark nodes as "dirty" for regeneration
+   * Returns statistics about what was removed
+   */
+  async removeProjectEmbeddings(projectId: string): Promise<{
+    scopeEmbeddings: number;
+    fileEmbeddings: number;
+    markdownSectionEmbeddings: number;
+    codeBlockEmbeddings: number;
+    otherEmbeddings: number;
+  }> {
+    if (!this.neo4jClient) {
+      throw new Error('Neo4j client not initialized');
+    }
+
+    const stats = {
+      scopeEmbeddings: 0,
+      fileEmbeddings: 0,
+      markdownSectionEmbeddings: 0,
+      codeBlockEmbeddings: 0,
+      otherEmbeddings: 0,
+    };
+
+    // Remove embeddings AND hashes from Scope nodes (mark as dirty)
+    // Remove from ALL Scope nodes, not just those with embeddings, to ensure complete cleanup
+    const scopeResult = await this.neo4jClient.run(
+      `MATCH (s:Scope {projectId: $projectId})
+       WHERE s.embedding_name IS NOT NULL 
+          OR s.embedding_content IS NOT NULL 
+          OR s.embedding_description IS NOT NULL
+          OR s.embedding_name_hash IS NOT NULL
+          OR s.embedding_content_hash IS NOT NULL
+          OR s.embedding_description_hash IS NOT NULL
+       SET s.embedding_name = null,
+           s.embedding_content = null,
+           s.embedding_description = null,
+           s.embedding_name_hash = null,
+           s.embedding_content_hash = null,
+           s.embedding_description_hash = null
+       RETURN count(s) as count`,
+      { projectId }
+    );
+    stats.scopeEmbeddings = scopeResult.records[0]?.get('count')?.toNumber() || 0;
+
+    // Remove embeddings AND hashes from File nodes (mark as dirty)
+    const fileResult = await this.neo4jClient.run(
+      `MATCH (f:File {projectId: $projectId})
+       WHERE f.embedding_name IS NOT NULL 
+          OR f.embedding_content IS NOT NULL
+          OR f.embedding_name_hash IS NOT NULL
+          OR f.embedding_content_hash IS NOT NULL
+       SET f.embedding_name = null,
+           f.embedding_content = null,
+           f.embedding_name_hash = null,
+           f.embedding_content_hash = null
+       RETURN count(f) as count`,
+      { projectId }
+    );
+    stats.fileEmbeddings = fileResult.records[0]?.get('count')?.toNumber() || 0;
+
+    // Remove embeddings AND hashes from MarkdownSection nodes (mark as dirty)
+    const markdownSectionResult = await this.neo4jClient.run(
+      `MATCH (s:MarkdownSection {projectId: $projectId})
+       WHERE s.embedding_content IS NOT NULL
+          OR s.embedding_content_hash IS NOT NULL
+       SET s.embedding_content = null,
+           s.embedding_content_hash = null
+       RETURN count(s) as count`,
+      { projectId }
+    );
+    stats.markdownSectionEmbeddings = markdownSectionResult.records[0]?.get('count')?.toNumber() || 0;
+
+    // Remove embeddings AND hashes from CodeBlock nodes (mark as dirty)
+    const codeBlockResult = await this.neo4jClient.run(
+      `MATCH (c:CodeBlock {projectId: $projectId})
+       WHERE c.embedding_content IS NOT NULL
+          OR c.embedding_content_hash IS NOT NULL
+       SET c.embedding_content = null,
+           c.embedding_content_hash = null
+       RETURN count(c) as count`,
+      { projectId }
+    );
+    stats.codeBlockEmbeddings = codeBlockResult.records[0]?.get('count')?.toNumber() || 0;
+
+    // Remove embeddings AND hashes from other node types (MarkdownDocument, DataFile, WebPage, MediaFile, ThreeDFile, DocumentFile)
+    const otherResult = await this.neo4jClient.run(
+      `MATCH (n {projectId: $projectId})
+       WHERE (n:MarkdownDocument OR n:DataFile OR n:WebPage OR n:MediaFile OR n:ThreeDFile OR n:DocumentFile)
+         AND (n.embedding_name IS NOT NULL 
+           OR n.embedding_content IS NOT NULL
+           OR n.embedding_description IS NOT NULL
+           OR n.embedding_name_hash IS NOT NULL
+           OR n.embedding_content_hash IS NOT NULL
+           OR n.embedding_description_hash IS NOT NULL)
+       SET n.embedding_name = null,
+           n.embedding_content = null,
+           n.embedding_description = null,
+           n.embedding_name_hash = null,
+           n.embedding_content_hash = null,
+           n.embedding_description_hash = null
+       RETURN count(n) as count`,
+      { projectId }
+    );
+    stats.otherEmbeddings = otherResult.records[0]?.get('count')?.toNumber() || 0;
+
+    return stats;
   }
 
   /**
@@ -2178,6 +2508,96 @@ volumes:
     return this.ingestionLock;
   }
 
+  getEmbeddingLock(): IngestionLock {
+    return this.embeddingLock;
+  }
+
+  // ============================================
+  // Cypher Queries
+  // ============================================
+
+  /**
+   * Run a Cypher query on the Neo4j database
+   *
+   * Waits for any pending ingestion to complete before executing.
+   * Use with caution - this can modify or delete data.
+   */
+  async runCypher(
+    query: string,
+    params: Record<string, unknown> = {}
+  ): Promise<{
+    success: boolean;
+    records?: Array<Record<string, unknown>>;
+    summary?: { counters: Record<string, number> };
+    error?: string;
+  }> {
+    if (!this.neo4jClient) {
+      return {
+        success: false,
+        error: 'Neo4j not connected. Initialize the brain first.',
+      };
+    }
+
+    // Wait for ingestion lock
+    // Only wait for ingestion lock (not embedding lock) for non-semantic queries
+    // This allows Cypher queries to run during embedding generation
+    if (this.ingestionLock.isLocked()) {
+      console.log('[Brain.runCypher] Waiting for ingestion lock...');
+      await this.ingestionLock.waitForUnlock(300000); // 5 minutes
+    }
+
+    // Wait for pending edits
+    if (this.hasPendingEdits()) {
+      console.log('[Brain.runCypher] Waiting for pending edits...');
+      await this.waitForPendingEdits(300000);
+    }
+
+    try {
+      const result = await this.neo4jClient.run(query, params);
+
+      // Convert records to plain objects
+      const records = result.records.map(record => {
+        const obj: Record<string, unknown> = {};
+        for (const key of record.keys) {
+          if (typeof key !== 'string') continue;
+          const value = record.get(key);
+          // Handle Neo4j Integer type
+          if (value && typeof value === 'object' && 'toNumber' in value) {
+            obj[key] = (value as { toNumber: () => number }).toNumber();
+          } else if (value && typeof value === 'object' && 'properties' in value) {
+            // Neo4j Node - extract properties
+            obj[key] = (value as { properties: unknown }).properties;
+          } else {
+            obj[key] = value;
+          }
+        }
+        return obj;
+      });
+
+      // Extract counters from summary
+      const counters: Record<string, number> = {};
+      const stats = result.summary?.counters?.updates();
+      if (stats) {
+        for (const [key, val] of Object.entries(stats)) {
+          if (typeof val === 'number' && val > 0) {
+            counters[key] = val;
+          }
+        }
+      }
+
+      return {
+        success: true,
+        records,
+        summary: Object.keys(counters).length > 0 ? { counters } : undefined,
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        error: err.message || String(err),
+      };
+    }
+  }
+
   // ============================================
   // File Watching
   // ============================================
@@ -2250,6 +2670,7 @@ volumes:
       projectId, // Required for hash-based incremental detection
       verbose: options.verbose ?? false,
       ingestionLock: this.ingestionLock,
+      embeddingLock: this.embeddingLock, // Separate lock for embeddings
       batchInterval: 1000, // 1 second batching
 
       // Hook afterIngestion to regenerate embeddings
@@ -2275,11 +2696,29 @@ volumes:
     });
 
     // Initial sync: catch up with any changes since last ingestion
-    // Skip if we just ingested (e.g., called from quickIngest)
-    if (options.skipInitialSync) {
-      console.log(`[Brain] Skipping initial sync (just ingested)`);
+    // Skip if:
+    // - explicitly requested (skipInitialSync: true)
+    // - project already has nodes in database (already ingested before)
+    // NOTE: We check the DATABASE directly, not the YAML config (which can be stale)
+    const nodeCountInDb = await this.countProjectNodes(projectId);
+    const projectHasNodes = nodeCountInDb > 0;
+    const shouldSkipInitialSync = options.skipInitialSync || projectHasNodes;
+
+    if (shouldSkipInitialSync) {
+      if (projectHasNodes) {
+        console.log(`[Brain] Skipping initial sync (project already has ${nodeCountInDb} nodes in DB)`);
+      } else {
+        console.log(`[Brain] Skipping initial sync (explicitly requested)`);
+      }
     } else {
       console.log(`[Brain] Initial sync for project: ${projectId}...`);
+
+      // Acquire lock for initial sync (no timeout - can take minutes for large projects)
+      const opKey = this.ingestionLock.acquire('initial-ingest', absolutePath, {
+        description: `Initial sync: ${projectId}`,
+        timeoutMs: 0,
+      });
+
       try {
         const syncResult = await ingestionManager.ingestFromPaths(
           sourceConfig,
@@ -2309,14 +2748,27 @@ volumes:
       } catch (err: any) {
         console.warn(`[Brain] Initial sync failed: ${err.message}`);
         // Continue with watcher anyway
+      } finally {
+        this.ingestionLock.release(opKey);
       }
     }
 
     // Start watching for future changes
-    await watcher.start();
-    this.activeWatchers.set(projectId, watcher);
-
-    console.log(`[Brain] Started watching project: ${projectId}`);
+    console.log(`[Brain] Starting watcher for project: ${projectId}...`);
+    const watcherStartTime = Date.now();
+    try {
+      await watcher.start();
+      const watcherStartDuration = Date.now() - watcherStartTime;
+      console.log(`[Brain] Watcher started successfully (took ${watcherStartDuration}ms)`);
+      this.activeWatchers.set(projectId, watcher);
+      console.log(`[Brain] Started watching project: ${projectId}`);
+    } catch (err: any) {
+      console.error(`[Brain] Failed to start watcher: ${err.message}`);
+      // Don't add to activeWatchers if start failed
+      // Don't re-throw - allow the process to continue without this watcher
+      // The project can still be searched, just without auto-ingestion on file changes
+      console.warn(`[Brain] Project ${projectId} will not be watched for changes. Search will still work.`);
+    }
   }
 
   /**
@@ -2517,7 +2969,9 @@ volumes:
     let totalEmbeddingsGenerated = 0;
 
     // Acquire ingestion lock
-    const release = await this.ingestionLock.acquire(`agent-edit-batch:${changes.length}`);
+    const opKey = this.ingestionLock.acquire('mcp-edit', `agent-batch:${changes.length}`, {
+      description: `MCP edit batch: ${changes.length} files`,
+    });
 
     try {
       for (const [projectId, { projectRoot, changes: projectChanges }] of byProject) {
@@ -2550,7 +3004,7 @@ volumes:
         console.log(`[Brain] Generated ${totalEmbeddingsGenerated} embeddings`);
       }
     } finally {
-      release();
+      this.ingestionLock.release(opKey);
       this.isFlushingAgentQueue = false;
       this.notifyFlushComplete();
     }
@@ -3025,19 +3479,33 @@ Return ONLY the persona description, nothing else.`;
   }
 
   /**
-   * Create a persona with LLM-enhanced description
+   * Create a persona, optionally with LLM-enhanced description
+   *
+   * @param params.enhance - If true, use LLM to expand the description into a full persona prompt.
+   *                         If false (default), use the description directly as the persona.
+   *                         Note: The system prompt already instructs the agent to respond in the user's language,
+   *                         so LLM enhancement is usually not needed for language adaptation.
    */
   async createEnhancedPersona(params: {
     name: string;
     color: TerminalColor;
     language: string;
     description: string;
+    /** Use LLM to enhance the description (default: false) */
+    enhance?: boolean;
   }): Promise<PersonaDefinition> {
-    const { name, color, language, description } = params;
+    const { name, color, language, description, enhance = false } = params;
 
-    // Generate enhanced persona
-    console.log(`[Brain] Generating enhanced persona for "${name}"...`);
-    const enhancedPersona = await this.enhancePersonaDescription(name, language, description);
+    let persona: string;
+    if (enhance) {
+      // Generate enhanced persona via LLM
+      console.log(`[Brain] Generating LLM-enhanced persona for "${name}"...`);
+      persona = await this.enhancePersonaDescription(name, language, description);
+    } else {
+      // Use description directly as persona (simpler, recommended)
+      console.log(`[Brain] Creating persona "${name}"...`);
+      persona = `You are ${name}. ${description}`;
+    }
 
     // Add to brain
     return this.addPersona({
@@ -3045,7 +3513,7 @@ Return ONLY the persona description, nothing else.`;
       color,
       language,
       description,
-      persona: enhancedPersona,
+      persona,
     });
   }
 
@@ -3053,9 +3521,6 @@ Return ONLY the persona description, nothing else.`;
    * Dispose brain manager - cleanup resources
    */
   async dispose(): Promise<void> {
-    // Save registry
-    await this.saveProjectsRegistry();
-
     // Dispose project registry (stops watchers, closes connections)
     await this.projectRegistry.dispose();
 

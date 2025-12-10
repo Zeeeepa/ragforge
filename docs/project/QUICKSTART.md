@@ -77,6 +77,16 @@ npx tsx scripts/generate-embeddings.ts
 npx tsx scripts/test-agent.ts "What functions are in this project?"
 ```
 
+### 7. Test de recherche sémantique
+
+**Note importante**: Ce document contient une modification de test effectuée le 10 décembre 2025 pour vérifier la capacité de recherche sémantique à retrouver des changements spécifiques. La modification inclut la mention explicite de "pdfjs-dist" comme alternative à "pdf2json" pour l'extraction de texte PDF sans warnings.
+
+**Test automatique embeddings**: Cette section a été modifiée le 10 décembre 2025 à 09h30 pour tester la génération automatique d'embeddings via le watcher. Le système devrait détecter ce changement, ingérer le fichier, générer les embeddings et permettre la recherche sémantique de ce contenu.
+
+**Test final sans limite**: Modification finale à 09h35 pour valider que la suppression de la limite de 2000 nœuds permet bien de générer les embeddings pour toutes les sections, y compris les plus récentes.
+
+**Test après redémarrage daemon**: Nouvelle modification à 09h40 après redémarrage du daemon avec le code corrigé. Cette fois, toutes les sections MarkdownSection devraient être traitées sans limite, permettant la génération d'embeddings pour les sections récentes.
+
 ---
 
 ## Option B: Add RagForge to Existing Project

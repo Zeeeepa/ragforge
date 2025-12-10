@@ -30,7 +30,6 @@ import {
   runEmbeddingPipelines,
   GeminiEmbeddingProvider,
   ProjectRegistry,
-  BrainManager,
   type ProjectToolResult,
   type CreateProjectParams,
   type SetupProjectParams,
@@ -47,6 +46,8 @@ import { runQuickstart, type QuickstartOptions } from './quickstart.js';
 import { runEmbeddingsIndex, runEmbeddingsGenerate, parseEmbeddingsOptions } from './embeddings.js';
 import { ensureEnvLoaded, getEnv } from '../utils/env.js';
 import { toRuntimeEmbeddingsConfig } from '../utils/embedding-transform.js';
+import { generateDaemonBrainToolHandlers } from './daemon-client.js';
+import { getDaemonBrainProxy } from './daemon-brain-proxy.js';
 
 // ============================================
 // Types
@@ -128,9 +129,6 @@ export interface AgentProjectContext {
 
   /** Project registry for multi-project support */
   registry: ProjectRegistry;
-
-  /** Brain manager for knowledge base operations */
-  brainManager?: BrainManager;
 }
 
 // ============================================
@@ -799,25 +797,8 @@ export async function createRagForgeAgent(options: AgentOptions) {
     },
   });
 
-  // Initialize BrainManager for knowledge base operations
-  let brainManager: BrainManager | undefined;
-  try {
-    if (verbose) {
-      console.log('   🧠 Initializing BrainManager...');
-    }
-    brainManager = await BrainManager.getInstance();
-    await brainManager.initialize();
-    if (verbose) {
-      console.log('   🧠 BrainManager initialized');
-    }
-  } catch (error: any) {
-    if (verbose) {
-      console.log(`   ⚠️  BrainManager init failed: ${error.message}`);
-      console.log('   ⚠️  Brain tools will be disabled');
-    }
-  }
-
   // Create mutable context - this is shared by all tools
+  // Note: Brain operations go through daemon proxy, no local BrainManager needed
   const ctx: AgentProjectContext = {
     currentProjectPath: null,
     generatedPath: null,
@@ -828,7 +809,6 @@ export async function createRagForgeAgent(options: AgentOptions) {
     geminiKey,
     replicateToken,
     registry,
-    brainManager,
   };
 
   // Cache for the current project config (updated when project changes)
@@ -967,9 +947,23 @@ export async function createRagForgeAgent(options: AgentOptions) {
       onLoadProject: createLoadProjectHandler(ctx),
     },
 
-    // Brain tools for knowledge base operations (if BrainManager is available)
-    includeBrainTools: !!ctx.brainManager,
-    brainToolsContext: ctx.brainManager ? { brain: ctx.brainManager } : undefined,
+    // Brain tools for knowledge base operations (always via daemon)
+    includeBrainTools: true,
+    customBrainHandlers: generateDaemonBrainToolHandlers(),
+
+    // Provide getLocks function for enriched context (code semantic search)
+    getLocks: async () => {
+      try {
+        const brainProxy = await getDaemonBrainProxy();
+        return await brainProxy.getLocks();
+      } catch (error: any) {
+        // If daemon not available, return locks as unavailable (safer)
+        return {
+          embeddingLock: { isLocked: () => true },
+          ingestionLock: { isLocked: () => true }
+        };
+      }
+    },
 
     // Agent persona for conversational responses
     persona: options.persona,

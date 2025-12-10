@@ -2,7 +2,7 @@ import React, { useState, useCallback } from 'react';
 import { Box, Text } from 'ink';
 import { Header, Footer, MainContent } from './components/layout/index.js';
 import { UserMessage, AssistantMessage, ToolMessage, type AgentIdentity } from './components/messages/index.js';
-import { InputPrompt, ToolConfirmation, Spinner } from './components/shared/index.js';
+import { InputPrompt, ToolConfirmation, Spinner, StatusBar, TodoList } from './components/shared/index.js';
 import { useAgent, type AgentMessage as AgentMessageType } from './hooks/index.js';
 
 interface AppProps {
@@ -20,6 +20,9 @@ export const App: React.FC<AppProps> = ({ projectName, projectPath, model, verbo
     status,
     pendingConfirmation,
     error,
+    suggestionSource,
+    statusText,
+    todos,
     sendMessage,
     confirmTool,
   } = useAgent({
@@ -120,12 +123,16 @@ export const App: React.FC<AppProps> = ({ projectName, projectPath, model, verbo
         )}
       </MainContent>
 
+      <TodoList todos={todos} />
+      <StatusBar text={statusText} isThinking={status === 'thinking'} />
+
       <InputPrompt
         value={input}
         onChange={setInput}
         onSubmit={handleSubmit}
         disabled={inputDisabled}
         placeholder={inputPlaceholder}
+        suggestionSource={suggestionSource}
       />
 
       <Footer />
