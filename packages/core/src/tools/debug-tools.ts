@@ -34,15 +34,7 @@ export interface DebugToolsContext {
    */
   projectRoot?: string | (() => string | null);
 
-  /**
-   * Embedding lock for checking availability
-   */
-  embeddingLock?: { isLocked: () => boolean };
-
-  /**
-   * Ingestion lock for checking availability
-   */
-  ingestionLock?: { isLocked: () => boolean };
+  // Note: locks are no longer needed in context - buildEnrichedContext now fetches them from brainManager
 }
 
 /**
@@ -378,14 +370,13 @@ export function generateDebugContextHandler(ctx: DebugToolsContext) {
 
     try {
       // Build enriched context
+      // Note: buildEnrichedContext now fetches locks from brainManager internally and waits for them
       const enrichedContext = await storage.buildEnrichedContext(
         args.conversation_id,
         args.query,
         {
           cwd: resolveValue(ctx.cwd),
           projectRoot: resolveValue(ctx.projectRoot) || undefined,
-          embeddingLock: ctx.embeddingLock,
-          ingestionLock: ctx.ingestionLock,
         }
       );
 

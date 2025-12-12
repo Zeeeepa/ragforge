@@ -29,6 +29,8 @@ import {
   createClient,
   ConversationStorage,
   GeminiEmbeddingProvider,
+  StructuredLLMExecutor,
+  GeminiAPIProvider,
   type BrainToolsContext,
   type ImageToolsContext,
   type ThreeDToolsContext,
@@ -474,9 +476,26 @@ class BrainDaemon {
         this.logger.warn('GEMINI_API_KEY not set - conversation semantic search will be disabled');
       }
       
-      const conversationStorage = neo4jClient 
+      const conversationStorage = neo4jClient
         ? new ConversationStorage(neo4jClient, undefined, embeddingProvider)
         : undefined;
+
+      // Set BrainManager for semantic search (isProjectKnown, getProjectsInCwd, locks)
+      if (conversationStorage && this.brain) {
+        conversationStorage.setBrainManager(this.brain);
+      }
+
+      // Set LLMExecutor and LLMProvider for fuzzy search fallback (needed for debug_context and buildEnrichedContext)
+      if (conversationStorage && geminiApiKey) {
+        const llmExecutor = new StructuredLLMExecutor();
+        const llmProvider = new GeminiAPIProvider({
+          apiKey: geminiApiKey,
+          model: 'gemini-2.0-flash',
+          temperature: 0.1,
+        });
+        conversationStorage.setLLMExecutor(llmExecutor, llmProvider);
+        this.logger.debug('ConversationStorage configured with LLMExecutor for fuzzy search');
+      }
 
       const self = this; // Capture 'this' for use in closures
       const agentCtx: AgentToolsContext = {
@@ -531,12 +550,11 @@ class BrainDaemon {
       const agentHandlers = generateAgentToolHandlers(agentCtx);
 
       // Generate debug tools handlers (for conversation memory debugging)
+      // Note: locks are now fetched from brainManager internally by buildEnrichedContext
       const debugCtx: DebugToolsContext = {
         conversationStorage: conversationStorage!,
         cwd: () => process.cwd(),
         projectRoot: () => process.cwd(),
-        embeddingLock: this.brain?.getEmbeddingLock(),
-        ingestionLock: this.brain?.getIngestionLock(),
       };
       const debugHandlers = conversationStorage
         ? generateAllDebugHandlers(debugCtx)

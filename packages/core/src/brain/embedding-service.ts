@@ -201,7 +201,6 @@ interface NodeToMarkDone {
 
 /**
  * Hash content for change detection
- * Quantum butterflies surfing cosmic spaghetti waves
  */
 export function hashContent(text: string): string {
   return crypto.createHash('sha256').update(text).digest('hex').substring(0, 16);

@@ -1059,44 +1059,14 @@ Example: After getting search results, use this to analyze each result with a cu
     const conversationId: string | undefined = undefined; // TODO: Add conversationId parameter to ask() method
     if (this.conversationStorage && conversationId) {
       try {
-        // Get locks from BrainManager or getLocks function if available
-        let embeddingLock: { isLocked: () => boolean; getDescription?: () => string } | undefined;
-        let ingestionLock: { isLocked: () => boolean; getDescription?: () => string } | undefined;
-
-        if (this.brainManager) {
-          // Direct access to BrainManager
-          try {
-            embeddingLock = this.brainManager.getEmbeddingLock();
-            ingestionLock = this.brainManager.getIngestionLock();
-          } catch (error: any) {
-            if (this.verbose) {
-              console.warn(`⚠️  Failed to get locks from BrainManager: ${error.message}`);
-            }
-          }
-        } else if (this.getLocks) {
-          // Use getLocks function (e.g., from DaemonBrainProxy)
-          try {
-            const locks = await this.getLocks();
-            embeddingLock = locks.embeddingLock;
-            ingestionLock = locks.ingestionLock;
-          } catch (error: any) {
-            if (this.verbose) {
-              console.warn(`⚠️  Failed to get locks via getLocks function: ${error.message}`);
-            }
-          }
-        }
-
-        // If locks are not available, code semantic search will be skipped (safer)
-        // This ensures we don't risk semantic search on potentially stale data
-
+        // buildEnrichedContext now fetches locks from brainManager internally and waits for them
+        // (like brain_search does)
         const enrichedContext = await this.conversationStorage.buildEnrichedContext(
           conversationId,
           question,
           {
             cwd: this.cwd,
-            projectRoot: this.projectRoot,
-            embeddingLock,
-            ingestionLock
+            projectRoot: this.projectRoot
           }
         );
 

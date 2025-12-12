@@ -331,45 +331,22 @@ export function generateAgentToolHandlers(
       
       if (conversationStorage && conversationId) {
         try {
-          // Get locks from BrainManager or getLocks function if available
-          const getLocks = (agent as any).getLocks;
-          let embeddingLock: { isLocked: () => boolean; getDescription?: () => string } | undefined;
-          let ingestionLock: { isLocked: () => boolean; getDescription?: () => string } | undefined;
-
-          if ((agent as any).brainManager) {
-            try {
-              embeddingLock = (agent as any).brainManager.getEmbeddingLock();
-              ingestionLock = (agent as any).brainManager.getIngestionLock();
-            } catch (error: any) {
-              // Ignore
-            }
-          } else if (getLocks) {
-            try {
-              const locks = await getLocks();
-              embeddingLock = locks.embeddingLock;
-              ingestionLock = locks.ingestionLock;
-            } catch (error: any) {
-              // Ignore
-            }
-          }
-
           // Resolve projectRoot (can be string or function)
           const projectRootValue = typeof (agent as any).projectRoot === 'function'
             ? (agent as any).projectRoot() || process.cwd()
             : (agent as any).projectRoot || process.cwd();
-          
+
           // Resolve cwd (use projectRoot if cwd not set, or process.cwd() as fallback)
           const cwdValue = (agent as any).cwd || projectRootValue || process.cwd();
 
           // Build enriched context with current conversation
+          // Note: buildEnrichedContext now fetches locks from brainManager internally and waits for them
           const enrichedContext = await conversationStorage.buildEnrichedContext(
             conversationId,
             question,
             {
               cwd: cwdValue,
-              projectRoot: projectRootValue,
-              embeddingLock,
-              ingestionLock
+              projectRoot: projectRootValue
             }
           );
 

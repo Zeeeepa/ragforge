@@ -27,7 +27,9 @@ import type { StructuredLLMExecutor } from '../llm/structured-llm-executor.js';
 import type { LLMProvider } from '../reranking/llm-provider.js';
 import type { BrainManager } from '../../brain/brain-manager.js';
 import { generateFsTools, type FsToolsContext } from '../../tools/fs-tools.js';
+import { generateBrainSearchTool, generateBrainSearchHandler, type BrainToolsContext } from '../../tools/brain-tools.js';
 import { GeneratedToolExecutor } from '../agents/rag-agent.js';
+import { CwdFileCache, getDefaultCwdFileCache, type CwdStats } from './cwd-file-cache.js';
 
 export class ConversationStorage {
   private config?: ConversationConfig;
@@ -36,6 +38,7 @@ export class ConversationStorage {
   private brainManager?: BrainManager;
   private llmExecutor?: StructuredLLMExecutor;
   private llmProvider?: LLMProvider;
+  private cwdFileCache: CwdFileCache = getDefaultCwdFileCache();
 
   constructor(
     private neo4j: Neo4jClient,
@@ -1533,7 +1536,11 @@ export class ConversationStorage {
   }
 
   /**
-   * Search code semantically using Scope nodes with startLine/endLine
+   * Search content semantically using adaptive node types based on directory content
+   * - Code-heavy dirs (>=70% code): searches Scope nodes only
+   * - Document-heavy dirs (>=70% docs): searches Scope + MarkdownSection + PDFDocument + etc.
+   * - Mixed dirs: searches Scope + MarkdownSection + MarkdownDocument
+   *
    * IMPORTANT: Only searches if cwd is a subdirectory of projectRoot and embedding lock is available
    * Uses brainManager.search() which handles EmbeddingChunk normalization
    */
@@ -1547,6 +1554,7 @@ export class ConversationStorage {
       minScore?: number;              // Default: 0.3
       embeddingLockAvailable?: boolean; // Default: true (must be checked by caller)
       ingestionLockAvailable?: boolean; // Default: true (must be checked by caller)
+      statsPaths?: string[];          // Paths to use for aggregated stats (when cwd contains multiple projects)
     }
   ): Promise<Array<{
     scopeId: string;
@@ -1573,9 +1581,11 @@ export class ConversationStorage {
       ingestionLockAvailable = true
     } = options;
 
-    // Check conditions: must be subdirectory OR cwd must be a parent of projectRoot (cwd contains projectRoot)
+    // Check conditions: must be subdirectory OR cwd must be a parent of projectRoot (cwd contains projectRoot) OR cwd IS projectRoot
     const relativePath = path.relative(projectRoot, cwd);
     const isSubdirectory = relativePath !== '' && relativePath !== '.' && !relativePath.startsWith('..');
+    // Check if cwd IS the project root (same directory)
+    const isAtProjectRoot = relativePath === '' || relativePath === '.';
 
     // Also check if cwd contains projectRoot (inverse relationship)
     const cwdToProjectPath = path.relative(cwd, projectRoot);
@@ -1583,8 +1593,8 @@ export class ConversationStorage {
 
     // CRITICAL: Both locks must be available for code semantic search
     // This ensures data consistency (no ingestion in progress) and embeddings are ready
-    // Allow semantic search if: (cwd is subdirectory of projectRoot) OR (cwd contains projectRoot)
-    if ((!isSubdirectory && !cwdContainsProject) || !embeddingLockAvailable || !ingestionLockAvailable) {
+    // Allow semantic search if: (cwd IS projectRoot) OR (cwd is subdirectory of projectRoot) OR (cwd contains projectRoot)
+    if ((!isAtProjectRoot && !isSubdirectory && !cwdContainsProject) || !embeddingLockAvailable || !ingestionLockAvailable) {
       return []; // Return empty if conditions not met
     }
 
@@ -1600,14 +1610,58 @@ export class ConversationStorage {
     const normalizedRelativePath = cwdContainsProject ? '' : relativePath.replace(/\\/g, '/');
     const globPattern = normalizedRelativePath ? `${normalizedRelativePath}/**/*` : '**/*';
 
+    // Get stats to determine which node types to search
+    // Priority: 1) statsPaths if provided (for aggregated multi-project stats)
+    //           2) projectRoot if cwd is a parent directory containing the project
+    //           3) cwd (current working directory)
+    let cwdStats;
+    let statsSource: string;
+    if (options.statsPaths && options.statsPaths.length > 0) {
+      cwdStats = await this.cwdFileCache.getAggregatedStats(options.statsPaths);
+      statsSource = `aggregated(${options.statsPaths.length} projects)`;
+    } else {
+      const statsPath = cwdContainsProject ? projectRoot : cwd;
+      cwdStats = await this.cwdFileCache.getStats(statsPath);
+      statsSource = statsPath;
+    }
+    console.log('[ConversationStorage] searchCodeSemantic: Directory stats', {
+      statsSource,
+      dominantType: cwdStats.dominantType,
+      codeRatio: cwdStats.codeRatio.toFixed(2)
+    });
+
+    // Type boost factors: prioritize methods/functions over classes/interfaces
+    const typeBoostFactors: Record<string, number> = {
+      'method': 1.15,      // Methods are most actionable
+      'function': 1.15,    // Functions are most actionable
+      'arrow_function': 1.10,
+      'class': 1.05,       // Classes provide context but less actionable
+      'interface': 1.0,    // Interfaces are reference only
+      'type': 1.0,
+      'variable': 0.95,    // Variables are less important
+      'property': 0.90,
+    };
+
     try {
+      console.log('[ConversationStorage] searchCodeSemantic: Calling brainManager.search...', {
+        query: query.substring(0, 50),
+        globPattern,
+        limit: initialLimit,
+        minScore
+      });
+      const searchStartTime = Date.now();
+      // No nodeTypes filter - search all types and re-score by type
       const searchResult = await this.brainManager.search(query, {
         semantic: true,
         embeddingType: 'content',
-        nodeTypes: ['Scope'], // Only search Scope nodes (code)
+        // No nodeTypes filter - we'll re-score by type instead
         glob: globPattern,
-        limit: initialLimit,
-        minScore,
+        limit: initialLimit * 2, // Fetch more to account for re-scoring
+        minScore: minScore * 0.8, // Lower threshold, we'll filter after re-scoring
+      });
+      console.log('[ConversationStorage] searchCodeSemantic: brainManager.search completed', {
+        resultCount: searchResult.results.length,
+        durationMs: Date.now() - searchStartTime
       });
 
       const results: Array<{
@@ -1620,6 +1674,7 @@ export class ConversationStorage {
         score: number;
         charCount: number;
         confidence: number;
+        nodeType?: string;
         matchedRange?: { startLine: number; endLine: number };
       }> = [];
 
@@ -1631,6 +1686,14 @@ export class ConversationStorage {
 
         const content = node.source || '';
         const charCount = content.length;
+        const nodeType = node.type || 'unknown';
+
+        // Apply type boost to score
+        const typeBoost = typeBoostFactors[nodeType] ?? 1.0;
+        const boostedScore = Math.min(1.0, result.score * typeBoost);
+
+        // Skip if boosted score is below original threshold
+        if (boostedScore < minScore) continue;
 
         results.push({
           scopeId: node.uuid,
@@ -1639,9 +1702,10 @@ export class ConversationStorage {
           startLine: this.toNumber(node.startLine),
           endLine: this.toNumber(node.endLine),
           content,
-          score: result.score,
+          score: boostedScore,
           charCount,
           confidence: 0.5, // Code semantic search: medium confidence
+          nodeType,
           // Include matchedRange if this result came from a chunk match
           matchedRange: result.matchedRange ? {
             startLine: result.matchedRange.startLine,
@@ -1650,14 +1714,17 @@ export class ConversationStorage {
         });
       }
 
-      // Sort by score DESC (should already be sorted but ensure)
+      // Sort by boosted score DESC
       results.sort((a, b) => b.score - a.score);
+
+      // Limit to original requested limit
+      const limitedByCount = results.slice(0, initialLimit);
 
       // Apply character limit: take results with highest scores until maxChars
       const limitedResults: typeof results = [];
       let cumulativeChars = 0;
 
-      for (const result of results) {
+      for (const result of limitedByCount) {
         if (cumulativeChars + result.charCount <= maxChars) {
           limitedResults.push(result);
           cumulativeChars += result.charCount;
@@ -2185,8 +2252,7 @@ export class ConversationStorage {
       level1SummariesLimit?: number;
       cwd?: string;                      // Current working directory pour détecter sous-répertoire
       projectRoot?: string;              // Project root for code search filtering
-      embeddingLock?: { isLocked: () => boolean; getDescription?: () => string }; // Lock d'embeddings pour vérifier disponibilité
-      ingestionLock?: { isLocked: () => boolean; getDescription?: () => string }; // Lock d'ingestion pour vérifier disponibilité
+      // Note: locks are now automatically fetched from brainManager and waited for (like brain_search)
     }
   ): Promise<{
     lastUserQueries: Array<{
@@ -2254,15 +2320,28 @@ export class ConversationStorage {
 
         // 1. Check if project is known (registered in brain)
         const isProjectKnown = await this.isProjectKnown(projectRoot);
-        
-        // 2. Check if locks are available
-        const embeddingLockAvailable = options.embeddingLock && !options.embeddingLock.isLocked();
-        const ingestionLockAvailable = options.ingestionLock && !options.ingestionLock.isLocked();
-        const locksAvailable = embeddingLockAvailable && ingestionLockAvailable;
 
-        // Check if cwd is a subdirectory (for semantic search only - it requires subdirectory)
+        // 2. Get locks from brainManager (like brain_search does)
+        let embeddingLock: { isLocked: () => boolean; waitForUnlock: (timeout: number) => Promise<boolean>; getDescription?: () => string } | undefined;
+        let ingestionLock: { isLocked: () => boolean; waitForUnlock: (timeout: number) => Promise<boolean>; getDescription?: () => string } | undefined;
+
+        if (this.brainManager) {
+          try {
+            embeddingLock = this.brainManager.getEmbeddingLock();
+            ingestionLock = this.brainManager.getIngestionLock();
+          } catch (err) {
+            console.debug('[ConversationStorage] buildEnrichedContext: Could not get locks from brainManager:', err);
+          }
+        }
+
+        // brainManager available means we can wait for locks (no need to check if available)
+        const hasBrainManager = !!this.brainManager;
+
+        // Check if cwd is a subdirectory of projectRoot
         const relativePath = path.relative(projectRoot, cwd);
         const isSubdirectory = relativePath !== '' && relativePath !== '.' && !relativePath.startsWith('..');
+        // Check if cwd IS the project root (user is at project root)
+        const isAtProjectRoot = relativePath === '' || relativePath === '.';
 
         // Check if cwd contains registered projects (alternative condition for semantic search)
         const projectsInCwd = await this.getProjectsInCwd(cwd);
@@ -2270,92 +2349,55 @@ export class ConversationStorage {
 
         console.log('[ConversationStorage] buildEnrichedContext: Code search conditions', {
           isProjectKnown,
-          locksAvailable,
+          hasBrainManager,
           isSubdirectory,
+          isAtProjectRoot,
           relativePath,
           hasProjectsInCwd,
           projectsInCwdCount: projectsInCwd.length
         });
 
-        // Launch semantic search (if project known + locks available + (subdirectory OR cwd contains projects)) AND fuzzy search in parallel
-        const [semanticResults, fuzzyResults] = await Promise.all([
-          // Semantic search: only if project known + locks available + (subdirectory OR cwd contains projects)
-          (async () => {
-            const canRunSemanticSearch = isProjectKnown && locksAvailable && (isSubdirectory || hasProjectsInCwd);
-            if (canRunSemanticSearch) {
-              // If cwd contains projects but is not a subdirectory, use the first project as projectRoot
-              const effectiveProjectRoot = hasProjectsInCwd && !isSubdirectory ? projectsInCwd[0] : projectRoot;
-              console.log('[ConversationStorage] buildEnrichedContext: Running semantic search', {
-                reason: isSubdirectory ? 'subdirectory' : 'cwd-contains-projects',
-                effectiveProjectRoot,
-                projectsInCwd: hasProjectsInCwd ? projectsInCwd : undefined
-              });
-              return await this.searchCodeSemantic(userMessage, {
-                cwd,
-                projectRoot: effectiveProjectRoot,
-                initialLimit: options?.codeSearchInitialLimit ?? this.getCodeSearchInitialLimit(),
-                maxChars: options?.codeSearchMaxChars ?? this.getCodeSearchMaxChars(),
-                minScore: options?.semanticMinScore ?? 0.3,
-                embeddingLockAvailable: true,
-                ingestionLockAvailable: true
-              });
+        // Build available projects list for the agent
+        // Include: current project (if known) + all projects in cwd
+        const availableProjects: Array<{ id: string; path: string; type: string }> = [];
+
+        if (isProjectKnown && this.brainManager) {
+          const project = this.brainManager.findProjectByPath(projectRoot);
+          if (project) {
+            availableProjects.push({ id: project.id, path: project.path, type: project.type });
+          }
+        }
+
+        // Add projects in cwd (if different from current project)
+        if (hasProjectsInCwd && this.brainManager) {
+          for (const projectPath of projectsInCwd) {
+            const project = this.brainManager.findProjectByPath(projectPath);
+            if (project && !availableProjects.find(p => p.id === project.id)) {
+              availableProjects.push({ id: project.id, path: project.path, type: project.type });
             }
-            console.log('[ConversationStorage] buildEnrichedContext: Skipping semantic search', {
-              isProjectKnown,
-              locksAvailable,
-              isSubdirectory,
-              hasProjectsInCwd
-            });
-            return [];
-          })(),
-          // Fuzzy search: always available (works at root or subdirectory)
-          (async () => {
-            console.log('[ConversationStorage] buildEnrichedContext: Running fuzzy search');
-            const results = await this.searchCodeFuzzyWithLLM(userMessage, {
-              cwd,
-              projectRoot,
-              maxChars: options?.codeSearchMaxChars ?? this.getCodeSearchMaxChars()
-            });
-            console.log('[ConversationStorage] buildEnrichedContext: Fuzzy search returned', results.length, 'results');
-            return results;
-          })()
-        ]);
-
-        // Merge results: semantic first (higher confidence), then fuzzy
-        // Deduplicate by file+startLine+endLine
-        const seen = new Set<string>();
-        const merged: typeof semanticResults = [];
-
-        console.log('[ConversationStorage] buildEnrichedContext: Merging results', {
-          semanticResults: semanticResults.length,
-          fuzzyResults: fuzzyResults.length
-        });
-
-        // Add semantic results first (higher priority)
-        for (const result of semanticResults) {
-          const key = `${result.file}:${result.startLine}:${result.endLine}`;
-          if (!seen.has(key)) {
-            seen.add(key);
-            merged.push(result);
           }
         }
 
-        // Add fuzzy results (avoid duplicates)
-        for (const result of fuzzyResults) {
-          const key = `${result.file}:${result.startLine}:${result.endLine}`;
-          if (!seen.has(key)) {
-            seen.add(key);
-            merged.push(result);
-          }
-        }
-
-        console.log('[ConversationStorage] buildEnrichedContext: Merged results', {
-          total: merged.length,
-          semantic: semanticResults.length,
-          fuzzy: fuzzyResults.length
+        console.log('[ConversationStorage] buildEnrichedContext: Running search agent', {
+          availableProjects: availableProjects.length,
+          hasBrainManager
         });
 
-        return merged;
+        // Run the search agent (it has access to brain_search and grep_files)
+        // The agent decides what to search based on the query
+        const agentResults = await this.searchCodeFuzzyWithLLM(userMessage, {
+          cwd,
+          projectRoot,
+          maxChars: options?.codeSearchMaxChars ?? this.getCodeSearchMaxChars(),
+          recentTurns: recentTurns.slice(0, 3), // Pass last 3 turns for context
+          availableProjects: availableProjects.length > 0 ? availableProjects : undefined
+        });
+
+        console.log('[ConversationStorage] buildEnrichedContext: Search agent returned', {
+          resultCount: agentResults.length
+        });
+
+        return agentResults;
       })()
     ]);
 
@@ -2830,9 +2872,11 @@ export class ConversationStorage {
   }
 
   /**
-   * LLM-guided fuzzy search on code files (fallback when project not known or locks unavailable)
-   * Uses StructuredLLMExecutor to decide if fuzzy search is relevant, then performs fuzzy search
-   * filtered on code file extensions
+   * LLM-guided fuzzy search on files (fallback when project not known or locks unavailable)
+   * Uses StructuredLLMExecutor to perform fuzzy search with adaptive file patterns.
+   * - Code-heavy dirs (>=70% code): focuses on code file extensions
+   * - Document-heavy dirs (>=70% docs): includes document file extensions
+   * - Mixed dirs: searches both code and document files
    */
   private async searchCodeFuzzyWithLLM(
     userMessage: string,
@@ -2840,6 +2884,8 @@ export class ConversationStorage {
       cwd: string;
       projectRoot: string;
       maxChars: number;
+      recentTurns?: ConversationTurn[]; // Recent conversation turns for context
+      availableProjects?: Array<{ id: string; path: string; type: string }>; // Projects the agent can search
     }
   ): Promise<Array<{
     scopeId: string;
@@ -2866,18 +2912,67 @@ export class ConversationStorage {
     });
 
     try {
+      // 0. Get cwd stats to determine dominant file type (code vs documents)
+      const cwdStats = await this.cwdFileCache.getStats(options.cwd);
+      const recommendedPattern = this.cwdFileCache.getRecommendedGlobPattern(cwdStats);
+      console.log('[ConversationStorage] searchCodeFuzzyWithLLM: CwdStats', {
+        dominantType: cwdStats.dominantType,
+        codeRatio: cwdStats.codeRatio.toFixed(2),
+        documentRatio: cwdStats.documentRatio.toFixed(2),
+        recommendedPattern
+      });
+
+      // 0.5. Build conversation context from recent turns (if available)
+      let conversationContext = '';
+      if (options.recentTurns && options.recentTurns.length > 0) {
+        const turnsForContext = options.recentTurns.slice(0, 3); // Max 3 turns
+        conversationContext = turnsForContext.map((turn, i) => {
+          let turnStr = `[Turn ${i + 1}]\nUser: ${turn.userMessage.substring(0, 300)}`;
+
+          // Include tool results summary (truncated)
+          if (turn.toolResults && turn.toolResults.length > 0) {
+            const toolsSummary = turn.toolResults
+              .slice(0, 3) // Max 3 tool results per turn
+              .map(tr => {
+                const resultPreview = typeof tr.toolResult === 'string'
+                  ? tr.toolResult.substring(0, 150)
+                  : JSON.stringify(tr.toolResult).substring(0, 150);
+                return `  - ${tr.toolName}: ${resultPreview}...`;
+              })
+              .join('\n');
+            turnStr += `\nTools used:\n${toolsSummary}`;
+          }
+
+          // Include assistant response (truncated)
+          if (turn.assistantMessage) {
+            turnStr += `\nAssistant: ${turn.assistantMessage.substring(0, 200)}...`;
+          }
+
+          return turnStr;
+        }).join('\n\n');
+
+        console.log('[ConversationStorage] searchCodeFuzzyWithLLM: Including conversation context', {
+          turnsCount: turnsForContext.length,
+          contextLength: conversationContext.length
+        });
+      }
+
       // 1. Create FsToolsContext for file system tools
       const fsToolsContext: FsToolsContext = {
         projectRoot: options.projectRoot,
       };
 
-      // 2. Generate file system search tools (only search tools, no modification tools)
+      // 2. Generate file system search tools (grep_files for text search, list/glob for exploration)
       const fsTools = generateFsTools(fsToolsContext);
-      
-      // Filter to only include search tools (no modification tools)
-      const searchToolNames = ['grep_files', 'search_files', 'list_directory', 'glob_files'];
-      const searchGeneratedTools = fsTools.tools.filter(tool => searchToolNames.includes(tool.name));
-      
+
+      // Filter to only include search tools (no modification tools, no fuzzy search_files)
+      const fsSearchToolNames = ['grep_files', 'list_directory', 'glob_files'];
+      const searchGeneratedTools = fsTools.tools.filter(tool => fsSearchToolNames.includes(tool.name));
+
+      // 3. Add brain_search tool for semantic search (if brainManager available)
+      const brainSearchTool = this.brainManager ? generateBrainSearchTool() : null;
+      const brainSearchHandler = this.brainManager ? generateBrainSearchHandler({ brain: this.brainManager }) : null;
+
       // Convert GeneratedToolDefinition[] to ToolDefinition[] format
       const searchTools: Array<{
         type: 'function';
@@ -2894,12 +2989,28 @@ export class ConversationStorage {
           parameters: tool.inputSchema,
         },
       }));
-      
+
+      // Add brain_search if available
+      if (brainSearchTool) {
+        searchTools.push({
+          type: 'function' as const,
+          function: {
+            name: brainSearchTool.name,
+            description: brainSearchTool.description,
+            parameters: brainSearchTool.inputSchema,
+          },
+        });
+      }
+
       const searchHandlers: Record<string, (args: Record<string, any>) => Promise<any>> = {};
-      for (const toolName of searchToolNames) {
+      for (const toolName of fsSearchToolNames) {
         if (fsTools.handlers[toolName]) {
           searchHandlers[toolName] = fsTools.handlers[toolName];
         }
+      }
+      // Add brain_search handler (wrap to match Record<string, any> signature)
+      if (brainSearchHandler) {
+        searchHandlers['brain_search'] = (args: Record<string, any>) => brainSearchHandler(args as any);
       }
 
       // 3. Create tool executor and collect tool results
@@ -2914,9 +3025,13 @@ export class ConversationStorage {
         searchHandlers,
         false, // verbose
         undefined, // logger
-        [], // executionOrder (no special ordering needed for search tools)
+        [], // executionOrder (no special ordering needed for search tools) - ALL tools run in parallel via Promise.all()
         {
-          onToolResult: (toolName: string, result: any, success: boolean) => {
+          onToolResult: (toolName: string, result: any, success: boolean, durationMs: number) => {
+            console.log(`[ConversationStorage] searchCodeFuzzyWithLLM: Tool ${toolName} completed in ${durationMs}ms`, {
+              success,
+              resultCount: result?.matches?.length ?? (result?.files?.length ?? 'N/A')
+            });
             toolResults.push({
               tool_name: toolName,
               success,
@@ -2956,27 +3071,44 @@ export class ConversationStorage {
             required: false
           }
         },
-        systemPrompt: `You are a code search assistant. Your task is to search code files to find relevant code snippets that match the user's query.
+        systemPrompt: `You are a code search assistant. Your task is to search for relevant code and content that matches the user's query.
 
-You have access to the following file system search tools:
-- grep_files: Search for text patterns in files matching a glob pattern (returns matches with file, line, content)
-- search_files: Fuzzy search for text in files matching a glob pattern (returns matches with file, line, content, similarity)
+**Available Tools:**
+${this.brainManager ? `- brain_search: **SEMANTIC SEARCH** - finds conceptually related content using embeddings. Use semantic=true for best results.
+  Example: brain_search({ query: "authentication logic", semantic: true, limit: 20 })
+  ${options.availableProjects && options.availableProjects.length > 0 ? `Can search specific projects: brain_search({ query: "...", projects: ["project-id"], semantic: true })` : ''}` : ''}
+- grep_files: Search for **EXACT text patterns** in files (regex supported, powered by ripgrep)
+  Example: grep_files({ pattern: "${recommendedPattern}", regex: "handleAuth|authenticate" })
 - list_directory: List files and directories
 - glob_files: Find files matching a glob pattern
+${options.availableProjects && options.availableProjects.length > 0 ? `
+**Available Projects for brain_search:**
+${options.availableProjects.map(p => `- ${p.id} (${p.type}): ${p.path}`).join('\n')}
+` : ''}${conversationContext ? `
+**Recent Conversation Context:**
+Use this context to understand what the user is working on and search for related terms.
+${conversationContext}
+` : ''}
+**Directory Analysis:**
+This directory is ${cwdStats.dominantType === 'code' ? 'primarily code files' : cwdStats.dominantType === 'documents' ? 'primarily document files' : 'a mix of code and document files'}.
+- Code files: ${cwdStats.codeCount} (${(cwdStats.codeRatio * 100).toFixed(0)}%)
+- Document files: ${cwdStats.documentCount} (${(cwdStats.documentRatio * 100).toFixed(0)}%)
+- Top file extensions: ${Object.entries(cwdStats.extensions).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([ext, count]) => `${ext}(${count})`).join(', ')}
+- Recommended glob pattern: "${recommendedPattern}"
 
 **Instructions:**
-1. Analyze the user query to identify key search terms (function names, class names, variables, code concepts)
-2. Use MULTIPLE tool calls in parallel to search for these terms in code files
-3. You can call up to 4-5 tools in a single response
-4. Focus on code files (TypeScript, JavaScript, Python, etc.) - use glob_files with patterns like "**/*.{ts,tsx,js,jsx,py}"
-5. Use grep_files for exact pattern matching or search_files for fuzzy matching
-6. Make multiple tool calls to search different patterns or terms
+1. **Use brain_search with semantic=true** for conceptual queries (e.g., "how does authentication work", "error handling logic")
+2. **Use grep_files** for exact patterns (function names, class names, specific strings)
+3. Extract meaningful terms from the user query and search for related concepts
+4. Make 2-4 tool calls in parallel to maximize coverage
+5. **USE THE RECOMMENDED GLOB PATTERN** for grep_files - it's based on actual files in this directory!
 
 **Important:**
 - Make ALL your tool calls in a single response (don't wait for results)
-- Use multiple tool calls to search different patterns or directories
-- Focus on the most relevant search terms`,
-        userTask: `Search code files for: "${userMessage.substring(0, 200)}". Use MULTIPLE file system tool calls to find relevant code snippets. Make all tool calls in parallel.`
+- brain_search returns absolute file paths in the 'filePath' field
+- grep_files returns relative paths from projectRoot
+- This is for initial context gathering - maximize results coverage!`,
+        userTask: `Search files for: "${userMessage.substring(0, 200)}". Use MULTIPLE file system tool calls to find relevant content. Make all tool calls in parallel.`
       });
 
       console.log('[ConversationStorage] searchCodeFuzzyWithLLM: Tool execution completed', {
@@ -3044,42 +3176,49 @@ You have access to the following file system search tools:
           }
         }
         
-        // Handle search_files result
-        if (toolResult.tool_name === 'search_files' && result.matches) {
-          for (const match of result.matches) {
+        // Handle brain_search result (semantic search)
+        if (toolResult.tool_name === 'brain_search' && result.results) {
+          for (const searchResult of result.results) {
             if (cumulativeChars >= options.maxChars) break;
-            
-            const charCount = match.content?.length || 0;
-            const similarity = match.similarity || 0.5;
-            
+
+            const node = searchResult.node;
+            const content = node.source || node.content || '';
+            const charCount = content.length;
+            const score = searchResult.score || 0.5;
+
+            // Use filePath (absolute) from brain_search result
+            const filePath = searchResult.filePath || node.file || '';
+            const startLine = node.startLine || 1;
+            const endLine = node.endLine || startLine;
+
             if (cumulativeChars + charCount > options.maxChars) {
               const remainingChars = options.maxChars - cumulativeChars;
               if (remainingChars > 100) {
                 formattedResults.push({
-                  scopeId: `fuzzy-${match.file}-${match.line}`,
-                  name: `Line ${match.line}${match.matched_word ? ` (matched: ${match.matched_word})` : ''}`,
-                  file: match.file,
-                  startLine: match.line,
-                  endLine: match.line,
-                  content: (match.content || '').substring(0, remainingChars) + '...',
-                  score: similarity,
+                  scopeId: node.uuid || `semantic-${filePath}-${startLine}`,
+                  name: node.name || `${node.type || 'scope'} at line ${startLine}`,
+                  file: filePath, // Absolute path from brain_search
+                  startLine,
+                  endLine,
+                  content: content.substring(0, remainingChars) + '...',
+                  score,
                   charCount: remainingChars,
-                  confidence: 0.3
+                  confidence: 0.5 // Higher confidence for semantic search
                 });
               }
               break;
             }
 
             formattedResults.push({
-              scopeId: `fuzzy-${match.file}-${match.line}`,
-              name: `Line ${match.line}${match.matched_word ? ` (matched: ${match.matched_word})` : ''}`,
-              file: match.file,
-              startLine: match.line,
-              endLine: match.line,
-              content: match.content || '',
-              score: similarity,
+              scopeId: node.uuid || `semantic-${filePath}-${startLine}`,
+              name: node.name || `${node.type || 'scope'} at line ${startLine}`,
+              file: filePath, // Absolute path from brain_search
+              startLine,
+              endLine,
+              content,
+              score,
               charCount,
-              confidence: 0.3
+              confidence: 0.5 // Higher confidence for semantic search
             });
 
             cumulativeChars += charCount;

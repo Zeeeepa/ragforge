@@ -393,6 +393,24 @@ Default: 0.3 for semantic search (recommended range: 0.3-0.7), no filter for tex
 Lower values (0.1-0.3) return more results but may include less relevant matches.
 Higher values (0.7-0.9) return fewer but more precise results.`,
         },
+        boost_keywords: {
+          type: 'array',
+          items: { type: 'string' },
+          optional: true,
+          description: `Keywords to boost in results using fuzzy matching (Levenshtein distance).
+Results containing these keywords (exact or fuzzy match) get a score boost.
+Useful when you know specific function/class names that should be prioritized.
+Example: ["buildEnrichedContext", "searchCode"] will boost results matching these names.`,
+        },
+        boost_weight: {
+          type: 'number',
+          optional: true,
+          description: `Maximum score boost per keyword match (default: 0.15).
+The actual boost is proportional to Levenshtein similarity:
+- Exact match (1.0 similarity) → full boost_weight added
+- Fuzzy match (0.8 similarity) → 80% of boost_weight added
+- No match (< 0.6 similarity) → no boost`,
+        },
       },
       required: ['query'],
     },
@@ -413,7 +431,9 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
     limit?: number;
     use_reranking?: boolean;
     min_score?: number;
-  }): Promise<UnifiedSearchResult & { waited_for_edits?: boolean; watchers_started?: string[]; flushed_projects?: string[]; reranked?: boolean }> => {
+    boost_keywords?: string[];
+    boost_weight?: number;
+  }): Promise<UnifiedSearchResult & { waited_for_edits?: boolean; watchers_started?: string[]; flushed_projects?: string[]; reranked?: boolean; keyword_boosted?: boolean }> => {
     const { createLogger } = await import('../runtime/utils/logger.js');
     const log = createLogger('brain_search');
     
@@ -519,11 +539,12 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
       }
 
       log.info('Step 5: Executing search');
-      // For reranking with semantic search, we need more candidates to rerank
-      // Minimum 100 results for reranking, then apply limit after reranking
+      // For reranking or keyword boosting with semantic search, we need more candidates
+      // Minimum 100 results, then apply limit after reranking/boosting
       const originalLimit = params.limit || 20;
-      const searchLimit = (params.use_reranking && params.semantic) 
-        ? Math.max(originalLimit, 100) 
+      const needsMoreCandidates = params.semantic && (params.use_reranking || (params.boost_keywords && params.boost_keywords.length > 0));
+      const searchLimit = needsMoreCandidates
+        ? Math.max(originalLimit, 100)
         : originalLimit;
       
       const options: BrainSearchOptions = {
@@ -735,20 +756,38 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
                     originalLimit,
                   });
                 } else {
-                  // Apply original limit after reranking (reranking was done on more candidates)
-                  const limitedResults = finalResults.slice(0, originalLimit);
-                  
-                  result = {
-                    ...result,
-                    results: limitedResults,
-                    totalCount: limitedResults.length,
-                  };
-                  
-                  log.info('Applied limit after reranking', {
-                    beforeLimit: finalResults.length,
-                    afterLimit: limitedResults.length,
-                    originalLimit,
-                  });
+                  // Check if boost_keywords will run after reranking
+                  const willApplyBoost = params.boost_keywords && params.boost_keywords.length > 0;
+
+                  if (willApplyBoost) {
+                    // Don't apply limit yet - boost_keywords will operate on all reranked candidates
+                    // and apply the limit at the end
+                    result = {
+                      ...result,
+                      results: finalResults,
+                      totalCount: finalResults.length,
+                    };
+
+                    log.info('Reranking done, deferring limit for keyword boost', {
+                      resultCount: finalResults.length,
+                      originalLimit,
+                    });
+                  } else {
+                    // No boost_keywords, apply limit now
+                    const limitedResults = finalResults.slice(0, originalLimit);
+
+                    result = {
+                      ...result,
+                      results: limitedResults,
+                      totalCount: limitedResults.length,
+                    };
+
+                    log.info('Applied limit after reranking', {
+                      beforeLimit: finalResults.length,
+                      afterLimit: limitedResults.length,
+                      originalLimit,
+                    });
+                  }
                 }
               }
             }
@@ -775,8 +814,126 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
         }
       }
 
+      // Apply keyword boosting with Levenshtein similarity
+      let keywordBoosted = false;
+      if (params.boost_keywords && params.boost_keywords.length > 0 && result.results.length > 0) {
+        log.info('Applying keyword boost', {
+          keywords: params.boost_keywords,
+          weight: params.boost_weight ?? 0.15,
+          resultCount: result.results.length
+        });
+
+        const { distance } = await import('fastest-levenshtein');
+        const boostWeight = params.boost_weight ?? 0.15;
+        const minSimilarity = 0.6; // Minimum similarity threshold for boost
+
+        // Helper to calculate Levenshtein similarity (0-1 scale)
+        const levenshteinSimilarity = (a: string, b: string): number => {
+          if (!a || !b) return 0;
+          const maxLen = Math.max(a.length, b.length);
+          if (maxLen === 0) return 1;
+          const dist = distance(a.toLowerCase(), b.toLowerCase());
+          return 1 - dist / maxLen;
+        };
+
+        // Helper to find best keyword match in a text
+        const findBestKeywordMatch = (text: string, keywords: string[]): { keyword: string; similarity: number } => {
+          let bestMatch = { keyword: '', similarity: 0 };
+          if (!text) return bestMatch;
+
+          const textLower = text.toLowerCase();
+
+          for (const keyword of keywords) {
+            const keywordLower = keyword.toLowerCase();
+
+            // Check for exact substring match first (highest priority)
+            if (textLower.includes(keywordLower)) {
+              return { keyword, similarity: 1.0 };
+            }
+
+            // Otherwise, check Levenshtein similarity with each word in text
+            const words = text.split(/[\s\.\-_\/\\:,;()[\]{}]+/).filter(w => w.length > 2);
+            for (const word of words) {
+              const sim = levenshteinSimilarity(word, keyword);
+              if (sim > bestMatch.similarity) {
+                bestMatch = { keyword, similarity: sim };
+              }
+            }
+          }
+
+          return bestMatch;
+        };
+
+        // Apply boost to each result
+        const boostedResults = result.results.map(r => {
+          const node = r.node;
+
+          // Check name, file, path, title for keyword matches
+          const fieldsToCheck = [
+            node.name,
+            node.file,
+            node.path,
+            node.title,
+            node.signature,
+          ].filter(Boolean);
+
+          let maxBoost = 0;
+          let matchedKeyword = '';
+          let matchSimilarity = 0;
+
+          for (const field of fieldsToCheck) {
+            const match = findBestKeywordMatch(field as string, params.boost_keywords!);
+            if (match.similarity >= minSimilarity) {
+              const boost = match.similarity * boostWeight;
+              if (boost > maxBoost) {
+                maxBoost = boost;
+                matchedKeyword = match.keyword;
+                matchSimilarity = match.similarity;
+              }
+            }
+          }
+
+          if (maxBoost > 0) {
+            log.debug('Boosted result', {
+              name: node.name,
+              originalScore: r.score,
+              boost: maxBoost,
+              newScore: r.score + maxBoost,
+              matchedKeyword,
+              matchSimilarity
+            });
+          }
+
+          return {
+            ...r,
+            score: r.score + maxBoost,
+            ...(maxBoost > 0 && { keywordBoost: { keyword: matchedKeyword, similarity: matchSimilarity, boost: maxBoost } }),
+          };
+        });
+
+        // Re-sort by score
+        boostedResults.sort((a, b) => b.score - a.score);
+
+        // Apply original limit after boosting (we fetched more candidates for better ranking)
+        const limitedBoostedResults = boostedResults.slice(0, originalLimit);
+
+        result = {
+          ...result,
+          results: limitedBoostedResults,
+          totalCount: limitedBoostedResults.length,
+        };
+
+        keywordBoosted = true;
+        log.info('Keyword boost complete', {
+          boostedCount: limitedBoostedResults.filter(r => (r as any).keywordBoost).length,
+          beforeLimit: boostedResults.length,
+          afterLimit: limitedBoostedResults.length,
+          originalLimit
+        });
+      }
+
       const totalDuration = Date.now() - startTime;
-      log.info('COMPLETE', { totalDuration, reranked });
+      log.info('COMPLETE', { totalDuration, reranked, keywordBoosted });
 
       return {
         ...result,
@@ -784,6 +941,7 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
         watchers_started: watchersStarted.length > 0 ? watchersStarted : undefined,
         flushed_projects: flushedProjects.length > 0 ? flushedProjects : undefined,
         reranked: reranked || undefined,
+        keyword_boosted: keywordBoosted || undefined,
       };
     } catch (error: any) {
       const totalDuration = Date.now() - startTime;

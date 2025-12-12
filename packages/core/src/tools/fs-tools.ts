@@ -12,6 +12,7 @@ import type { GeneratedToolDefinition } from './types/index.js';
 import * as fsHelpers from './fs-helpers.js';
 import { distance as levenshtein } from 'fastest-levenshtein';
 import pLimit from 'p-limit';
+import { rgPath } from '@vscode/ripgrep';
 
 // ============================================
 // Types
@@ -624,16 +625,21 @@ export function generateSearchFilesTool(): GeneratedToolDefinition {
 Searches within files matching a glob pattern with typo tolerance.
 Useful when you don't know the exact spelling.
 
+**RECOMMENDED: Use multiple keywords for better precision.**
+When searching for concepts, break your search into meaningful keywords.
+Avoid common words like "test", "the", "is", "a", etc.
+
 Parameters:
 - pattern: Glob pattern to filter files (e.g., "**/*.ts")
-- query: Text to search for (fuzzy matched)
+- keywords: Array of keywords to search for (fuzzy matched). Use multiple keywords for better results!
+- match_mode: "all" (require all keywords in same file) or "any" (match any keyword). Default: "any"
 - threshold: Similarity threshold 0-1 (default: 0.7, higher = stricter)
 - max_results: Maximum number of matches to return (default: 50)
 - extract_hierarchy: Extract dependency hierarchy for results (default: false). Requires brain to be available.
 
-Example: search_files({ pattern: "**/*.ts", query: "authentification" })
-Example: search_files({ pattern: "src/**/*", query: "levenshtien", threshold: 0.6 })
-Example: search_files({ pattern: "**/*.ts", query: "normalizeTimestamp", extract_hierarchy: true })`,
+Example (single keyword): search_files({ pattern: "**/*.ts", keywords: ["authentification"] })
+Example (multiple keywords - recommended): search_files({ pattern: "**/*.ts", keywords: ["debug", "context", "tool"], match_mode: "all" })
+Example (typo tolerant): search_files({ pattern: "src/**/*", keywords: ["levenshtien", "fuzzy"], threshold: 0.6 })`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -641,9 +647,15 @@ Example: search_files({ pattern: "**/*.ts", query: "normalizeTimestamp", extract
           type: 'string',
           description: 'Glob pattern to filter files',
         },
-        query: {
+        keywords: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of keywords to search for (fuzzy matched). Use multiple keywords for better precision!',
+        },
+        match_mode: {
           type: 'string',
-          description: 'Text to search for (fuzzy matched)',
+          enum: ['all', 'any'],
+          description: 'Match mode: "all" requires all keywords in same file, "any" matches any keyword (default: "any")',
         },
         threshold: {
           type: 'number',
@@ -658,9 +670,107 @@ Example: search_files({ pattern: "**/*.ts", query: "normalizeTimestamp", extract
           description: 'Extract dependency hierarchy for results (default: false). Requires brain to be available.',
         },
       },
-      required: ['pattern', 'query'],
+      required: ['pattern', 'keywords'],
     },
   };
+}
+
+/**
+ * Try to use ripgrep (rg) for grep - 10-100x faster than Node.js implementation
+ */
+async function tryRipgrep(
+  projectRoot: string,
+  pattern: string,
+  regex: string,
+  ignoreCase: boolean,
+  maxResults: number
+): Promise<{ success: boolean; matches?: Array<{ file: string; line: number; content: string; match: string }>; filesSearched?: number } | null> {
+  const { spawn } = await import('child_process');
+
+  return new Promise((resolve) => {
+    // Build rg command args
+    const args = [
+      '--json',                    // JSON output for easy parsing
+      '--glob', pattern,           // File pattern
+      '--max-count', String(Math.ceil(maxResults / 10)), // Limit per file
+      '-g', '!node_modules',       // Ignore node_modules
+      '-g', '!.git',               // Ignore .git
+      '-g', '!dist',               // Ignore dist
+      '--max-columns', '500',      // Limit line length
+    ];
+
+    if (ignoreCase) {
+      args.push('-i');
+    }
+
+    args.push(regex);  // The pattern to search
+    args.push('.');    // Search in current directory
+
+    const rg = spawn(rgPath, args, {
+      cwd: projectRoot,
+      timeout: 30000, // 30 second timeout
+    });
+
+    let stdout = '';
+    let stderr = '';
+    let matches: Array<{ file: string; line: number; content: string; match: string }> = [];
+    let filesSearched = new Set<string>();
+
+    rg.stdout.on('data', (data: Buffer) => {
+      stdout += data.toString();
+
+      // Parse JSON lines as they come in (ripgrep outputs one JSON object per line)
+      const lines = stdout.split('\n');
+      stdout = lines.pop() || ''; // Keep incomplete line for next chunk
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const obj = JSON.parse(line);
+          if (obj.type === 'match' && matches.length < maxResults) {
+            const filePath = obj.data.path.text;
+            filesSearched.add(filePath);
+
+            // Handle submatches
+            const lineText = obj.data.lines?.text || '';
+            const submatches = obj.data.submatches || [];
+            const matchText = submatches.length > 0 ? submatches[0].match.text : '';
+
+            matches.push({
+              file: filePath,
+              line: obj.data.line_number,
+              content: lineText.trim().substring(0, 200),
+              match: matchText,
+            });
+          }
+        } catch {
+          // Skip invalid JSON lines
+        }
+      }
+    });
+
+    rg.stderr.on('data', (data: Buffer) => {
+      stderr += data.toString();
+    });
+
+    rg.on('error', () => {
+      // rg not found or other error - fallback to Node.js implementation
+      resolve(null);
+    });
+
+    rg.on('close', (code) => {
+      if (code === 0 || code === 1) { // 0 = matches found, 1 = no matches (both are valid)
+        resolve({
+          success: true,
+          matches: matches.slice(0, maxResults),
+          filesSearched: filesSearched.size,
+        });
+      } else {
+        // rg failed - fallback
+        resolve(null);
+      }
+    });
+  });
 }
 
 export function generateGrepFilesHandler(ctx: FsToolsContext) {
@@ -679,6 +789,43 @@ export function generateGrepFilesHandler(ctx: FsToolsContext) {
       return { error: `Invalid regex: ${err.message}` };
     }
 
+    // Try ripgrep first (10-100x faster)
+    const rgResult = await tryRipgrep(projectRoot, pattern, regex, ignore_case, max_results);
+
+    if (rgResult?.success) {
+      const result: any = {
+        matches: rgResult.matches,
+        files_searched: rgResult.filesSearched,
+        total_matches: rgResult.matches!.length,
+        truncated: rgResult.matches!.length >= max_results,
+        engine: 'ripgrep',
+      };
+
+      // Handle extract_hierarchy
+      if (extract_hierarchy && rgResult.matches!.length > 0) {
+        try {
+          const { BrainManager } = await import('../brain/index.js');
+          const { generateExtractDependencyHierarchyHandler } = await import('./brain-tools.js');
+          const brain = await BrainManager.getInstance();
+
+          const extractHandler = generateExtractDependencyHierarchyHandler({ brain });
+          const hierarchyResult = await extractHandler({
+            results: rgResult.matches,
+            depth: 1,
+            direction: 'both',
+            max_scopes: Math.min(rgResult.matches!.length, 10),
+          });
+
+          result.hierarchy = hierarchyResult;
+        } catch (err: any) {
+          result.hierarchy_error = err.message || 'Brain not available';
+        }
+      }
+
+      return result;
+    }
+
+    // Fallback to Node.js implementation if rg not available
     const regexFlags = ignore_case ? 'gi' : 'g';
     const searchRegex = new RegExp(regex, regexFlags);
 
@@ -690,10 +837,10 @@ export function generateGrepFilesHandler(ctx: FsToolsContext) {
     });
 
     if (files.length === 0) {
-      return { matches: [], files_searched: 0, message: 'No files matched the glob pattern' };
+      return { matches: [], files_searched: 0, message: 'No files matched the glob pattern', engine: 'nodejs' };
     }
 
-    const limit = pLimit(10); // Process 10 files concurrently
+    const limit = pLimit(50); // Increased parallelism for fallback
     const matches: Array<{ file: string; line: number; content: string; match: string }> = [];
     let totalMatches = 0;
 
@@ -732,6 +879,7 @@ export function generateGrepFilesHandler(ctx: FsToolsContext) {
       files_searched: files.length,
       total_matches: matches.length,
       truncated: totalMatches >= max_results,
+      engine: 'nodejs',
     };
 
     // Note: extract_hierarchy is handled by the MCP server wrapper via daemon proxy
@@ -742,7 +890,7 @@ export function generateGrepFilesHandler(ctx: FsToolsContext) {
         const { BrainManager } = await import('../brain/index.js');
         const { generateExtractDependencyHierarchyHandler } = await import('./brain-tools.js');
         const brain = await BrainManager.getInstance();
-        
+
         // Extract hierarchy (ensureProjectSynced is called inside the handler, like brain_search)
         const extractHandler = generateExtractDependencyHierarchyHandler({ brain });
         const hierarchyResult = await extractHandler({
@@ -751,7 +899,7 @@ export function generateGrepFilesHandler(ctx: FsToolsContext) {
           direction: 'both',
           max_scopes: Math.min(matches.length, 10),
         });
-        
+
         result.hierarchy = hierarchyResult;
       } catch (err: any) {
         // If brain is not available, extraction will be handled by MCP wrapper
@@ -763,16 +911,244 @@ export function generateGrepFilesHandler(ctx: FsToolsContext) {
   };
 }
 
+/**
+ * Try to use ugrep with fuzzy search (-Z) - much faster than Node.js Levenshtein
+ * ugrep supports fuzzy matching with Levenshtein distance via -Z option
+ */
+async function tryUgrep(
+  projectRoot: string,
+  pattern: string,
+  keyword: string,
+  threshold: number,
+  maxResults: number
+): Promise<{ success: boolean; matches?: Array<{ file: string; line: number; content: string; matched_word: string; matched_keyword: string; similarity: number }>; filesSearched?: number } | null> {
+  const { spawn } = await import('child_process');
+
+  return new Promise((resolve) => {
+    // Convert threshold to max Levenshtein distance
+    // For a typical keyword length, calculate max allowed edits
+    // threshold 0.7 with 10-char word = max 3 edits (30% of 10)
+    const avgWordLen = Math.max(keyword.length, 5);
+    const maxDistance = Math.max(1, Math.floor((1 - threshold) * avgWordLen));
+
+    // Build ugrep command args
+    const args = [
+      '--json',                      // JSON output for easy parsing
+      `-Z${maxDistance}`,            // Fuzzy search with max distance
+      '-w',                          // Match whole words only
+      '--glob', pattern,             // File pattern
+      '-g', '!node_modules',         // Ignore node_modules
+      '-g', '!.git',                 // Ignore .git
+      '-g', '!dist',                 // Ignore dist
+      '--max-count', String(Math.ceil(maxResults / 5)), // Limit per file
+      '-i',                          // Case insensitive
+      keyword,                       // The keyword to search
+      '.',                           // Search in current directory
+    ];
+
+    const ug = spawn('ugrep', args, {
+      cwd: projectRoot,
+      timeout: 30000, // 30 second timeout
+    });
+
+    let stdout = '';
+    let matches: Array<{ file: string; line: number; content: string; matched_word: string; matched_keyword: string; similarity: number }> = [];
+    let filesSearched = new Set<string>();
+
+    ug.stdout.on('data', (data: Buffer) => {
+      stdout += data.toString();
+
+      // Parse JSON lines as they come in
+      const lines = stdout.split('\n');
+      stdout = lines.pop() || ''; // Keep incomplete line for next chunk
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const obj = JSON.parse(line);
+          if (obj.type === 'match' && matches.length < maxResults) {
+            const filePath = obj.file || obj.path;
+            filesSearched.add(filePath);
+
+            const lineText = obj.lines || obj.line || '';
+            const matchedWord = obj.match || lineText.trim().split(/\s+/).find((w: string) =>
+              w.toLowerCase().includes(keyword.toLowerCase().substring(0, 3))
+            ) || keyword;
+
+            // Estimate similarity based on match
+            const similarity = Math.max(threshold, 1 - (maxDistance / Math.max(keyword.length, matchedWord.length)));
+
+            matches.push({
+              file: filePath,
+              line: obj.line_number || obj.lnum || 1,
+              content: lineText.trim().substring(0, 200),
+              matched_word: matchedWord,
+              matched_keyword: keyword,
+              similarity: Math.round(similarity * 100) / 100,
+            });
+          }
+        } catch {
+          // Skip invalid JSON lines
+        }
+      }
+    });
+
+    ug.on('error', () => {
+      // ugrep not found or other error - fallback to Node.js implementation
+      resolve(null);
+    });
+
+    ug.on('close', (code) => {
+      if (code === 0 || code === 1) { // 0 = matches found, 1 = no matches
+        resolve({
+          success: true,
+          matches: matches.slice(0, maxResults),
+          filesSearched: filesSearched.size,
+        });
+      } else {
+        // ugrep failed - fallback
+        resolve(null);
+      }
+    });
+  });
+}
+
+/**
+ * Try ugrep for all keywords and merge results
+ */
+async function tryUgrepMultiKeyword(
+  projectRoot: string,
+  pattern: string,
+  keywords: string[],
+  matchMode: 'all' | 'any',
+  threshold: number,
+  maxResults: number
+): Promise<{ success: boolean; matches?: Array<{ file: string; line: number; content: string; matched_word: string; matched_keyword: string; similarity: number }>; filesSearched?: number; filesWithAllKeywords?: number } | null> {
+  // Run ugrep for each keyword in parallel
+  const results = await Promise.all(
+    keywords.map(keyword => tryUgrep(projectRoot, pattern, keyword, threshold, maxResults))
+  );
+
+  // Check if all succeeded
+  if (results.some(r => r === null)) {
+    return null; // Fallback to Node.js
+  }
+
+  // Merge results
+  const allMatches: Array<{ file: string; line: number; content: string; matched_word: string; matched_keyword: string; similarity: number }> = [];
+  const filesWithKeywords = new Map<string, Set<string>>();
+  const allFilesSearched = new Set<string>();
+
+  for (let i = 0; i < results.length; i++) {
+    const result = results[i]!;
+    const keyword = keywords[i];
+
+    for (const match of result.matches || []) {
+      allMatches.push(match);
+      allFilesSearched.add(match.file);
+
+      if (!filesWithKeywords.has(match.file)) {
+        filesWithKeywords.set(match.file, new Set());
+      }
+      filesWithKeywords.get(match.file)!.add(keyword);
+    }
+  }
+
+  // Filter by match mode
+  let finalMatches = allMatches;
+  if (matchMode === 'all') {
+    const filesWithAll = new Set(
+      Array.from(filesWithKeywords.entries())
+        .filter(([_, kws]) => kws.size === keywords.length)
+        .map(([file]) => file)
+    );
+    finalMatches = allMatches.filter(m => filesWithAll.has(m.file));
+  }
+
+  // Sort by similarity
+  finalMatches.sort((a, b) => b.similarity - a.similarity);
+
+  // Count files with all keywords
+  const filesWithAllCount = Array.from(filesWithKeywords.values())
+    .filter(kws => kws.size === keywords.length).length;
+
+  return {
+    success: true,
+    matches: finalMatches.slice(0, maxResults),
+    filesSearched: allFilesSearched.size,
+    filesWithAllKeywords: filesWithAllCount,
+  };
+}
+
 export function generateSearchFilesHandler(ctx: FsToolsContext) {
-  return async (params: { pattern: string; query: string; threshold?: number; max_results?: number; extract_hierarchy?: boolean }) => {
+  return async (params: {
+    pattern: string;
+    keywords: string[];
+    match_mode?: 'all' | 'any';
+    threshold?: number;
+    max_results?: number;
+    extract_hierarchy?: boolean
+  }) => {
     const fs = await import('fs/promises');
     const { glob } = await import('glob');
 
     const projectRoot = getProjectRoot(ctx) || process.cwd();
 
-    const { pattern, query, threshold = 0.7, max_results = 50, extract_hierarchy = false } = params;
-    const queryLower = query.toLowerCase();
-    const queryLen = query.length;
+    const { pattern, keywords, match_mode = 'any', threshold = 0.7, max_results = 50, extract_hierarchy = false } = params;
+
+    // Try ugrep first (much faster with built-in fuzzy search)
+    const ugrepResult = await tryUgrepMultiKeyword(projectRoot, pattern, keywords, match_mode, threshold, max_results);
+
+    if (ugrepResult?.success) {
+      const result: any = {
+        keywords,
+        match_mode,
+        threshold,
+        matches: ugrepResult.matches,
+        files_searched: ugrepResult.filesSearched,
+        files_with_matches: new Set(ugrepResult.matches?.map(m => m.file)).size,
+        files_with_all_keywords: ugrepResult.filesWithAllKeywords,
+        total_matches: ugrepResult.matches!.length,
+        truncated: ugrepResult.matches!.length >= max_results,
+        engine: 'ugrep',
+      };
+
+      // Handle extract_hierarchy for ugrep results
+      if (extract_hierarchy && ugrepResult.matches!.length > 0) {
+        try {
+          const { BrainManager } = await import('../brain/index.js');
+          const { generateExtractDependencyHierarchyHandler } = await import('./brain-tools.js');
+          const brain = await BrainManager.getInstance();
+
+          const extractHandler = generateExtractDependencyHierarchyHandler({ brain });
+          const hierarchyResult = await extractHandler({
+            results: ugrepResult.matches!.map(m => ({
+              file: m.file,
+              line: m.line,
+              content: m.content,
+              match: m.matched_word,
+            })),
+            depth: 1,
+            direction: 'both',
+            max_scopes: Math.min(ugrepResult.matches!.length, 10),
+          });
+
+          result.hierarchy = hierarchyResult;
+        } catch (err: any) {
+          result.hierarchy_error = err.message || 'Brain not available';
+        }
+      }
+
+      return result;
+    }
+
+    // Fallback to Node.js implementation if ugrep not available
+    // Normalize keywords
+    const normalizedKeywords = keywords.map(k => ({
+      original: k,
+      lower: k.toLowerCase(),
+      len: k.length,
+    }));
 
     // Get files matching glob
     const files = await glob(pattern, {
@@ -782,44 +1158,65 @@ export function generateSearchFilesHandler(ctx: FsToolsContext) {
     });
 
     if (files.length === 0) {
-      return { matches: [], files_searched: 0, message: 'No files matched the glob pattern' };
+      return { matches: [], files_searched: 0, message: 'No files matched the glob pattern', engine: 'nodejs' };
     }
 
-    const limit = pLimit(10);
-    const matches: Array<{ file: string; line: number; content: string; matched_word: string; similarity: number }> = [];
+    const limit = pLimit(50); // Increased parallelism for fallback
+
+    // Track matches per file for "all" mode
+    type FileMatch = {
+      file: string;
+      line: number;
+      content: string;
+      matched_word: string;
+      matched_keyword: string;
+      similarity: number;
+    };
+    const allFileMatches: Map<string, { matches: FileMatch[]; keywordsFound: Set<string> }> = new Map();
 
     const searchFile = async (file: string) => {
-      if (matches.length >= max_results) return;
-
       const filePath = path.join(projectRoot, file);
       try {
         const content = await fs.readFile(filePath, 'utf-8');
         const lines = content.split('\n');
 
-        for (let i = 0; i < lines.length && matches.length < max_results; i++) {
+        const fileData: { matches: FileMatch[]; keywordsFound: Set<string> } = {
+          matches: [],
+          keywordsFound: new Set(),
+        };
+
+        for (let i = 0; i < lines.length; i++) {
           const line = lines[i];
-          // Extract words from line
+          // Extract words from line (min 3 chars)
           const words = line.match(/\b\w{3,}\b/g) || [];
 
           for (const word of words) {
-            if (matches.length >= max_results) break;
-
             const wordLower = word.toLowerCase();
-            const maxLen = Math.max(queryLen, word.length);
-            const distance = levenshtein(queryLower, wordLower);
-            const similarity = 1 - distance / maxLen;
 
-            if (similarity >= threshold) {
-              matches.push({
-                file,
-                line: i + 1,
-                content: line.trim().substring(0, 200),
-                matched_word: word,
-                similarity: Math.round(similarity * 100) / 100,
-              });
-              break; // One match per line
+            // Check against each keyword
+            for (const keyword of normalizedKeywords) {
+              const maxLen = Math.max(keyword.len, word.length);
+              const distance = levenshtein(keyword.lower, wordLower);
+              const similarity = 1 - distance / maxLen;
+
+              if (similarity >= threshold) {
+                fileData.keywordsFound.add(keyword.original);
+                fileData.matches.push({
+                  file,
+                  line: i + 1,
+                  content: line.trim().substring(0, 200),
+                  matched_word: word,
+                  matched_keyword: keyword.original,
+                  similarity: Math.round(similarity * 100) / 100,
+                });
+                break; // One keyword match per word
+              }
             }
           }
+        }
+
+        if (fileData.matches.length > 0) {
+          allFileMatches.set(file, fileData);
         }
       } catch {
         // Skip unreadable files
@@ -828,44 +1225,78 @@ export function generateSearchFilesHandler(ctx: FsToolsContext) {
 
     await Promise.all(files.map(file => limit(() => searchFile(file))));
 
-    // Sort by similarity (best first)
-    matches.sort((a, b) => b.similarity - a.similarity);
+    // Filter and collect final matches based on match_mode
+    let finalMatches: FileMatch[] = [];
+
+    if (match_mode === 'all') {
+      // Only include files where ALL keywords were found
+      for (const [file, data] of allFileMatches) {
+        if (data.keywordsFound.size === normalizedKeywords.length) {
+          finalMatches.push(...data.matches);
+        }
+      }
+    } else {
+      // "any" mode - include all matches
+      for (const data of allFileMatches.values()) {
+        finalMatches.push(...data.matches);
+      }
+    }
+
+    // Sort by similarity (best first), then by file for consistency
+    finalMatches.sort((a, b) => {
+      if (b.similarity !== a.similarity) return b.similarity - a.similarity;
+      return a.file.localeCompare(b.file);
+    });
+
+    // Apply max_results limit
+    if (finalMatches.length > max_results) {
+      finalMatches = finalMatches.slice(0, max_results);
+    }
+
+    // Calculate files with all keywords (for stats)
+    const filesWithAllKeywords = Array.from(allFileMatches.entries())
+      .filter(([_, data]) => data.keywordsFound.size === normalizedKeywords.length)
+      .map(([file]) => file);
 
     const result: any = {
-      query,
+      keywords,
+      match_mode,
       threshold,
-      matches,
+      matches: finalMatches,
       files_searched: files.length,
-      total_matches: matches.length,
-      truncated: matches.length >= max_results,
+      files_with_matches: allFileMatches.size,
+      files_with_all_keywords: filesWithAllKeywords.length,
+      total_matches: finalMatches.length,
+      truncated: finalMatches.length >= max_results,
+      engine: 'nodejs', // Fallback engine
     };
 
     // Note: extract_hierarchy is handled by the MCP server wrapper via daemon proxy
     // The daemon handler will automatically start watchers and sync projects (like brain_search)
     // For direct usage (non-MCP), try direct brain access
-    if (extract_hierarchy && matches.length > 0) {
+    if (extract_hierarchy && finalMatches.length > 0) {
       try {
         // Convert matches to format expected by extract_dependency_hierarchy
-        const hierarchyMatches = matches.map(m => ({
+        const hierarchyMatches = finalMatches.map(m => ({
           file: m.file,
           line: m.line,
           content: m.content,
           match: m.matched_word,
         }));
-        
+
         const { BrainManager } = await import('../brain/index.js');
         const { generateExtractDependencyHierarchyHandler } = await import('./brain-tools.js');
         const brain = await BrainManager.getInstance();
-        
+
         // Extract hierarchy (ensureProjectSynced is called inside the handler, like brain_search)
         const extractHandler = generateExtractDependencyHierarchyHandler({ brain });
         const hierarchyResult = await extractHandler({
           results: hierarchyMatches,
           depth: 1,
           direction: 'both',
-          max_scopes: Math.min(matches.length, 10),
+          max_scopes: Math.min(finalMatches.length, 10),
         });
-        
+
         result.hierarchy = hierarchyResult;
       } catch (err: any) {
         // If brain is not available, extraction will be handled by MCP wrapper
