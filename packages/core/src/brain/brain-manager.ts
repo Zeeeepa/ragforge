@@ -2554,9 +2554,9 @@ volumes:
           
           const cypher = `
             CALL db.index.vector.queryNodes($indexName, $requestTopK, $queryEmbedding)
-            YIELD node, score
+            YIELD node AS n, score
             WHERE score >= $minScore ${projectFilter} ${nodeTypeFilter}
-            RETURN node, score
+            RETURN n, score
             ORDER BY score DESC
             LIMIT $limit
           `;
@@ -2571,7 +2571,7 @@ volumes:
           });
 
           for (const record of result.records) {
-            const rawNode = record.get('node').properties;
+            const rawNode = record.get('n').properties;
             const uuid = rawNode.uuid;
             const score = record.get('score');
 

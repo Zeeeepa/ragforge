@@ -3009,8 +3009,27 @@ export class ConversationStorage {
         }
       }
       // Add brain_search handler (wrap to match Record<string, any> signature)
+      // Normalize args: force use_reranking=false (too expensive) and restrict to available projects
       if (brainSearchHandler) {
-        searchHandlers['brain_search'] = (args: Record<string, any>) => brainSearchHandler(args as any);
+        const availableProjectIds = options.availableProjects?.map(p => p.id) || [];
+        console.log('[ConversationStorage] searchCodeFuzzyWithLLM: brain_search handler setup', {
+          availableProjectIds,
+          availableProjects: options.availableProjects,
+        });
+        searchHandlers['brain_search'] = (args: Record<string, any>) => {
+          const normalizedArgs = {
+            ...args,
+            use_reranking: false,
+            // Force projects to available ones (ignore agent's choice if any)
+            ...(availableProjectIds.length > 0 && { projects: availableProjectIds }),
+          };
+          console.log('[ConversationStorage] searchCodeFuzzyWithLLM: brain_search normalized call', {
+            originalArgs: args,
+            normalizedArgs,
+            forcedProjects: availableProjectIds.length > 0 ? availableProjectIds : 'none (search all)',
+          });
+          return brainSearchHandler(normalizedArgs as any);
+        };
       }
 
       // 3. Create tool executor and collect tool results
@@ -3075,7 +3094,9 @@ export class ConversationStorage {
 
 **Available Tools:**
 ${this.brainManager ? `- brain_search: **SEMANTIC SEARCH** - finds conceptually related content using embeddings. Use semantic=true for best results.
-  Example: brain_search({ query: "authentication logic", semantic: true, limit: 20 })
+  **IMPORTANT**: Use boost_keywords to boost specific function/class names you suspect are relevant!
+  Example: brain_search({ query: "how authentication works", semantic: true, limit: 20, boost_keywords: ["auth", "login", "authenticate"] })
+  The boost_keywords use fuzzy matching (Levenshtein) - results containing these keywords get higher scores.
   ${options.availableProjects && options.availableProjects.length > 0 ? `Can search specific projects: brain_search({ query: "...", projects: ["project-id"], semantic: true })` : ''}` : ''}
 - grep_files: Search for **EXACT text patterns** in files (regex supported, powered by ripgrep)
   Example: grep_files({ pattern: "${recommendedPattern}", regex: "handleAuth|authenticate" })
@@ -3098,6 +3119,9 @@ This directory is ${cwdStats.dominantType === 'code' ? 'primarily code files' : 
 
 **Instructions:**
 1. **Use brain_search with semantic=true** for conceptual queries (e.g., "how does authentication work", "error handling logic")
+   - **Always include boost_keywords** with 2-4 terms you extract OR guess from the query
+   - Extract: key nouns, verbs, technical terms from the user's message
+   - Guess: likely function/class names based on the domain (e.g., "auth" → ["authenticate", "login", "session", "token"])
 2. **Use grep_files** for exact patterns (function names, class names, specific strings)
 3. Extract meaningful terms from the user query and search for related concepts
 4. Make 2-4 tool calls in parallel to maximize coverage
