@@ -139,7 +139,7 @@ export async function runClean(options: CleanOptions): Promise<void> {
       project = {
         id: r.get('id'),
         path: r.get('path'),
-        type: r.get('type') || 'ragforge-project',
+        type: r.get('type') || 'quick-ingest',
         lastAccessed: lastAccessed ? (lastAccessed instanceof Date ? lastAccessed : new Date(lastAccessed)) : new Date(),
         nodeCount: r.get('nodeCount')?.toNumber() || 0,
         excluded: r.get('excluded') || false,

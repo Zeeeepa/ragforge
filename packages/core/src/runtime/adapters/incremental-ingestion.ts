@@ -784,6 +784,24 @@ export class IncrementalIngestionManager {
       console.log(`\n⚠️  ${created.length + modified.length} scope(s) marked as dirty - embeddings need regeneration`);
     }
 
+    // Update lineCount for File nodes that don't have it (calculate from max scope endLine)
+    // This ensures all File nodes have lineCount for agent context
+    if (projectId) {
+      try {
+        await this.client.run(`
+          MATCH (f:File {projectId: $projectId})<-[:DEFINED_IN]-(s:Scope)
+          WHERE f.lineCount IS NULL
+          WITH f, max(s.endLine) as maxLine
+          SET f.lineCount = maxLine
+        `, { projectId });
+      } catch (error) {
+        // Non-critical: lineCount is for agent UX, not required
+        if (verbose) {
+          console.log('   Note: Could not update lineCount for some files');
+        }
+      }
+    }
+
     return stats;
   }
 

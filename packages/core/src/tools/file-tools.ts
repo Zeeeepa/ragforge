@@ -231,6 +231,9 @@ export interface FileToolsContext {
   /** Callback after file modification (for re-ingestion)
    * Can return ingestion stats or queue info */
   onFileModified?: (filePath: string, changeType: 'created' | 'updated' | 'deleted') => Promise<any>;
+  /** Callback after file is accessed (read)
+   * Used for touched-files tracking to create File nodes for files outside projects */
+  onFileAccessed?: (filePath: string) => Promise<void>;
   /** Ingestion lock for coordinating with RAG tools (deprecated - lock is now managed by BrainManager) */
   ingestionLock?: IngestionLock;
 }
@@ -309,6 +312,13 @@ export function generateReadFileHandler(ctx: FileToolsContext): (args: any) => P
       output += `\n\n(File has more lines. Use offset=${lastReadLine} to continue. Total: ${totalLines} lines)`;
     } else {
       output += `\n\n(End of file - ${totalLines} lines)`;
+    }
+
+    // Notify touched-files tracker (non-blocking)
+    if (ctx.onFileAccessed) {
+      ctx.onFileAccessed(absolutePath).catch((err: Error) => {
+        console.error('[FileTools] onFileAccessed error:', err.message);
+      });
     }
 
     return {
@@ -399,6 +409,13 @@ export function generateWriteFileHandler(ctx: FileToolsContext): (args: any) => 
     let ingestionStats: any = null;
     if (ctx.onFileModified) {
       ingestionStats = await ctx.onFileModified(absolutePath, changeType);
+    }
+
+    // Notify touched-files tracker (non-blocking)
+    if (ctx.onFileAccessed) {
+      ctx.onFileAccessed(absolutePath).catch((err: Error) => {
+        console.error('[FileTools] onFileAccessed error:', err.message);
+      });
     }
 
     // Generate diff for output
@@ -615,6 +632,13 @@ export function generateEditFileHandler(ctx: FileToolsContext): (args: any) => P
     let ingestionStats: any = null;
     if (ctx.onFileModified) {
       ingestionStats = await ctx.onFileModified(absolutePath, 'updated');
+    }
+
+    // Notify touched-files tracker (non-blocking)
+    if (ctx.onFileAccessed) {
+      ctx.onFileAccessed(absolutePath).catch((err: Error) => {
+        console.error('[FileTools] onFileAccessed error:', err.message);
+      });
     }
 
     // Generate diff

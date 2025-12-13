@@ -24,7 +24,7 @@ export type ProjectStatus = 'active' | 'background' | 'unloading';
 /**
  * Type of project
  */
-export type ProjectType = 'ragforge-project' | 'quick-ingest' | 'external';
+export type ProjectType = 'quick-ingest' | 'external' | 'touched-files';
 
 /**
  * A loaded project with all its resources

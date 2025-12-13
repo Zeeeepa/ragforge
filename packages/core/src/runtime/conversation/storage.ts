@@ -2271,6 +2271,7 @@ export class ConversationStorage {
       score: number;
       charCount: number;
       confidence: number;
+      fileLineCount?: number; // Total lines in file (for agent read strategy)
     }>;
     semanticResults: Array<{
       type: 'turn' | 'summary';
@@ -2447,6 +2448,7 @@ export class ConversationStorage {
       score: number;
       charCount: number;
       confidence: number;
+      fileLineCount?: number; // Total lines in file (for agent read strategy)
     }>;
     semanticResults: Array<{
       type: 'turn' | 'summary';
@@ -2602,12 +2604,12 @@ export class ConversationStorage {
           }
         }
         
-        sections.push(`${pathPrefix}[${displayPath}:${code.startLine}-${code.endLine}] ${code.name} (Relevance: ${(code.score * 100).toFixed(0)}%, Confidence: ${(code.confidence * 100).toFixed(0)}%)`);
-        // Truncate content if too long (max 500 chars for display)
-        const displayContent = code.content.length > 500 
-          ? code.content.substring(0, 500) + '...'
-          : code.content;
-        sections.push(displayContent);
+        // Include full scope content with clear line range for editing
+        // Show file size to help agent decide read strategy (full file vs line range)
+        const fileSizeInfo = code.fileLineCount ? `, File: ${code.fileLineCount} lines` : '';
+        sections.push(`${pathPrefix}[${displayPath}:${code.startLine}-${code.endLine}] ${code.name} (Relevance: ${(code.score * 100).toFixed(0)}%${fileSizeInfo})`);
+        // Full scope content (no truncation - agent needs complete context for accurate edits)
+        sections.push(code.content);
         sections.push('');
       });
     }
@@ -3215,6 +3217,9 @@ This directory is ${cwdStats.dominantType === 'code' ? 'primarily code files' : 
             const startLine = node.startLine || 1;
             const endLine = node.endLine || startLine;
 
+            // Get file line count from brain_search result
+            const fileLineCount = searchResult.fileLineCount;
+
             if (cumulativeChars + charCount > options.maxChars) {
               const remainingChars = options.maxChars - cumulativeChars;
               if (remainingChars > 100) {
@@ -3227,7 +3232,8 @@ This directory is ${cwdStats.dominantType === 'code' ? 'primarily code files' : 
                   content: content.substring(0, remainingChars) + '...',
                   score,
                   charCount: remainingChars,
-                  confidence: 0.5 // Higher confidence for semantic search
+                  confidence: 0.5, // Higher confidence for semantic search
+                  ...(fileLineCount && { fileLineCount })
                 });
               }
               break;
@@ -3242,7 +3248,8 @@ This directory is ${cwdStats.dominantType === 'code' ? 'primarily code files' : 
               content,
               score,
               charCount,
-              confidence: 0.5 // Higher confidence for semantic search
+              confidence: 0.5, // Higher confidence for semantic search
+              ...(fileLineCount && { fileLineCount })
             });
 
             cumulativeChars += charCount;

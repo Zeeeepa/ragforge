@@ -336,9 +336,11 @@ For text search (semantic=false), uses exact text matching (CONTAINS).
 For fuzzy search with typo tolerance on files, use search_files instead.
 
 Example usage:
-- brain_search({ query: "authentication logic", semantic: true })
-- brain_search({ query: "how to parse JSON", types: ["function", "class"], semantic: true })
-- brain_search({ query: "API endpoints", projects: ["my-backend"], semantic: true })`,
+- brain_search({ query: "authentication logic", semantic: true, boost_keywords: ["AuthService", "login", "validateToken"] })
+- brain_search({ query: "how to parse JSON", semantic: true, boost_keywords: ["parseJSON", "JSONParser", "deserialize"] })
+- brain_search({ query: "API endpoints", semantic: true, boost_keywords: ["router", "endpoint", "handleRequest"] })
+
+**Pro tip**: If you know (or can guess) function/class/variable names that would be relevant to the search, add them to boost_keywords. This prioritizes results containing those names - even fuzzy matches work.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -531,11 +533,33 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
       } else {
         const embeddingLock = ctx.brain.getEmbeddingLock();
         const isEmbeddingLocked = embeddingLock.isLocked();
-        log.info('Non-semantic search - skipping embedding lock wait', { 
+        log.info('Non-semantic search - skipping embedding lock wait', {
           embeddingLocked: isEmbeddingLocked,
           canProceedDuringEmbedding: true,
           description: isEmbeddingLocked ? embeddingLock.getDescription() : undefined
         });
+      }
+
+      // Step 4b: Process orphan files in cwd (touched-files outside projects)
+      // Only for semantic search - text search doesn't need embeddings
+      if (params.semantic) {
+        const cwd = process.cwd();
+        const pendingCount = await ctx.brain.countPendingOrphans(cwd);
+        if (pendingCount > 0) {
+          log.info('Processing orphan files in cwd', { cwd, pendingCount });
+          const orphanStart = Date.now();
+          const orphanStats = await ctx.brain.processOrphanFilesInDirectory(cwd, 30000);
+          const orphanDuration = Date.now() - orphanStart;
+          log.info('Orphan files processed', {
+            duration: orphanDuration,
+            parsed: orphanStats.parsed,
+            embedded: orphanStats.embedded,
+            errors: orphanStats.errors
+          });
+          if (orphanStats.parsed > 0 || orphanStats.embedded > 0) {
+            waitedForSync = true;
+          }
+        }
       }
 
       log.info('Step 5: Executing search');
@@ -1559,7 +1583,7 @@ Shows all knowledge sources the agent knows about:
 
 Includes:
 - Project ID and path
-- Type (ragforge-project, quick-ingest, web-crawl)
+- Type (quick-ingest, touched-files, web-crawl)
 - Last access time
 - Node count
 

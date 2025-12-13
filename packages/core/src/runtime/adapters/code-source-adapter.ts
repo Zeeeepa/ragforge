@@ -1056,6 +1056,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           contentHash,
           ...(rawContentHash && { rawContentHash }),
           ...(mtime && { mtime }),
+          ...(analysis.totalLines && { lineCount: analysis.totalLines }),
         }
       });
 

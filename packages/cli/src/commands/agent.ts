@@ -223,7 +223,7 @@ async function loadProjectIntoContext(
     const loadedProject: LoadedProject = {
       id: projectId,
       path: projectPath,
-      type: 'ragforge-project',
+      type: 'quick-ingest',
       config,
       neo4jClient,
       ragClient,

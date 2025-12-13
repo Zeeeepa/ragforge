@@ -13,6 +13,9 @@ import { StructuredLLMExecutor } from '../runtime/llm/structured-llm-executor.js
 import type { LLMProvider } from '../runtime/reranking/llm-provider.js';
 import type { ToolCallRequest, ToolExecutionResult } from '../runtime/llm/structured-llm-executor.js';
 import { normalizeTimestamp } from '../runtime/utils/timestamp.js';
+import * as fs from 'fs/promises';
+import * as path from 'path';
+import * as os from 'os';
 
 // ============================================
 // Types
@@ -445,52 +448,84 @@ export function generateAgentToolHandlers(
             return lines.slice(start, end).join('\n');
           };
 
-          // Build result object
+          // Create output directory for files
+          const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+          const debugDir = path.join(os.homedir(), '.ragforge', 'debug', `extract_${timestamp}`);
+          await fs.mkdir(debugDir, { recursive: true });
+
+          // Build result object with file paths
           const result: any = {
             iteration: i,
+            output_dir: debugDir,
+            files: {},
           };
 
-          // Add prompt if requested
+          // Write prompt to file if requested
           if (return_prompt) {
             const fullPrompt = capturedPrompts[i].prompt;
-            result.prompt = extractLines(fullPrompt, prompt_start_line, prompt_end_line);
-            result.prompt_full_length = fullPrompt.split('\n').length;
-            if (prompt_start_line !== undefined || prompt_end_line !== undefined) {
-              result.prompt_extracted_lines = `${prompt_start_line ?? 1}-${prompt_end_line ?? result.prompt_full_length}`;
+            const promptContent = extractLines(fullPrompt, prompt_start_line, prompt_end_line);
+
+            // Write full prompt
+            const promptFile = path.join(debugDir, 'prompt.txt');
+            await fs.writeFile(promptFile, promptContent, 'utf-8');
+            result.files.prompt = promptFile;
+            result.prompt_lines = fullPrompt.split('\n').length;
+
+            // Write enriched context separately if present
+            const enrichedCtx = capturedPrompts[i].enrichedContext;
+            if (enrichedCtx) {
+              const contextFile = path.join(debugDir, 'enriched_context.txt');
+              await fs.writeFile(contextFile, enrichedCtx, 'utf-8');
+              result.files.enriched_context = contextFile;
             }
-            // Also include context info
-            result.systemPrompt = capturedPrompts[i].systemPrompt;
-            result.enrichedContext = capturedPrompts[i].enrichedContext; // Semantic/fuzzy search results
-            result.userTask = capturedPrompts[i].userTask;
-            result.inputFields = capturedPrompts[i].inputFields;
-            result.item = capturedPrompts[i].item;
-            result.toolContext = capturedPrompts[i].toolContext;
+
+            // Write metadata
+            const metadata = {
+              iteration: i,
+              userTask: capturedPrompts[i].userTask,
+              inputFields: capturedPrompts[i].inputFields,
+              item: capturedPrompts[i].item,
+              toolContext: capturedPrompts[i].toolContext,
+              prompt_lines: fullPrompt.split('\n').length,
+              enriched_context_chars: capturedPrompts[i].enrichedContext?.length || 0,
+            };
+            const metadataFile = path.join(debugDir, 'metadata.json');
+            await fs.writeFile(metadataFile, JSON.stringify(metadata, null, 2), 'utf-8');
+            result.files.metadata = metadataFile;
           }
 
           // Call LLM to get the response (but we won't execute tools)
           if (return_response) {
             const requestId = `extract-agent-prompt-iter${iteration}-response-${Date.now()}`;
             const response = await llmProvider.generateContent(prompt, requestId);
-            
+
             // Parse response to extract tool calls (for information, but we won't execute them)
             const parsed = (executor as any).parseSingleResponse(response, outputSchema, 'xml');
             const toolCalls = (parsed as any).tool_calls as ToolCallRequest[] | undefined;
             const validToolCalls = (executor as any).filterValidToolCalls(toolCalls);
 
-            // Extract lines from response if requested
+            // Write raw response to file
             const fullResponse = response;
-            result.rawResponse = extractLines(fullResponse, response_start_line, response_end_line);
-            result.response_full_length = fullResponse.split('\n').length;
-            if (response_start_line !== undefined || response_end_line !== undefined) {
-              result.response_extracted_lines = `${response_start_line ?? 1}-${response_end_line ?? result.response_full_length}`;
-            }
-            result.parsedResponse = parsed;
-            result.wouldCallTools = validToolCalls.map((tc: ToolCallRequest) => ({
-              tool_name: tc.tool_name,
-              arguments: tc.arguments,
-            }));
+            const responseContent = extractLines(fullResponse, response_start_line, response_end_line);
+            const responseFile = path.join(debugDir, 'response.txt');
+            await fs.writeFile(responseFile, responseContent, 'utf-8');
+            result.files.response = responseFile;
+            result.response_lines = fullResponse.split('\n').length;
+
+            // Write parsed response and tool calls
+            const parsedFile = path.join(debugDir, 'parsed_response.json');
+            await fs.writeFile(parsedFile, JSON.stringify({
+              parsed,
+              wouldCallTools: validToolCalls.map((tc: ToolCallRequest) => ({
+                tool_name: tc.tool_name,
+                arguments: tc.arguments,
+              })),
+            }, null, 2), 'utf-8');
+            result.files.parsed_response = parsedFile;
+            result.would_call_tools_count = validToolCalls.length;
           }
 
+          console.log(`[extract_agent_prompt] Results written to: ${debugDir}`);
           return result;
         }
 

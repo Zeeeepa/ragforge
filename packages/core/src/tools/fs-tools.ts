@@ -15,6 +15,53 @@ import pLimit from 'p-limit';
 import { rgPath } from '@vscode/ripgrep';
 
 // ============================================
+// File Line Count Cache (in-memory, TTL-based)
+// ============================================
+
+interface CachedLineCount {
+  lineCount: number;
+  mtime: number; // File modification time for invalidation
+  cachedAt: number;
+}
+
+const fileLineCountCache = new Map<string, CachedLineCount>();
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+async function getFileLineCount(filePath: string, fs: typeof import('fs/promises')): Promise<number | undefined> {
+  try {
+    const stats = await fs.stat(filePath);
+    const mtime = stats.mtimeMs;
+    const now = Date.now();
+
+    // Check cache
+    const cached = fileLineCountCache.get(filePath);
+    if (cached && cached.mtime === mtime && (now - cached.cachedAt) < CACHE_TTL_MS) {
+      return cached.lineCount;
+    }
+
+    // Read and count lines
+    const content = await fs.readFile(filePath, 'utf-8');
+    const lineCount = content.split('\n').length;
+
+    // Cache result
+    fileLineCountCache.set(filePath, { lineCount, mtime, cachedAt: now });
+
+    // Cleanup old entries (max 500 files in cache)
+    if (fileLineCountCache.size > 500) {
+      const entries = [...fileLineCountCache.entries()];
+      entries.sort((a, b) => a[1].cachedAt - b[1].cachedAt);
+      for (let i = 0; i < 100; i++) {
+        fileLineCountCache.delete(entries[i][0]);
+      }
+    }
+
+    return lineCount;
+  } catch {
+    return undefined;
+  }
+}
+
+// ============================================
 // Types
 // ============================================
 
@@ -575,17 +622,18 @@ export function generateGrepFilesTool(): GeneratedToolDefinition {
     description: `Search file contents using regex pattern.
 
 Searches within files matching a glob pattern.
-Returns matching lines with file path and line numbers.
+Returns matching lines with file path, line numbers, and file size (total lines).
 
 Parameters:
 - pattern: Glob pattern to filter files (e.g., "**/*.ts", "src/**/*.js")
 - regex: Regular expression to search for in file contents
 - ignore_case: Case insensitive search (default: false)
+- context_lines: Number of lines to show before/after each match (default: 0, max: 5)
 - max_results: Maximum number of matches to return (default: 100)
 - extract_hierarchy: Extract dependency hierarchy for results (default: false). Requires brain to be available.
 
 Example: grep_files({ pattern: "**/*.ts", regex: "function.*Handler" })
-Example: grep_files({ pattern: "src/**/*.js", regex: "TODO|FIXME", ignore_case: true })
+Example: grep_files({ pattern: "src/**/*.js", regex: "TODO|FIXME", ignore_case: true, context_lines: 3 })
 Example: grep_files({ pattern: "**/*.ts", regex: "export function", extract_hierarchy: true })`,
     inputSchema: {
       type: 'object',
@@ -601,6 +649,10 @@ Example: grep_files({ pattern: "**/*.ts", regex: "export function", extract_hier
         ignore_case: {
           type: 'boolean',
           description: 'Case insensitive search (default: false)',
+        },
+        context_lines: {
+          type: 'number',
+          description: 'Lines of context before/after each match (default: 0, max: 5)',
         },
         max_results: {
           type: 'number',
@@ -683,8 +735,9 @@ async function tryRipgrep(
   pattern: string,
   regex: string,
   ignoreCase: boolean,
-  maxResults: number
-): Promise<{ success: boolean; matches?: Array<{ file: string; line: number; content: string; match: string }>; filesSearched?: number } | null> {
+  maxResults: number,
+  contextLines: number = 0
+): Promise<{ success: boolean; matches?: Array<{ file: string; line: number; content: string; match: string; context_before?: string[]; context_after?: string[] }>; filesSearched?: number } | null> {
   const { spawn } = await import('child_process');
 
   return new Promise((resolve) => {
@@ -703,6 +756,12 @@ async function tryRipgrep(
       args.push('-i');
     }
 
+    // Add context lines if requested (max 5)
+    if (contextLines > 0) {
+      const ctx = Math.min(contextLines, 5);
+      args.push('-C', String(ctx));
+    }
+
     args.push(regex);  // The pattern to search
     args.push('.');    // Search in current directory
 
@@ -713,8 +772,12 @@ async function tryRipgrep(
 
     let stdout = '';
     let stderr = '';
-    let matches: Array<{ file: string; line: number; content: string; match: string }> = [];
+    let matches: Array<{ file: string; line: number; content: string; match: string; context_before?: string[]; context_after?: string[] }> = [];
     let filesSearched = new Set<string>();
+
+    // For context tracking: collect lines around matches
+    let pendingContextBefore: Array<{ file: string; line: number; text: string }> = [];
+    let lastMatch: { file: string; line: number; content: string; match: string; context_before?: string[]; context_after?: string[] } | null = null;
 
     rg.stdout.on('data', (data: Buffer) => {
       stdout += data.toString();
@@ -727,7 +790,24 @@ async function tryRipgrep(
         if (!line.trim()) continue;
         try {
           const obj = JSON.parse(line);
-          if (obj.type === 'match' && matches.length < maxResults) {
+
+          if (obj.type === 'context') {
+            // Context line (before or after a match)
+            const filePath = obj.data.path.text;
+            const lineNum = obj.data.line_number;
+            const lineText = obj.data.lines?.text?.trim() || '';
+
+            if (lastMatch && lastMatch.file === filePath && lineNum > lastMatch.line) {
+              // This is context AFTER the last match
+              if (!lastMatch.context_after) lastMatch.context_after = [];
+              lastMatch.context_after.push(`${lineNum}: ${lineText.substring(0, 150)}`);
+            } else {
+              // This is context BEFORE a future match
+              pendingContextBefore.push({ file: filePath, line: lineNum, text: lineText });
+              // Keep only recent context lines (max 5)
+              if (pendingContextBefore.length > 5) pendingContextBefore.shift();
+            }
+          } else if (obj.type === 'match' && matches.length < maxResults) {
             const filePath = obj.data.path.text;
             filesSearched.add(filePath);
 
@@ -735,13 +815,24 @@ async function tryRipgrep(
             const lineText = obj.data.lines?.text || '';
             const submatches = obj.data.submatches || [];
             const matchText = submatches.length > 0 ? submatches[0].match.text : '';
+            const lineNum = obj.data.line_number;
 
-            matches.push({
+            // Collect context before (from same file, recent lines)
+            const contextBefore = pendingContextBefore
+              .filter(c => c.file === filePath && c.line < lineNum)
+              .map(c => `${c.line}: ${c.text.substring(0, 150)}`);
+
+            lastMatch = {
               file: filePath,
-              line: obj.data.line_number,
+              line: lineNum,
               content: lineText.trim().substring(0, 200),
               match: matchText,
-            });
+              ...(contextBefore.length > 0 && { context_before: contextBefore }),
+            };
+            matches.push(lastMatch);
+
+            // Clear pending context for this file
+            pendingContextBefore = pendingContextBefore.filter(c => c.file !== filePath);
           }
         } catch {
           // Skip invalid JSON lines
@@ -774,13 +865,13 @@ async function tryRipgrep(
 }
 
 export function generateGrepFilesHandler(ctx: FsToolsContext) {
-  return async (params: { pattern: string; regex: string; ignore_case?: boolean; max_results?: number; extract_hierarchy?: boolean }) => {
+  return async (params: { pattern: string; regex: string; ignore_case?: boolean; context_lines?: number; max_results?: number; extract_hierarchy?: boolean }) => {
     const fs = await import('fs/promises');
     const { glob } = await import('glob');
 
     const projectRoot = getProjectRoot(ctx) || process.cwd();
 
-    const { pattern, regex, ignore_case = false, max_results = 100, extract_hierarchy = false } = params;
+    const { pattern, regex, ignore_case = false, context_lines = 0, max_results = 100, extract_hierarchy = false } = params;
 
     try {
       // Validate regex
@@ -790,19 +881,39 @@ export function generateGrepFilesHandler(ctx: FsToolsContext) {
     }
 
     // Try ripgrep first (10-100x faster)
-    const rgResult = await tryRipgrep(projectRoot, pattern, regex, ignore_case, max_results);
+    const rgResult = await tryRipgrep(projectRoot, pattern, regex, ignore_case, max_results, context_lines);
 
     if (rgResult?.success) {
+      // Enrich matches with totalLines (file size) - uses cache
+      const uniqueFiles = [...new Set(rgResult.matches!.map(m => m.file))];
+      const fileLineCounts = new Map<string, number | undefined>();
+
+      // Count lines in matched files (parallel, limited, cached)
+      const limitLineCount = pLimit(10);
+      await Promise.all(uniqueFiles.map(file => limitLineCount(async () => {
+        const filePath = path.join(projectRoot, file);
+        const lineCount = await getFileLineCount(filePath, fs);
+        if (lineCount !== undefined) {
+          fileLineCounts.set(file, lineCount);
+        }
+      })));
+
+      // Add totalLines to each match
+      const enrichedMatches = rgResult.matches!.map(m => ({
+        ...m,
+        totalLines: fileLineCounts.get(m.file),
+      }));
+
       const result: any = {
-        matches: rgResult.matches,
+        matches: enrichedMatches,
         files_searched: rgResult.filesSearched,
-        total_matches: rgResult.matches!.length,
-        truncated: rgResult.matches!.length >= max_results,
+        total_matches: enrichedMatches.length,
+        truncated: enrichedMatches.length >= max_results,
         engine: 'ripgrep',
       };
 
       // Handle extract_hierarchy
-      if (extract_hierarchy && rgResult.matches!.length > 0) {
+      if (extract_hierarchy && enrichedMatches.length > 0) {
         try {
           const { BrainManager } = await import('../brain/index.js');
           const { generateExtractDependencyHierarchyHandler } = await import('./brain-tools.js');
@@ -810,10 +921,10 @@ export function generateGrepFilesHandler(ctx: FsToolsContext) {
 
           const extractHandler = generateExtractDependencyHierarchyHandler({ brain });
           const hierarchyResult = await extractHandler({
-            results: rgResult.matches,
+            results: enrichedMatches,
             depth: 1,
             direction: 'both',
-            max_scopes: Math.min(rgResult.matches!.length, 10),
+            max_scopes: Math.min(enrichedMatches.length, 10),
           });
 
           result.hierarchy = hierarchyResult;
@@ -841,30 +952,56 @@ export function generateGrepFilesHandler(ctx: FsToolsContext) {
     }
 
     const limit = pLimit(50); // Increased parallelism for fallback
-    const matches: Array<{ file: string; line: number; content: string; match: string }> = [];
-    let totalMatches = 0;
+    const matches: Array<{ file: string; line: number; content: string; match: string; totalLines?: number; context_before?: string[]; context_after?: string[] }> = [];
+    let totalMatchCount = 0;
+    const ctxLines = Math.min(context_lines, 5);
 
     const searchFile = async (file: string) => {
-      if (totalMatches >= max_results) return;
+      if (totalMatchCount >= max_results) return;
 
       const filePath = path.join(projectRoot, file);
       try {
         const content = await fs.readFile(filePath, 'utf-8');
         const lines = content.split('\n');
+        const totalLines = lines.length;
 
-        for (let i = 0; i < lines.length && totalMatches < max_results; i++) {
+        // Cache the line count
+        const stats = await fs.stat(filePath);
+        fileLineCountCache.set(filePath, { lineCount: totalLines, mtime: stats.mtimeMs, cachedAt: Date.now() });
+
+        for (let i = 0; i < lines.length && totalMatchCount < max_results; i++) {
           const line = lines[i];
           searchRegex.lastIndex = 0; // Reset regex state
           const match = searchRegex.exec(line);
 
           if (match) {
-            matches.push({
+            const result: typeof matches[0] = {
               file,
               line: i + 1,
               content: line.trim().substring(0, 200),
               match: match[0],
-            });
-            totalMatches++;
+              totalLines,
+            };
+
+            // Add context lines if requested
+            if (ctxLines > 0) {
+              const beforeStart = Math.max(0, i - ctxLines);
+              const afterEnd = Math.min(lines.length - 1, i + ctxLines);
+
+              if (beforeStart < i) {
+                result.context_before = lines.slice(beforeStart, i).map((l, idx) =>
+                  `${beforeStart + idx + 1}: ${l.trim().substring(0, 150)}`
+                );
+              }
+              if (afterEnd > i) {
+                result.context_after = lines.slice(i + 1, afterEnd + 1).map((l, idx) =>
+                  `${i + 2 + idx}: ${l.trim().substring(0, 150)}`
+                );
+              }
+            }
+
+            matches.push(result);
+            totalMatchCount++;
           }
         }
       } catch {
@@ -878,7 +1015,7 @@ export function generateGrepFilesHandler(ctx: FsToolsContext) {
       matches,
       files_searched: files.length,
       total_matches: matches.length,
-      truncated: totalMatches >= max_results,
+      truncated: totalMatchCount >= max_results,
       engine: 'nodejs',
     };
 

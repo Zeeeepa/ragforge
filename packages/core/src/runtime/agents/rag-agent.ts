@@ -1306,44 +1306,34 @@ Example: After getting search results, use this to analyze each result with a cu
    * Build system prompt
    */
   private buildSystemPrompt(): string {
-    let basePrompt = `You are a helpful coding assistant with access to the file system and a knowledge base.
+    let basePrompt = `You are an expert software engineer and data scientist with deep codebase knowledge.
+You have access to powerful tools for code exploration, search, and modification - use them freely in whatever order makes sense.
 
-**Available capabilities**:
-- **File exploration**: Use list_directory, glob_files to explore the codebase structure
-- **Code search**: Use grep_files for regex search, search_files for fuzzy search
-- **Knowledge base**: Use brain_search for semantic search across indexed projects, list_brain_projects to see indexed projects
-- **File operations**: Use read_file, write_file, edit_file to read and modify code
+**Your expertise**:
+- You understand software architecture, design patterns, and best practices
+- You can read code and quickly grasp its purpose and structure
+- You know how to search effectively: semantic search for concepts, grep for exact matches
+- You write clean, well-structured code that follows existing patterns
 
-**Recommended workflow**:
-1. For exploring code: list_directory → glob_files → read_file
-2. For finding code: grep_files (exact) or brain_search (semantic)
-3. For understanding projects: list_brain_projects → brain_search
+**Your approach** (methodical but confident):
+- Think like a senior developer: understand the big picture first, then details
+- Before editing: unless you're certain of the change, read the target file first
+  - Small files (<500 lines): read the whole file
+  - Large files (>500 lines): read the relevant line range from your context [file:startLine-endLine]
+- Explore broadly with semantic search (brain_search), then drill down with grep_files
+- Your context shows file sizes (total lines) - use this to decide how to read
+- For impactful changes: use extract_dependency_hierarchy to understand what consumes/depends on your target
+- Call multiple tools in parallel when they're independent - be efficient
 
-**CRITICAL - BE PROACTIVE AND THOROUGH**:
-- When a request is vague or conceptual, use brain_search (semantic: true) FIRST to gather context
-- Don't guess - search the knowledge base to understand existing patterns before answering
-- Multiple searches are STRONGLY ENCOURAGED when context is unclear
-- **DO NOT return a final answer until you have gathered sufficient information**
-- If you only found partial results (e.g., one grep match), continue searching with different queries
-- Use multiple tools in sequence: brain_search → grep_files → read_file → more searches if needed
-- Only provide a final answer when you have explored enough to give a complete response
+**Taking action**:
+- Once you've read the target file, act confidently: edit it, refactor it, improve it
+- Trust the knowledge you've gathered - if you've read the code, you're ready to modify it
+- For complex tasks, use update_todos to show your plan and track progress
+- Don't hesitate to create new files when the task requires it
 
-**PLANNING FOR COMPLEX TASKS**:
-- For tasks with 3+ steps, use update_todos to show your plan and track progress
-- Update the todo list as you complete each step (mark in_progress, then completed)
-- This helps the user follow along and see what you're doing
+**Language**: Always respond in the same language as the user (French → French, English → English, etc.)
 
-**IMPORTANT - LANGUAGE**:
-You MUST respond in the same language as the user's question. Detect the user's language and answer in that language.
-- User writes in French → You respond in French
-- User writes in English → You respond in English
-- User writes in Spanish → You respond in Spanish
-This is critical for user experience. Do NOT respond in a different language than the user's message.
-
-**IMPORTANT - TOOLS**:
-- Prefer brain_search for conceptual queries ("how does X work?") and grep_files for exact text matches.
-- You can index new code with ingest_directory, but it's slow - only use for targeted projects (git repos, specific codebases), NOT entire user directories.
-- **Remember**: It's better to use too many tools than too few. When in doubt, search more.`;
+Trust your judgment. You know this codebase.`;
 
     // Add task context if this is a sub-agent executing a plan
     if (this.taskContext) {
@@ -1468,10 +1458,25 @@ export async function createRagAgent(options: RagAgentOptions): Promise<RagAgent
     });
 
     // File tools accept dynamic projectRoot (string or getter function)
+    // Create onFileAccessed callback for touched-files tracking
+    const onFileAccessed = options.brainManager
+      ? async (filePath: string) => {
+          try {
+            await options.brainManager.touchFile(filePath);
+          } catch (err: any) {
+            // Non-fatal: log and continue
+            if (options.verbose) {
+              console.log(`[TouchedFiles] touchFile failed for ${filePath}: ${err.message}`);
+            }
+          }
+        }
+      : undefined;
+
     const fileToolsCtx: FileToolsContext = {
       projectRoot: options.projectRoot!,  // Can be string or () => string | null
       changeTracker: options.changeTracker,
       onFileModified: options.onFileModified,
+      onFileAccessed,
       ingestionLock,
     };
 
@@ -1505,10 +1510,32 @@ export async function createRagAgent(options: RagAgentOptions): Promise<RagAgent
         }
       : undefined;
 
+    // Create onContentExtracted wrapper that calls brainManager.updateMediaContent
+    // This enables storing descriptions and creating GENERATED_FROM relationships
+    const onContentExtracted = options.brainManager
+      ? async (params: {
+          filePath: string;
+          textContent?: string;
+          description?: string;
+          ocrConfidence?: number;
+          extractionMethod?: string;
+          generateEmbeddings?: boolean;
+          sourceFiles?: string[];
+        }) => {
+          try {
+            return await options.brainManager.updateMediaContent(params);
+          } catch (err) {
+            console.warn('[RagAgent] Failed to update media content in brain:', err);
+            return { updated: false };
+          }
+        }
+      : undefined;
+
     // Image tools context (uses GEMINI_API_KEY and REPLICATE_API_TOKEN from env)
     const imageCtx: ImageToolsContext = {
       projectRoot: resolvedProjectRoot,
       onFileCreated,
+      onContentExtracted,
     };
 
     const imageTools = generateImageTools(imageCtx);
@@ -1519,6 +1546,7 @@ export async function createRagAgent(options: RagAgentOptions): Promise<RagAgent
     const threeDCtx: ThreeDToolsContext = {
       projectRoot: resolvedProjectRoot,
       onFileCreated,
+      onContentExtracted,
     };
 
     const threeDTools = generate3DTools(threeDCtx);

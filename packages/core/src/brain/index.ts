@@ -40,3 +40,11 @@ export {
   type RenderAndAnalyzeOptions,
   type RenderAndAnalyzeResult,
 } from './threed-service.js';
+
+export {
+  TouchedFilesWatcher,
+  type TouchedFilesWatcherConfig,
+  type ProcessingStats,
+  type OrphanFile,
+  type OrphanFileState,
+} from './touched-files-watcher.js';

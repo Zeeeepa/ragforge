@@ -31,6 +31,7 @@ import { UniversalSourceAdapter } from '../runtime/adapters/universal-source-ada
 import type { ParseResult } from '../runtime/adapters/types.js';
 import { formatLocalDate } from '../runtime/utils/timestamp.js';
 import { EmbeddingService, MULTI_EMBED_CONFIGS } from './embedding-service.js';
+import { TouchedFilesWatcher, type ProcessingStats as TouchedFilesStats } from './touched-files-watcher.js';
 import { CONTENT_NODE_LABELS } from '../utils/node-schema.js';
 import { computeSchemaHash } from '../utils/schema-version.js';
 import { FileWatcher, type FileWatcherConfig } from '../runtime/adapters/file-watcher.js';
@@ -267,6 +268,8 @@ export interface BrainSearchResult {
   projectPath: string;
   projectType: string;
   filePath: string; // Absolute path to the file (projectPath + "/" + node.file)
+  /** Total line count of the file (for agent context - helps decide read strategy) */
+  fileLineCount?: number;
   /** For chunked content matches: the range in the parent node where the match occurred */
   matchedRange?: {
     startLine: number;
@@ -340,6 +343,7 @@ export class BrainManager {
   private sourceAdapter: UniversalSourceAdapter;
   private ingestionManager: IncrementalIngestionManager | null = null;
   private embeddingService: EmbeddingService | null = null;
+  private touchedFilesWatcher: TouchedFilesWatcher | null = null;
   private ingestionLock: IngestionLock;
   private embeddingLock: IngestionLock;
   private activeWatchers: Map<string, FileWatcher> = new Map();
@@ -457,6 +461,10 @@ export class BrainManager {
       // Index on projectId for fast project-scoped queries
       'CREATE INDEX scope_projectid IF NOT EXISTS FOR (n:Scope) ON (n.projectId)',
       'CREATE INDEX file_projectid IF NOT EXISTS FOR (n:File) ON (n.projectId)',
+      // Index for touched-files (orphan files outside projects)
+      'CREATE INDEX directory_path IF NOT EXISTS FOR (n:Directory) ON (n.path)',
+      'CREATE INDEX file_absolutepath IF NOT EXISTS FOR (n:File) ON (n.absolutePath)',
+      'CREATE INDEX file_state IF NOT EXISTS FOR (n:File) ON (n.state)',
     ];
 
     for (const query of indexQueries) {
@@ -1226,6 +1234,30 @@ volumes:
     if (this.embeddingService.canGenerateEmbeddings()) {
       console.log('[Brain] EmbeddingService initialized');
     }
+
+    // Initialize touched-files watcher
+    this.touchedFilesWatcher = new TouchedFilesWatcher({
+      neo4jClient: this.neo4jClient,
+      embeddingService: this.embeddingService,
+      projectId: BrainManager.TOUCHED_FILES_PROJECT_ID,
+      verbose: false,
+      // When a file transitions to indexed, resolve any PENDING_IMPORT relations
+      onFileIndexed: async (filePath: string) => {
+        const resolved = await this.resolvePendingImports(filePath);
+        if (resolved > 0) {
+          console.log(`[Brain] Resolved ${resolved} pending imports for ${path.basename(filePath)}`);
+        }
+      },
+      // Create mentioned file nodes for unresolved imports
+      onCreateMentionedFile: async (targetPath, importedBy) => {
+        return this.createMentionedFile(targetPath, importedBy);
+      },
+      // Get file state for import resolution
+      onGetFileState: async (absolutePath) => {
+        return this.getOrphanFileState(absolutePath);
+      },
+    });
+    console.log('[Brain] TouchedFilesWatcher initialized');
   }
 
   // ============================================
@@ -1239,7 +1271,7 @@ volumes:
    * @param type - Project type
    * @param displayName - Optional display name for UI purposes
    */
-  async registerProject(projectPath: string, type: ProjectType = 'ragforge-project', displayName?: string): Promise<string> {
+  async registerProject(projectPath: string, type: ProjectType = 'quick-ingest', displayName?: string): Promise<string> {
     const absolutePath = path.resolve(projectPath);
     // Always generate ID from path - this is the source of truth
     const projectId = ProjectRegistry.generateId(absolutePath);
@@ -1447,6 +1479,599 @@ volumes:
     } catch {
       return 0;
     }
+  }
+
+  // ============================================
+  // Touched Files
+  // ============================================
+
+  /** Project ID for touched files (singleton) */
+  private static readonly TOUCHED_FILES_PROJECT_ID = 'touched-files';
+
+  /** Path used for the touched-files project */
+  private static readonly TOUCHED_FILES_PATH = '~/.ragforge/touched-files';
+
+  /**
+   * Check if a file path is inside any registered project
+   * @returns The project containing the file, or undefined if not in any project
+   */
+  findProjectForFile(filePath: string): RegisteredProject | undefined {
+    const absolutePath = path.resolve(filePath);
+
+    for (const project of this.registeredProjects.values()) {
+      // Skip the touched-files project itself
+      if (project.type === 'touched-files') continue;
+
+      // Check if file is inside this project's directory
+      if (absolutePath.startsWith(project.path + path.sep) || absolutePath === project.path) {
+        return project;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Ensures the Directory hierarchy exists for a file path.
+   * Creates missing Directory nodes with IN_DIRECTORY relations.
+   * Example: /home/user/project/file.ts creates:
+   *   (:Directory {path: "/home"})<-[:IN_DIRECTORY]-(:Directory {path: "/home/user"})<-...
+   */
+  async ensureDirectoryHierarchy(filePath: string): Promise<void> {
+    if (!this.neo4jClient) return;
+
+    const absolutePath = path.resolve(filePath);
+    const dirPath = path.dirname(absolutePath);
+    const parts = dirPath.split(path.sep).filter(Boolean);
+
+    let currentPath: string = path.sep; // Start at root
+
+    for (const part of parts) {
+      const parentPath = currentPath;
+      currentPath = path.join(currentPath, part);
+
+      await this.neo4jClient.run(`
+        MERGE (d:Directory {path: $path})
+        ON CREATE SET d.name = $name, d.uuid = randomUUID()
+        WITH d
+        MATCH (parent:Directory {path: $parentPath})
+        WHERE $parentPath <> $path
+        MERGE (d)-[:IN_DIRECTORY]->(parent)
+      `, { path: currentPath, name: part, parentPath });
+    }
+  }
+
+  /**
+   * Get or create the touched-files project
+   * This is a special singleton project that holds files accessed outside any known project
+   */
+  async getOrCreateTouchedFilesProject(): Promise<RegisteredProject> {
+    const projectId = BrainManager.TOUCHED_FILES_PROJECT_ID;
+
+    // Check if already registered
+    const existing = this.registeredProjects.get(projectId);
+    if (existing) {
+      return existing;
+    }
+
+    // Create the touched-files directory if it doesn't exist
+    const os = await import('os');
+    const fs = await import('fs/promises');
+    const touchedFilesPath = path.join(os.homedir(), '.ragforge', 'touched-files');
+
+    try {
+      await fs.mkdir(touchedFilesPath, { recursive: true });
+    } catch {
+      // Directory might already exist
+    }
+
+    // Register the project
+    const now = new Date();
+    const project: RegisteredProject = {
+      id: projectId,
+      path: touchedFilesPath,
+      type: 'touched-files',
+      lastAccessed: now,
+      nodeCount: 0,
+      autoCleanup: false, // Don't auto-cleanup touched files
+      displayName: 'Touched Files',
+      excluded: false,
+    };
+
+    this.registeredProjects.set(projectId, project);
+
+    // Ensure Project node exists in Neo4j
+    if (this.neo4jClient) {
+      await this.neo4jClient.run(
+        `MERGE (p:Project {id: $projectId})
+         SET p.path = $path,
+             p.type = 'touched-files',
+             p.displayName = 'Touched Files',
+             p.lastAccessed = datetime(),
+             p.autoCleanup = false`,
+        { projectId, path: touchedFilesPath }
+      );
+    }
+
+    return project;
+  }
+
+  /**
+   * Touch a file - creates or updates a File node for an orphan file.
+   * Does NOT ingest immediately - just marks as dirty for later batch processing.
+   *
+   * State transitions:
+   * - New file → state: 'dirty'
+   * - Existing 'mentioned' → state: 'dirty'
+   * - Existing 'dirty'/'indexed'/'embedded' → update lastAccessed only
+   *
+   * @returns Info about what happened
+   */
+  async touchFile(filePath: string): Promise<{
+    created: boolean;
+    previousState: string | null;
+    newState: string;
+  }> {
+    const absolutePath = path.resolve(filePath);
+
+    // Check if in a known project - if so, skip
+    if (this.findProjectForFile(absolutePath)) {
+      return { created: false, previousState: null, newState: 'in_project' };
+    }
+
+    // Check file exists and is not a directory
+    const fs = await import('fs/promises');
+    try {
+      const stat = await fs.stat(absolutePath);
+      if (stat.isDirectory()) {
+        return { created: false, previousState: null, newState: 'is_directory' };
+      }
+    } catch {
+      return { created: false, previousState: null, newState: 'not_found' };
+    }
+
+    if (!this.neo4jClient) {
+      return { created: false, previousState: null, newState: 'no_client' };
+    }
+
+    // Ensure Directory hierarchy exists
+    await this.ensureDirectoryHierarchy(absolutePath);
+
+    // Create/update the File node
+    const result = await this.neo4jClient.run(`
+      MERGE (f:File {absolutePath: $absolutePath})
+      ON CREATE SET
+        f.uuid = randomUUID(),
+        f.name = $name,
+        f.extension = $extension,
+        f.state = 'dirty',
+        f.projectId = 'touched-files',
+        f.firstAccessed = datetime(),
+        f.lastAccessed = datetime(),
+        f.accessCount = 1
+      ON MATCH SET
+        f.lastAccessed = datetime(),
+        f.accessCount = COALESCE(f.accessCount, 0) + 1,
+        f.state = CASE
+          WHEN f.state = 'mentioned' THEN 'dirty'
+          ELSE f.state
+        END
+      WITH f,
+           CASE WHEN f.accessCount = 1 THEN true ELSE false END as wasCreated,
+           CASE WHEN f.accessCount > 1 THEN f.state ELSE null END as prevState
+      MATCH (dir:Directory {path: $dirPath})
+      MERGE (f)-[:IN_DIRECTORY]->(dir)
+      RETURN f.state as newState, wasCreated, prevState
+    `, {
+      absolutePath,
+      name: path.basename(absolutePath),
+      extension: path.extname(absolutePath),
+      dirPath: path.dirname(absolutePath)
+    });
+
+    const record = result.records[0];
+    if (!record) {
+      return { created: false, previousState: null, newState: 'error' };
+    }
+
+    const created = record.get('wasCreated');
+    const newState = record.get('newState');
+    const previousState = record.get('prevState');
+
+    if (created) {
+      console.log(`[TouchedFiles] Created: ${absolutePath} (state: ${newState})`);
+    } else if (previousState === 'mentioned') {
+      console.log(`[TouchedFiles] Promoted: ${absolutePath} (mentioned → ${newState})`);
+    }
+
+    return { created, previousState, newState };
+  }
+
+  /**
+   * Get list of touched files
+   */
+  async listTouchedFiles(): Promise<Array<{ path: string; uuid: string; lineCount?: number }>> {
+    if (!this.neo4jClient) return [];
+
+    const result = await this.neo4jClient.run(
+      `MATCH (f:File {projectId: $projectId})
+       RETURN f.absolutePath as path, f.uuid as uuid, f.lineCount as lineCount
+       ORDER BY f.absolutePath`,
+      { projectId: BrainManager.TOUCHED_FILES_PROJECT_ID }
+    );
+
+    return result.records.map(r => ({
+      path: r.get('path'),
+      uuid: r.get('uuid'),
+      lineCount: r.get('lineCount')?.toNumber(),
+    }));
+  }
+
+  /**
+   * Remove a file from the touched-files project
+   */
+  async removeTouchedFile(filePath: string): Promise<boolean> {
+    const absolutePath = path.resolve(filePath);
+
+    if (!this.neo4jClient) return false;
+
+    const result = await this.neo4jClient.run(
+      `MATCH (f:File {absolutePath: $absolutePath, projectId: $projectId})
+       OPTIONAL MATCH (f)<-[:DEFINED_IN]-(s:Scope)
+       DETACH DELETE f, s
+       RETURN count(f) as deleted`,
+      { absolutePath, projectId: BrainManager.TOUCHED_FILES_PROJECT_ID }
+    );
+
+    const deleted = result.records[0]?.get('deleted')?.toNumber() || 0;
+    return deleted > 0;
+  }
+
+  /**
+   * Get orphan files (touched-files) in a directory
+   *
+   * @param dirPath - Directory path to search in
+   * @param options - Filter options
+   * @returns Array of orphan files with their state
+   */
+  async getOrphansInDirectory(
+    dirPath: string,
+    options: {
+      states?: ('mentioned' | 'dirty' | 'indexed' | 'embedded')[];
+      recursive?: boolean;
+    } = {}
+  ): Promise<Array<{ absolutePath: string; state: string; name: string; }>> {
+    if (!this.neo4jClient) return [];
+
+    const absoluteDirPath = path.resolve(dirPath);
+    const { states, recursive = true } = options;
+
+    // Build state filter
+    const stateFilter = states && states.length > 0
+      ? `AND f.state IN $states`
+      : '';
+
+    // Recursive: traverse IN_DIRECTORY* from files to find those under dirPath
+    // Non-recursive: only direct children
+    const query = recursive
+      ? `
+        MATCH (f:File {projectId: $projectId})-[:IN_DIRECTORY*]->(d:Directory)
+        WHERE d.path = $dirPath OR d.path STARTS WITH $dirPathPrefix
+        ${stateFilter}
+        RETURN DISTINCT f.absolutePath as absolutePath, f.state as state, f.name as name
+        ORDER BY f.absolutePath
+      `
+      : `
+        MATCH (f:File {projectId: $projectId})-[:IN_DIRECTORY]->(d:Directory {path: $dirPath})
+        ${stateFilter}
+        RETURN f.absolutePath as absolutePath, f.state as state, f.name as name
+        ORDER BY f.absolutePath
+      `;
+
+    const result = await this.neo4jClient.run(query, {
+      projectId: BrainManager.TOUCHED_FILES_PROJECT_ID,
+      dirPath: absoluteDirPath,
+      dirPathPrefix: absoluteDirPath + path.sep,
+      states: states || []
+    });
+
+    return result.records.map(r => ({
+      absolutePath: r.get('absolutePath'),
+      state: r.get('state'),
+      name: r.get('name')
+    }));
+  }
+
+  /**
+   * Count orphan files that are not yet fully embedded
+   * Used by brain_search to check if it needs to wait for processing
+   *
+   * @param dirPath - Directory path to search in (usually cwd)
+   * @returns Count of files with state != 'embedded'
+   */
+  async countPendingOrphans(dirPath: string): Promise<number> {
+    if (!this.neo4jClient) return 0;
+
+    const absoluteDirPath = path.resolve(dirPath);
+
+    const result = await this.neo4jClient.run(`
+      MATCH (f:File {projectId: $projectId})-[:IN_DIRECTORY*]->(d:Directory)
+      WHERE (d.path = $dirPath OR d.path STARTS WITH $dirPathPrefix)
+        AND f.state <> 'embedded'
+      RETURN count(DISTINCT f) as pending
+    `, {
+      projectId: BrainManager.TOUCHED_FILES_PROJECT_ID,
+      dirPath: absoluteDirPath,
+      dirPathPrefix: absoluteDirPath + path.sep
+    });
+
+    return result.records[0]?.get('pending')?.toNumber() || 0;
+  }
+
+  /**
+   * Get all orphan files with a specific state
+   * Useful for batch processing (e.g., all dirty files for indexing)
+   *
+   * @param state - The state to filter by
+   * @returns Array of file paths
+   */
+  async getOrphansByState(
+    state: 'mentioned' | 'dirty' | 'indexed' | 'embedded'
+  ): Promise<string[]> {
+    if (!this.neo4jClient) return [];
+
+    const result = await this.neo4jClient.run(`
+      MATCH (f:File {projectId: $projectId, state: $state})
+      RETURN f.absolutePath as absolutePath
+      ORDER BY f.absolutePath
+    `, {
+      projectId: BrainManager.TOUCHED_FILES_PROJECT_ID,
+      state
+    });
+
+    return result.records.map(r => r.get('absolutePath'));
+  }
+
+  /**
+   * Update state of an orphan file
+   * Used during batch processing to transition files through states
+   *
+   * @param filePath - Absolute path to the file
+   * @param newState - New state to set
+   * @param additionalProps - Optional additional properties to set
+   */
+  async updateOrphanState(
+    filePath: string,
+    newState: 'mentioned' | 'dirty' | 'indexed' | 'embedded',
+    additionalProps?: Record<string, unknown>
+  ): Promise<boolean> {
+    if (!this.neo4jClient) return false;
+
+    const absolutePath = path.resolve(filePath);
+
+    // Build SET clause for additional properties
+    const propsEntries = Object.entries(additionalProps || {});
+    const propsSet = propsEntries.length > 0
+      ? ', ' + propsEntries.map(([key]) => `f.${key} = $prop_${key}`).join(', ')
+      : '';
+
+    // Build params object with prefixed prop names
+    const params: Record<string, unknown> = {
+      absolutePath,
+      projectId: BrainManager.TOUCHED_FILES_PROJECT_ID,
+      newState
+    };
+    for (const [key, value] of propsEntries) {
+      params[`prop_${key}`] = value;
+    }
+
+    const result = await this.neo4jClient.run(`
+      MATCH (f:File {absolutePath: $absolutePath, projectId: $projectId})
+      SET f.state = $newState${propsSet}
+      RETURN f.absolutePath as path
+    `, params);
+
+    return result.records.length > 0;
+  }
+
+  /**
+   * Process all pending orphan files (dirty → indexed → embedded)
+   * Called manually or by brain_search when files need to be embedded
+   */
+  async processOrphanFiles(): Promise<TouchedFilesStats> {
+    if (!this.touchedFilesWatcher) {
+      return { parsed: 0, embedded: 0, skipped: 0, errors: 0, durationMs: 0 };
+    }
+    return this.touchedFilesWatcher.processAll();
+  }
+
+  /**
+   * Process orphan files in a specific directory
+   * Used by brain_search to ensure files in cwd are embedded before searching
+   *
+   * @param dirPath - Directory to process
+   * @param timeout - Maximum time to wait (default 30s)
+   */
+  async processOrphanFilesInDirectory(dirPath: string, timeout = 30000): Promise<TouchedFilesStats> {
+    if (!this.touchedFilesWatcher) {
+      return { parsed: 0, embedded: 0, skipped: 0, errors: 0, durationMs: 0 };
+    }
+    return this.touchedFilesWatcher.processDirectory(dirPath, timeout);
+  }
+
+  /**
+   * Check if the touched-files watcher is currently processing
+   */
+  isProcessingOrphans(): boolean {
+    return this.touchedFilesWatcher?.processing ?? false;
+  }
+
+  /**
+   * Create a "mentioned" file node for a file that is referenced by an import
+   * but has never been directly accessed.
+   *
+   * This creates:
+   * - A File node with state='mentioned' (if doesn't exist)
+   * - A PENDING_IMPORT relationship from the importing file
+   *
+   * When the mentioned file is later indexed, the PENDING_IMPORT relations
+   * will be resolved into proper CONSUMES relations between scopes.
+   *
+   * @param absolutePath - Absolute path to the mentioned file
+   * @param importedBy - Information about what is importing this file
+   */
+  async createMentionedFile(
+    absolutePath: string,
+    importedBy: {
+      filePath: string;
+      scopeUuid?: string;
+      symbols: string[];
+      importPath: string;
+    }
+  ): Promise<{ created: boolean; fileState: string }> {
+    if (!this.neo4jClient) {
+      return { created: false, fileState: 'unknown' };
+    }
+
+    // Ensure directory hierarchy exists
+    await this.ensureDirectoryHierarchy(absolutePath);
+
+    const result = await this.neo4jClient.run(`
+      // Create or get the mentioned file
+      MERGE (f:File {absolutePath: $absolutePath})
+      ON CREATE SET
+        f.uuid = randomUUID(),
+        f.name = $name,
+        f.extension = $extension,
+        f.state = 'mentioned',
+        f.projectId = $projectId,
+        f.firstMentioned = datetime()
+      WITH f, (f.firstMentioned = datetime()) as wasCreated
+
+      // Ensure IN_DIRECTORY relation
+      MATCH (dir:Directory {path: $dirPath})
+      MERGE (f)-[:IN_DIRECTORY]->(dir)
+
+      // Create PENDING_IMPORT relationship
+      WITH f, wasCreated
+      MATCH (importer:File {absolutePath: $importerPath})
+      MERGE (importer)-[pending:PENDING_IMPORT {importPath: $importPath}]->(f)
+      ON CREATE SET
+        pending.symbols = $symbols,
+        pending.scopeUuid = $scopeUuid,
+        pending.createdAt = datetime()
+      ON MATCH SET
+        pending.symbols = CASE
+          WHEN pending.symbols IS NULL THEN $symbols
+          ELSE [x IN pending.symbols WHERE NOT x IN $symbols] + $symbols
+        END
+
+      RETURN f.state as fileState, wasCreated
+    `, {
+      absolutePath,
+      name: path.basename(absolutePath),
+      extension: path.extname(absolutePath),
+      projectId: BrainManager.TOUCHED_FILES_PROJECT_ID,
+      dirPath: path.dirname(absolutePath),
+      importerPath: importedBy.filePath,
+      importPath: importedBy.importPath,
+      symbols: importedBy.symbols,
+      scopeUuid: importedBy.scopeUuid || null
+    });
+
+    const record = result.records[0];
+    return {
+      created: record?.get('wasCreated') ?? false,
+      fileState: record?.get('fileState') ?? 'unknown'
+    };
+  }
+
+  /**
+   * Resolve all PENDING_IMPORT relationships pointing to a file
+   * Called after a file transitions from mentioned/dirty to indexed
+   *
+   * Creates CONSUMES relations between scopes and deletes the PENDING_IMPORT
+   *
+   * @param absolutePath - Path of the newly indexed file
+   * @returns Number of resolved imports
+   */
+  async resolvePendingImports(absolutePath: string): Promise<number> {
+    if (!this.neo4jClient) return 0;
+
+    // Find all pending imports pointing to this file
+    const pendingResult = await this.neo4jClient.run(`
+      MATCH (target:File {absolutePath: $path})<-[pending:PENDING_IMPORT]-(source:File)
+      RETURN
+        source.absolutePath as sourcePath,
+        pending.symbols as symbols,
+        pending.scopeUuid as scopeUuid,
+        pending.importPath as importPath
+    `, { path: absolutePath });
+
+    if (pendingResult.records.length === 0) {
+      return 0;
+    }
+
+    let resolved = 0;
+
+    for (const record of pendingResult.records) {
+      const sourcePath = record.get('sourcePath');
+      const symbols: string[] = record.get('symbols') || [];
+      const scopeUuid = record.get('scopeUuid');
+
+      // Create CONSUMES relations for each symbol
+      // Match source scopes (filter by scopeUuid if provided) with target scopes by name
+      const consumesResult = await this.neo4jClient.run(`
+        MATCH (targetFile:File {absolutePath: $targetPath})
+        MATCH (targetScope:Scope)-[:DEFINED_IN]->(targetFile)
+        WHERE targetScope.name IN $symbols
+          OR targetScope.exportedAs IN $symbols
+
+        MATCH (sourceFile:File {absolutePath: $sourcePath})
+        MATCH (sourceScope:Scope)-[:DEFINED_IN]->(sourceFile)
+        WHERE ($scopeUuid IS NULL OR sourceScope.uuid = $scopeUuid)
+
+        MERGE (sourceScope)-[:CONSUMES]->(targetScope)
+        RETURN count(*) as created
+      `, {
+        targetPath: absolutePath,
+        sourcePath,
+        symbols,
+        scopeUuid: scopeUuid || null
+      });
+
+      const created = consumesResult.records[0]?.get('created')?.toNumber() || 0;
+      if (created > 0) {
+        resolved++;
+      }
+    }
+
+    // Delete all resolved PENDING_IMPORT relations
+    await this.neo4jClient.run(`
+      MATCH (target:File {absolutePath: $path})<-[pending:PENDING_IMPORT]-()
+      DELETE pending
+    `, { path: absolutePath });
+
+    return resolved;
+  }
+
+  /**
+   * Get the state of an orphan file in the graph
+   *
+   * @param absolutePath - Absolute path to check
+   * @returns File state or null if not in graph
+   */
+  async getOrphanFileState(absolutePath: string): Promise<string | null> {
+    if (!this.neo4jClient) return null;
+
+    const result = await this.neo4jClient.run(`
+      MATCH (f:File {absolutePath: $absolutePath, projectId: $projectId})
+      RETURN f.state as state
+    `, {
+      absolutePath,
+      projectId: BrainManager.TOUCHED_FILES_PROJECT_ID
+    });
+
+    return result.records[0]?.get('state') || null;
   }
 
   // ============================================
@@ -2080,16 +2705,40 @@ volumes:
       }
     }
 
-    // If file is not in any project, don't ingest
+    // If file is not in any project, try to use as orphan/touched file
     if (!projectId) {
-      console.log(`[BrainManager] File not in any project, skipping ingestion: ${filePath}`);
-      return { updated: false };
+      // Check if file is tracked as orphan file
+      const orphanResult = await this.neo4jClient.run(
+        `MATCH (f:File {absolutePath: $filePath})
+         WHERE f.projectId = $orphanProjectId
+         RETURN f.uuid as uuid, f.state as state`,
+        { filePath, orphanProjectId: BrainManager.TOUCHED_FILES_PROJECT_ID }
+      );
+
+      if (orphanResult.records.length > 0) {
+        // File is tracked as orphan - use orphan project
+        projectId = BrainManager.TOUCHED_FILES_PROJECT_ID;
+        console.log(`[BrainManager] Using orphan file tracking for: ${filePath}`);
+      } else {
+        // Create as new orphan file using touchFile method
+        try {
+          await this.touchFile(filePath);
+          projectId = BrainManager.TOUCHED_FILES_PROJECT_ID;
+          console.log(`[BrainManager] Created orphan file tracking for: ${filePath}`);
+        } catch (err) {
+          console.log(`[BrainManager] File not in any project and cannot create orphan tracking: ${filePath}`);
+          return { updated: false };
+        }
+      }
     }
 
     // Find existing node by file path
+    // For orphan files, use absolutePath; for project files, use file/path
     const fileName = pathModule.basename(filePath);
     const findResult = await this.neo4jClient.run(
-      `MATCH (n) WHERE (n.file = $fileName OR n.path = $filePath) AND n.projectId = $projectId
+      `MATCH (n)
+       WHERE n.projectId = $projectId
+         AND (n.file = $fileName OR n.path = $filePath OR n.absolutePath = $filePath)
        RETURN n.uuid as uuid, labels(n) as labels LIMIT 1`,
       { fileName, filePath, projectId }
     );
@@ -2227,11 +2876,13 @@ volumes:
         const sourceFileName = pathModule.basename(sourceFilePath);
         const sourceExt = pathModule.extname(sourceFilePath).toLowerCase();
 
-        // Find existing source node
+        // Find existing source node (check both project files and orphan files)
         const sourceResult = await this.neo4jClient.run(
-          `MATCH (n) WHERE (n.file = $fileName OR n.path = $filePath) AND n.projectId = $projectId
+          `MATCH (n)
+           WHERE (n.file = $fileName OR n.path = $filePath OR n.absolutePath = $filePath)
+             AND (n.projectId = $projectId OR n.projectId = $orphanProjectId)
            RETURN n.uuid as uuid LIMIT 1`,
-          { fileName: sourceFileName, filePath: sourceFilePath, projectId }
+          { fileName: sourceFileName, filePath: sourceFilePath, projectId, orphanProjectId: BrainManager.TOUCHED_FILES_PROJECT_ID }
         );
 
         let sourceUuid: string;
@@ -2759,7 +3410,58 @@ volumes:
 
     // Sort by score and limit
     allResults.sort((a, b) => b.score - a.score);
-    return allResults.slice(0, limit);
+    const limitedResults = allResults.slice(0, limit);
+
+    // Enrich results with file lineCount (for agent context)
+    // Collect unique file paths and query File nodes for lineCount
+    try {
+      const uniqueFiles = new Map<string, { projectId: string; relPath: string }>();
+      for (const r of limitedResults) {
+        const relPath = r.node.file || r.node.path;
+        if (relPath && r.projectId) {
+          const key = `${r.projectId}:${relPath}`;
+          if (!uniqueFiles.has(key)) {
+            uniqueFiles.set(key, { projectId: r.projectId, relPath });
+          }
+        }
+      }
+
+      if (uniqueFiles.size > 0) {
+        const fileInfos = Array.from(uniqueFiles.values());
+        const lineCountQuery = `
+          UNWIND $files AS f
+          MATCH (file:File {projectId: f.projectId, path: f.relPath})
+          RETURN f.projectId + ':' + f.relPath AS key, file.lineCount AS lineCount
+        `;
+        const lineCountResult = await this.neo4jClient!.run(lineCountQuery, { files: fileInfos });
+
+        const lineCountMap = new Map<string, number>();
+        for (const record of lineCountResult.records) {
+          const key = record.get('key');
+          const lineCount = record.get('lineCount');
+          if (key && lineCount) {
+            lineCountMap.set(key, typeof lineCount === 'object' ? lineCount.toNumber() : lineCount);
+          }
+        }
+
+        // Add lineCount to results
+        for (const r of limitedResults) {
+          const relPath = r.node.file || r.node.path;
+          if (relPath && r.projectId) {
+            const key = `${r.projectId}:${relPath}`;
+            const lineCount = lineCountMap.get(key);
+            if (lineCount) {
+              (r as any).fileLineCount = lineCount;
+            }
+          }
+        }
+      }
+    } catch (err) {
+      // Non-critical: lineCount is for UX, don't fail search
+      console.debug('[BrainManager] Failed to enrich results with lineCount:', err);
+    }
+
+    return limitedResults;
   }
 
   /**

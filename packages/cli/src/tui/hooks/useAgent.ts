@@ -309,7 +309,7 @@ export function useAgent(options: UseAgentOptions = {}): UseAgentReturn {
             console.log('📚 Brain Projects:');
             for (const p of projects) {
               const status = p.excluded ? ' [excluded]' : '';
-              const type = p.type === 'ragforge-project' ? '📦' : (p.type === 'quick-ingest' ? '📂' : '🌐');
+              const type = p.type === 'quick-ingest' ? '📂' : (p.type === 'touched-files' ? '📄' : '🌐');
               console.log(`  ${type} ${p.id}${status}: ${p.path}`);
             }
           } else {
