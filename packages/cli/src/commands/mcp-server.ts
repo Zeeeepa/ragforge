@@ -319,67 +319,21 @@ async function prepareToolsForMcp(
     log('info', 'Running in standalone mode with limited tools');
   }
 
-  // Add file tools (read, write, edit)
-  // Note: These return ready handlers, not generators
-  // Fallback to cwd for standalone mode (no project loaded)
-  const fileTools = generateFileTools({
-    projectRoot: () => ctx.currentProjectPath || process.cwd(),
-    // Queue file changes for batched re-ingestion (non-blocking)
-    // The actual ingestion happens after a debounce delay (500ms)
-    // brain_search will wait for pending edits before querying
-    onFileModified: ctx.brainProxy
-      ? async (filePath: string, changeType: 'created' | 'updated' | 'deleted') => {
-          log('debug', `File ${changeType}: ${filePath} (queuing for re-ingestion)`);
-
-          if (!ctx.brainProxy) {
-            return { queued: false, reason: 'brainProxy not available' };
-          }
-
-          const pathModule = await import('path');
-          const absoluteFilePath = pathModule.resolve(filePath);
-          const ext = pathModule.extname(filePath).toLowerCase();
-          const mediaExts = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.pdf', '.docx', '.xlsx', '.glb', '.gltf'];
-
-          // Media files: still need immediate processing (no queue yet for media)
-          if (mediaExts.includes(ext) && changeType !== 'deleted') {
-            try {
-              await ctx.brainProxy.updateMediaContent({
-                filePath: absoluteFilePath,
-                extractionMethod: `file-tool-${changeType}`,
-                generateEmbeddings: true,
-              });
-              log('debug', `Re-ingested media: ${filePath}`);
-              return { queued: false, mediaUpdated: true };
-            } catch (e: any) {
-              log('debug', `Media re-ingestion failed: ${e.message}`);
-              return { queued: false, error: e.message };
-            }
-          }
-
-          // Code files: queue for batched ingestion (non-blocking!)
-          console.log(`[MCP] 🔄 Queuing ${filePath} for re-ingestion...`);
-          ctx.brainProxy.queueFileChange(absoluteFilePath, changeType);
-          const pendingCount = ctx.brainProxy.getPendingEditCount();
-          console.log(`[MCP] 📥 Queued! (${pendingCount} pending edits)`);
-          log('debug', `Queued ${filePath} for re-ingestion (${pendingCount} pending)`);
-
-          return {
-            queued: true,
-            pendingCount,
-            note: 'Ingestion queued. brain_search will wait for completion.',
-          };
-        }
-      : undefined,
-  });
-  allTools.push(...fileTools.tools);
-  for (const [name, handler] of Object.entries(fileTools.handlers)) {
-    allHandlers[name] = handler;
-  }
+  // File tools (read, write, edit, delete, move, copy) are routed via daemon
+  // This ensures brain integration for all file operations, including:
+  // - touchFile for orphan files on read
+  // - triggerReIngestion on file modifications
+  // See the brain tools section below where these are added via daemon proxy
 
   // Add FS tools (list_directory, glob_files, etc.)
+  // Note: delete_path, move_file, copy_file are excluded - they're routed via daemon for brain integration
   const fsTools = generateFsTools({ projectRoot: () => ctx.currentProjectPath || process.cwd() });
-  allTools.push(...fsTools.tools);
+  const brainRoutedTools = new Set(['delete_path', 'move_file', 'copy_file']);
+  const filteredFsTools = fsTools.tools.filter(t => !brainRoutedTools.has(t.name));
+  allTools.push(...filteredFsTools);
   for (const [name, handler] of Object.entries(fsTools.handlers)) {
+    // Skip tools routed via daemon
+    if (brainRoutedTools.has(name)) continue;
     // Wrap handlers for grep_files and search_files to handle extract_hierarchy via daemon
     if (name === 'grep_files' || name === 'search_files') {
       allHandlers[name] = async (args: any) => {
@@ -387,10 +341,10 @@ async function prepareToolsForMcp(
         const extractHierarchy = args.extract_hierarchy;
         const handlerArgs = { ...args };
         delete handlerArgs.extract_hierarchy;
-        
+
         // Call the handler first to get matches (without extract_hierarchy)
         const result = await handler(handlerArgs);
-        
+
         // If extract_hierarchy is requested and we have matches, call extract_dependency_hierarchy via daemon
         if (extractHierarchy && result.matches && result.matches.length > 0) {
           try {
@@ -401,7 +355,7 @@ async function prepareToolsForMcp(
               direction: 'both',
               max_scopes: Math.min(result.matches.length, 10),
             });
-            
+
             if (hierarchyResult.success) {
               result.hierarchy = hierarchyResult.result;
             } else {
@@ -411,7 +365,7 @@ async function prepareToolsForMcp(
             result.hierarchy_error = err.message || 'Failed to extract hierarchy';
           }
         }
-        
+
         return result;
       };
     } else {
@@ -595,9 +549,11 @@ async function prepareToolsForMcp(
 
   log('info', `Prepared ${allTools.length} tools total`);
 
-  // Create onBeforeToolCall callback for auto-init and auto-watch
+  // Create onBeforeToolCall callback for auto-init
+  // Note: Auto-watcher logic moved to daemon.ts (ensureWatcherForFile)
+  // This ensures both MCP and Agent benefit from the same behavior
   const onBeforeToolCall = async (toolName: string, args: any) => {
-    // 1. Auto-init brain proxy if not initialized
+    // Auto-init brain proxy if not initialized
     if (!ctx.brainProxy) {
       try {
         log('debug', 'Auto-initializing brain proxy...');
@@ -605,40 +561,6 @@ async function prepareToolsForMcp(
         log('info', 'Brain proxy auto-initialized');
       } catch (e: any) {
         log('debug', `Brain proxy auto-init failed: ${e.message}`);
-      }
-    }
-
-    // 2. Auto-start watcher for file paths in known projects
-    if (ctx.brainProxy && args) {
-      const pathModule = await import('path');
-      // Extract file path from common arg names
-      const filePath = args.path || args.file_path || args.image_path || args.model_path;
-      if (filePath && typeof filePath === 'string') {
-        const absolutePath = pathModule.isAbsolute(filePath)
-          ? filePath
-          : pathModule.resolve(process.cwd(), filePath);
-
-        // Find project for this path
-        const projects = ctx.brainProxy.listProjects();
-        const project = projects.find(p =>
-          absolutePath.startsWith(p.path + pathModule.sep) || absolutePath.startsWith(p.path)
-        );
-
-        if (project) {
-          // Check if watcher is running via proxy
-          const isWatching = ctx.brainProxy.isWatching(project.path);
-
-          if (!isWatching) {
-            try {
-              log('debug', `Auto-starting watcher for project ${project.id}`);
-              // Start watcher via daemon
-              await ctx.brainProxy.startWatching(project.path);
-              log('info', `Watcher auto-started for ${project.id}`);
-            } catch (e: any) {
-              log('debug', `Watcher auto-start failed: ${e.message}`);
-            }
-          }
-        }
       }
     }
   };

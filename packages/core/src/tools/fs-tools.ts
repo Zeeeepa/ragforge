@@ -81,6 +81,11 @@ export interface FsToolsContext {
    * Callback after file move (for Neo4j update)
    */
   onFileMoved?: (source: string, destination: string) => Promise<void>;
+
+  /**
+   * Callback after file copy (for Neo4j tracking of destination)
+   */
+  onFileCopied?: (source: string, destination: string) => Promise<void>;
 }
 
 /**
@@ -522,10 +527,21 @@ export function generateCopyFileHandler(ctx: FsToolsContext) {
     const projectRoot = getProjectRoot(ctx) || process.cwd();
 
     try {
-      return await fsHelpers.copyFile(params.source, params.destination, {
+      const result = await fsHelpers.copyFile(params.source, params.destination, {
         basePath: projectRoot,
         overwrite: params.overwrite ?? false,
       });
+
+      // Notify callback for tracking (re-ingestion + orphan tracking)
+      if (ctx.onFileCopied && result.copied) {
+        try {
+          await ctx.onFileCopied(result.absoluteSource, result.absoluteDestination);
+        } catch (err: any) {
+          console.error('[FsTools] onFileCopied error:', err.message);
+        }
+      }
+
+      return result;
     } catch (err: any) {
       return { error: err.message };
     }

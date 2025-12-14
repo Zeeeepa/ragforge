@@ -451,11 +451,19 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
       log.debug('Step 1: Listing projects');
       const allProjects = ctx.brain.listProjects();
       log.debug(`Found ${allProjects.length} total projects`);
-      
+
       const targetProjects = params.projects
         ? allProjects.filter(p => params.projects!.includes(p.id))
         : allProjects;
-      log.debug(`Targeting ${targetProjects.length} projects`);
+
+      // Include touched-files (orphan files) in search when user doesn't specify projects
+      // Filter by cwd to only include relevant orphan files
+      const includeTouchedFiles = !params.projects;
+      const touchedFilesBasePath = includeTouchedFiles ? process.cwd() : undefined;
+      log.debug(`Targeting ${targetProjects.length} projects`, {
+        includeTouchedFiles,
+        touchedFilesBasePath: touchedFilesBasePath ? touchedFilesBasePath.substring(0, 50) : undefined
+      });
 
       // For each project, ensure it's synced before searching
       log.info('Step 2: Ensuring projects are synced', { projectCount: targetProjects.length });
@@ -579,6 +587,8 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
         glob: params.glob,
         limit: searchLimit,
         minScore: params.min_score,
+        // Include orphan files under cwd when user doesn't specify projects
+        touchedFilesBasePath,
       };
       const searchStart = Date.now();
       let result = await ctx.brain.search(params.query, options);
@@ -2151,6 +2161,23 @@ async function triggerReIngestion(
     } as any;
   }
 
+  // Orphan file (not in any project) - use touchFile for tracking
+  if (changeType !== 'deleted') {
+    try {
+      console.log(`[brain-tools] 📁 Tracking orphan file: ${absolutePath}`);
+      const result = await brain.touchFile(absolutePath);
+      console.log(`[brain-tools] ✅ Orphan tracked: created=${result.created}, state=${result.newState}`);
+      return {
+        projectId: 'orphan',
+        orphan: true,
+        created: result.created,
+        state: result.newState,
+      } as any;
+    } catch (e: any) {
+      console.warn(`[brain-tools] Failed to track orphan file: ${e.message}`);
+    }
+  }
+
   return null;
 }
 
@@ -2454,6 +2481,17 @@ export function generateBrainReadFileHandler(ctx: BrainToolsContext) {
       output += `\n\n(End of file - ${totalLines} lines)`;
     }
 
+    // Track file access for orphan files (fire and forget)
+    ctx.brain.touchFile(absolutePath).catch((err: any) => {
+      // Silently ignore - touchFile may fail for unsupported file types
+      console.debug(`[brain-tools] touchFile skipped for ${absolutePath}: ${err.message}`);
+    });
+
+    // Update lastAccessed for all files (project and orphan) - for reranking
+    ctx.brain.updateFileAccess(absolutePath).catch((err: any) => {
+      console.debug(`[brain-tools] updateFileAccess skipped for ${absolutePath}: ${err.message}`);
+    });
+
     return {
       path: filePath,
       absolute_path: absolutePath,
@@ -2715,6 +2753,203 @@ export function generateBrainDeletePathHandler(ctx: BrainToolsContext) {
   };
 }
 
+/**
+ * Generate move_file tool definition (brain-aware)
+ */
+export function generateBrainMoveFileTool(): GeneratedToolDefinition {
+  return {
+    name: 'move_file',
+    description: `Move or rename a file or directory.
+
+Creates parent directories if needed.
+Updates the knowledge graph to reflect the new path.
+
+Parameters:
+- source: Current path
+- destination: New path
+
+Example: move_file({ source: "src/utils.ts", destination: "src/lib/utils.ts" })
+Example: move_file({ source: "old-name.ts", destination: "new-name.ts" })`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        source: {
+          type: 'string',
+          description: 'Current file/directory path',
+        },
+        destination: {
+          type: 'string',
+          description: 'New path',
+        },
+      },
+      required: ['source', 'destination'],
+    },
+  };
+}
+
+/**
+ * Generate handler for move_file (brain-aware)
+ */
+export function generateBrainMoveFileHandler(ctx: BrainToolsContext) {
+  return async (params: { source: string; destination: string }): Promise<any> => {
+    const { source, destination } = params;
+    const fs = await import('fs/promises');
+    const pathModule = await import('path');
+
+    // Resolve paths
+    const absoluteSource = pathModule.isAbsolute(source)
+      ? source
+      : pathModule.resolve(process.cwd(), source);
+    const absoluteDestination = pathModule.isAbsolute(destination)
+      ? destination
+      : pathModule.resolve(process.cwd(), destination);
+
+    // Check source exists
+    try {
+      await fs.access(absoluteSource);
+    } catch (err: any) {
+      if (err.code === 'ENOENT') {
+        return { error: `Source not found: ${absoluteSource}` };
+      }
+      throw err;
+    }
+
+    // Check destination doesn't exist
+    try {
+      await fs.access(absoluteDestination);
+      return { error: `Destination already exists: ${absoluteDestination}` };
+    } catch (err: any) {
+      if (err.code !== 'ENOENT') throw err;
+    }
+
+    // Create parent directories if needed
+    const parentDir = pathModule.dirname(absoluteDestination);
+    await fs.mkdir(parentDir, { recursive: true });
+
+    // Move the file
+    await fs.rename(absoluteSource, absoluteDestination);
+
+    // Track in brain: delete old, create new
+    await triggerReIngestion(ctx.brain, absoluteSource, 'deleted');
+    const ingestionResult = await triggerReIngestion(ctx.brain, absoluteDestination, 'created');
+
+    return {
+      source,
+      destination,
+      absolute_source: absoluteSource,
+      absolute_destination: absoluteDestination,
+      moved: true,
+      rag_synced: !!ingestionResult,
+      project_id: ingestionResult?.projectId,
+    };
+  };
+}
+
+/**
+ * Generate copy_file tool definition (brain-aware)
+ */
+export function generateBrainCopyFileTool(): GeneratedToolDefinition {
+  return {
+    name: 'copy_file',
+    description: `Copy a file or directory.
+
+Creates parent directories if needed.
+Directories are copied recursively by default.
+Fails if destination already exists (use overwrite: true to replace).
+
+Parameters:
+- source: File/directory to copy
+- destination: Destination path
+- overwrite: Replace if destination exists (default: false)
+
+Example: copy_file({ source: "template.ts", destination: "src/new-file.ts" })
+Example: copy_file({ source: "src/components", destination: "src/components-backup" })`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        source: {
+          type: 'string',
+          description: 'Source path',
+        },
+        destination: {
+          type: 'string',
+          description: 'Destination path',
+        },
+        overwrite: {
+          type: 'boolean',
+          description: 'Replace if destination exists (default: false)',
+        },
+      },
+      required: ['source', 'destination'],
+    },
+  };
+}
+
+/**
+ * Generate handler for copy_file (brain-aware)
+ */
+export function generateBrainCopyFileHandler(ctx: BrainToolsContext) {
+  return async (params: { source: string; destination: string; overwrite?: boolean }): Promise<any> => {
+    const { source, destination, overwrite = false } = params;
+    const fs = await import('fs/promises');
+    const pathModule = await import('path');
+
+    // Resolve paths
+    const absoluteSource = pathModule.isAbsolute(source)
+      ? source
+      : pathModule.resolve(process.cwd(), source);
+    const absoluteDestination = pathModule.isAbsolute(destination)
+      ? destination
+      : pathModule.resolve(process.cwd(), destination);
+
+    // Check source exists
+    let sourceStat;
+    try {
+      sourceStat = await fs.stat(absoluteSource);
+    } catch (err: any) {
+      if (err.code === 'ENOENT') {
+        return { error: `Source not found: ${absoluteSource}` };
+      }
+      throw err;
+    }
+
+    // Check destination
+    if (!overwrite) {
+      try {
+        await fs.access(absoluteDestination);
+        return { error: `Destination already exists: ${absoluteDestination}. Use overwrite: true to replace.` };
+      } catch (err: any) {
+        if (err.code !== 'ENOENT') throw err;
+      }
+    }
+
+    // Create parent directories if needed
+    const parentDir = pathModule.dirname(absoluteDestination);
+    await fs.mkdir(parentDir, { recursive: true });
+
+    // Copy
+    if (sourceStat.isDirectory()) {
+      await fs.cp(absoluteSource, absoluteDestination, { recursive: true });
+    } else {
+      await fs.copyFile(absoluteSource, absoluteDestination);
+    }
+
+    // Track in brain: create new file
+    const ingestionResult = await triggerReIngestion(ctx.brain, absoluteDestination, 'created');
+
+    return {
+      source,
+      destination,
+      absolute_source: absoluteSource,
+      absolute_destination: absoluteDestination,
+      copied: true,
+      is_directory: sourceStat.isDirectory(),
+      rag_synced: !!ingestionResult,
+      project_id: ingestionResult?.projectId,
+    };
+  };
+}
+
 // ============================================
 // notify_user - Send intermediate messages to user
 // ============================================
@@ -2864,9 +3099,15 @@ export function generateBrainTools(): GeneratedToolDefinition[] {
     generateStopWatcherTool(),
     // File dirty marking
     generateMarkFileDirtyTool(),
-    // Note: Brain-aware file tools (read_file, write_file, create_file, edit_file, delete_path)
-    // are no longer exposed as separate tools. They are automatically handled by the
-    // regular file tools via the onFileModified callback when brain is available.
+    // Brain-aware file tools - handle touchFile for orphan files
+    // and triggerReIngestion for file modifications
+    generateBrainReadFileTool(),
+    generateBrainWriteFileTool(),
+    generateBrainCreateFileTool(),
+    generateBrainEditFileTool(),
+    generateBrainDeletePathTool(),
+    generateBrainMoveFileTool(),
+    generateBrainCopyFileTool(),
     // Advanced: schema and direct Cypher queries
     generateGetSchemaTool(),
     generateRunCypherTool(),
@@ -2899,9 +3140,15 @@ export function generateBrainToolHandlers(ctx: BrainToolsContext): Record<string
     stop_watcher: generateStopWatcherHandler(ctx),
     // File dirty marking
     mark_file_dirty: generateMarkFileDirtyHandler(ctx),
-    // Note: Brain-aware file tools (read_file, write_file, create_file, edit_file, delete_path)
-    // are no longer exposed as separate handlers. They are automatically handled by the
-    // regular file tools via the onFileModified callback when brain is available.
+    // Brain-aware file tools - these handle touchFile for orphan files
+    // and trigger re-ingestion on file modifications
+    read_file: generateBrainReadFileHandler(ctx),
+    write_file: generateBrainWriteFileHandler(ctx),
+    create_file: generateBrainCreateFileHandler(ctx),
+    edit_file: generateBrainEditFileHandler(ctx),
+    delete_path: generateBrainDeletePathHandler(ctx),
+    move_file: generateBrainMoveFileHandler(ctx),
+    copy_file: generateBrainCopyFileHandler(ctx),
     // Advanced: schema and direct Cypher queries
     get_schema: generateGetSchemaHandler(),
     run_cypher: generateRunCypherHandler(ctx),

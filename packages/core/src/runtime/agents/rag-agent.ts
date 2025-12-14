@@ -1603,12 +1603,41 @@ export async function createRagAgent(options: RagAgentOptions): Promise<RagAgent
       onFileDeleted: options.onFileModified
         ? async (filePath: string) => { await options.onFileModified!(filePath, 'deleted'); }
         : undefined,
-      onFileMoved: options.onFileModified
-        ? async (source: string, destination: string) => {
-            await options.onFileModified!(source, 'deleted');
-            await options.onFileModified!(destination, 'created');
+      onFileMoved: async (source: string, destination: string) => {
+        // Notify for re-ingestion
+        if (options.onFileModified) {
+          await options.onFileModified(source, 'deleted');
+          await options.onFileModified(destination, 'created');
+        }
+        // Also track destination as orphan if outside projects
+        if (options.brainManager) {
+          try {
+            await options.brainManager.touchFile(destination);
+          } catch (err: any) {
+            // Non-fatal: log and continue
+            if (options.verbose) {
+              console.log(`[FsTools] touchFile failed for moved file ${destination}: ${err.message}`);
+            }
           }
-        : undefined,
+        }
+      },
+      onFileCopied: async (_source: string, destination: string) => {
+        // Notify for re-ingestion (if in a project)
+        if (options.onFileModified) {
+          await options.onFileModified(destination, 'created');
+        }
+        // Also track as orphan if outside projects
+        if (options.brainManager) {
+          try {
+            await options.brainManager.touchFile(destination);
+          } catch (err: any) {
+            // Non-fatal: log and continue
+            if (options.verbose) {
+              console.log(`[FsTools] touchFile failed for copied file ${destination}: ${err.message}`);
+            }
+          }
+        }
+      },
     };
 
     const fsTools = generateFsTools(fsCtx);

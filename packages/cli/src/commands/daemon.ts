@@ -588,6 +588,38 @@ class BrainDaemon {
     return this.brain!;
   }
 
+  /**
+   * Ensure watcher is running for a file's project (fire-and-forget)
+   * Called before tool execution to auto-start watchers for known projects
+   */
+  private ensureWatcherForFile(args: Record<string, any>): void {
+    if (!this.brain) return;
+
+    // Extract file path from common arg names
+    const filePath = args?.path || args?.file_path || args?.image_path || args?.model_path;
+    if (!filePath || typeof filePath !== 'string') return;
+
+    const absolutePath = path.isAbsolute(filePath)
+      ? filePath
+      : path.resolve(process.cwd(), filePath);
+
+    // Find project for this path
+    const project = this.brain.findProjectForFile(absolutePath);
+    if (!project) return;
+
+    // Check if watcher is already running
+    if (this.brain.isWatching(project.path)) return;
+
+    // Start watcher (fire-and-forget)
+    this.brain.startWatching(project.path)
+      .then(() => {
+        this.logger.info(`Auto-started watcher for project: ${project.id}`);
+      })
+      .catch((err: any) => {
+        this.logger.debug(`Auto-watcher failed for ${project.id}: ${err.message}`);
+      });
+  }
+
   private setupRoutes(): void {
     // Health check
     this.server.get('/health', async () => {
@@ -685,6 +717,9 @@ class BrainDaemon {
             available_tools: Object.keys(this.toolHandlers).sort(),
           };
         }
+
+        // Auto-start watcher for file's project (fire-and-forget, non-blocking)
+        this.ensureWatcherForFile(args);
 
         const startTime = Date.now();
         const result = await handler(args);

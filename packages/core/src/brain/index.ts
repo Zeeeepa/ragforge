@@ -46,5 +46,54 @@ export {
   type TouchedFilesWatcherConfig,
   type ProcessingStats,
   type OrphanFile,
-  type OrphanFileState,
 } from './touched-files-watcher.js';
+
+export {
+  FileStateMachine,
+  FileStateMigration,
+  isValidTransition,
+  getNextState,
+  type FileState,
+  type ErrorType,
+  type StateTransition,
+  type FileStateInfo,
+  type TransitionOptions,
+} from './file-state-machine.js';
+
+export {
+  extractReferences,
+  resolveReference,
+  resolveAllReferences,
+  createReferenceRelations,
+  resolvePendingImports,
+  type ReferenceType,
+  type RelationType,
+  type ExtractedReference,
+  type ResolvedReference,
+  type ReferenceCreationResult,
+} from './reference-extractor.js';
+
+export {
+  FileProcessor,
+  createOrphanFileProcessor,
+  createProjectFileProcessor,
+  type FileInfo,
+  type ProcessResult,
+  type BatchResult,
+  type FileProcessorConfig,
+} from './file-processor.js';
+
+export {
+  ChangeDetector,
+  type ChangeResult,
+  type BatchChangeResult,
+  type ChangeDetectorConfig,
+} from './change-detector.js';
+
+export {
+  EmbeddingCoordinator,
+  createEmbeddingCoordinator,
+  type EmbedProjectResult,
+  type EmbeddingCoordinatorConfig,
+  type EmbedProjectOptions,
+} from './embedding-coordinator.js';

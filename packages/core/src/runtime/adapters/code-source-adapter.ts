@@ -876,27 +876,28 @@ export class CodeSourceAdapter extends SourceAdapter {
 
     // Create Project node using the generated projectId
     // This ensures consistency: Project node uuid = projectId used by all other nodes
+    // Skip for 'touched-files' - orphan files don't need a Project node
     const projectId = generatedProjectId; // Use generated projectId consistently
-    nodes.push({
-      labels: ['Project'],
-      id: projectId,
-      properties: {
-        uuid: projectId, // Use generated projectId as uuid for consistency
-        projectId: projectId, // Also set projectId explicitly
-        name: projectInfo.name,
-        gitRemote: projectInfo.gitRemote || null,
-        rootPath: projectInfo.rootPath,
-        indexedAt: getLocalTimestamp()
-      }
-    });
+    if (projectId !== 'touched-files') {
+      nodes.push({
+        labels: ['Project'],
+        id: projectId,
+        properties: {
+          uuid: projectId, // Use generated projectId as uuid for consistency
+          projectId: projectId, // Also set projectId explicitly
+          name: projectInfo.name,
+          gitRemote: projectInfo.gitRemote || null,
+          rootPath: projectInfo.rootPath,
+          indexedAt: getLocalTimestamp()
+        }
+      });
+    }
 
     // Create PackageJson nodes
     const projectRoot = config.root || process.cwd();
     for (const [filePath, pkgInfo] of packageJsonFiles) {
       const relPath = path.relative(projectRoot, filePath);
-      // Generate deterministic UUID for package.json
-      const pkgUuidRaw = UniqueIDHelper.GenerateDeterministicUUID(`packagejson:${filePath}`);
-      const pkgId = `pkg:${pkgUuidRaw}`; // Prefix for relationship matching
+      const pkgId = UniqueIDHelper.GeneratePackageJsonUUID(filePath);
 
       nodes.push({
         labels: ['PackageJson'],
@@ -904,6 +905,7 @@ export class CodeSourceAdapter extends SourceAdapter {
         properties: {
           uuid: pkgId,
           file: relPath,
+          absolutePath: filePath,
           name: pkgInfo.name,
           version: pkgInfo.version,
           description: pkgInfo.description || null,
@@ -955,6 +957,7 @@ export class CodeSourceAdapter extends SourceAdapter {
             name: scope.name,
             type: scope.type,
             file: relPath, // Use relative path
+            absolutePath: filePath, // Canonical identifier
             language: config.adapter, // NEW: language (typescript/python)
             startLine: scope.startLine,
             endLine: scope.endLine,
@@ -1043,7 +1046,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       // Compute file metadata for incremental ingestion
       const { rawContentHash, mtime } = await this.computeFileMetadata(filePath);
 
-      const fileUuid = `file:${relPath}`;
+      const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
       nodes.push({
         labels: ['File'],
         id: fileUuid,
@@ -1063,7 +1066,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       // Create BELONGS_TO relationship (File -> Project)
       relationships.push({
         type: 'BELONGS_TO',
-        from: `file:${relPath}`,
+        from: UniqueIDHelper.GenerateFileUUID(filePath),
         to: projectId
       });
 
@@ -1073,7 +1076,7 @@ export class CodeSourceAdapter extends SourceAdapter {
         relationships.push({
           type: 'DEFINED_IN',
           from: uuid,
-          to: `file:${relPath}`
+          to: UniqueIDHelper.GenerateFileUUID(filePath)
         });
       }
     }
@@ -1094,10 +1097,11 @@ export class CodeSourceAdapter extends SourceAdapter {
 
         // Create IN_DIRECTORY relationship (File -> Directory)
         if (currentPath === relPath) {
+          const absDirPath = path.join(projectRoot, dir);
           relationships.push({
             type: 'IN_DIRECTORY',
-            from: `file:${relPath}`,
-            to: `dir:${dir}`
+            from: UniqueIDHelper.GenerateFileUUID(filePath),
+            to: UniqueIDHelper.GenerateDirectoryUUID(absDirPath)
           });
         }
 
@@ -1108,13 +1112,15 @@ export class CodeSourceAdapter extends SourceAdapter {
     // Create Directory nodes
     for (const dir of directories) {
       const depth = dir.split('/').filter(p => p.length > 0).length;
-      const dirUuid = `dir:${dir}`;
+      const absDirPath = path.join(projectRoot, dir);
+      const dirUuid = UniqueIDHelper.GenerateDirectoryUUID(absDirPath);
       nodes.push({
         labels: ['Directory'],
         id: dirUuid,
         properties: {
-          uuid: dirUuid, // Required for relationship matching
-          path: dir,
+          uuid: dirUuid,
+          path: dir,  // Keep relative for display
+          absolutePath: absDirPath,
           depth
         }
       });
@@ -1124,10 +1130,12 @@ export class CodeSourceAdapter extends SourceAdapter {
     for (const dir of directories) {
       const parentDir = dir.includes('/') ? dir.substring(0, dir.lastIndexOf('/')) : '';
       if (parentDir && parentDir !== '.' && parentDir !== '' && directories.has(parentDir)) {
+        const absParentPath = path.join(projectRoot, parentDir);
+        const absDirPath = path.join(projectRoot, dir);
         relationships.push({
           type: 'PARENT_OF',
-          from: `dir:${parentDir}`,
-          to: `dir:${dir}`
+          from: UniqueIDHelper.GenerateDirectoryUUID(absParentPath),
+          to: UniqueIDHelper.GenerateDirectoryUUID(absDirPath)
         });
       }
     }
@@ -1273,7 +1281,7 @@ export class CodeSourceAdapter extends SourceAdapter {
             relationships.push({
               type: 'USES_LIBRARY',
               from: sourceUuid,
-              to: `lib:${imp.source}`,
+              to: UniqueIDHelper.GenerateExternalLibraryUUID(imp.source),
               properties: {
                 symbol: imp.imported
               }
@@ -1285,10 +1293,12 @@ export class CodeSourceAdapter extends SourceAdapter {
 
     // Create ExternalLibrary nodes
     for (const [libName] of externalLibs) {
+      const libId = UniqueIDHelper.GenerateExternalLibraryUUID(libName);
       nodes.push({
         labels: ['ExternalLibrary'],
-        id: `lib:${libName}`,
+        id: libId,
         properties: {
+          uuid: libId,
           name: libName
         }
       });
@@ -1301,13 +1311,14 @@ export class CodeSourceAdapter extends SourceAdapter {
       const doc = htmlResult.document;
 
       // Create WebDocument node
-      const docId = `webdoc:${doc.uuid}`;
+      const docId = UniqueIDHelper.GenerateWebDocumentUUID(filePath);
       nodes.push({
         labels: ['WebDocument'],
         id: docId,
         properties: {
-          uuid: docId, // Use prefixed ID for relationship matching
+          uuid: docId,
           file: relPath,
+          absolutePath: filePath,
           type: doc.type, // 'html' | 'vue-sfc' | 'svelte' | 'astro'
           hash: doc.hash,
           hasTemplate: doc.hasTemplate,
@@ -1337,9 +1348,10 @@ export class CodeSourceAdapter extends SourceAdapter {
 
       nodes.push({
         labels: ['File'],
-        id: `file:${relPath}`,
+        id: UniqueIDHelper.GenerateFileUUID(filePath),
         properties: {
           path: relPath,
+          absolutePath: filePath,
           name: fileName,
           directory,
           extension,
@@ -1352,7 +1364,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       // Create BELONGS_TO relationship (File -> Project)
       relationships.push({
         type: 'BELONGS_TO',
-        from: `file:${relPath}`,
+        from: UniqueIDHelper.GenerateFileUUID(filePath),
         to: projectId
       });
 
@@ -1360,16 +1372,17 @@ export class CodeSourceAdapter extends SourceAdapter {
       relationships.push({
         type: 'DEFINED_IN',
         from: docId,
-        to: `file:${relPath}`
+        to: UniqueIDHelper.GenerateFileUUID(filePath)
       });
 
       // Create Image nodes and relationships
       for (const img of doc.images) {
-        const imgId = `img:${doc.uuid}:${img.line}`;
+        const imgId = UniqueIDHelper.GenerateImageUUID(filePath, img.line);
         nodes.push({
           labels: ['Image'],
           id: imgId,
           properties: {
+            uuid: imgId,
             src: img.src,
             alt: img.alt || null,
             line: img.line
@@ -1393,11 +1406,15 @@ export class CodeSourceAdapter extends SourceAdapter {
         if (!directories.has(dir)) {
           directories.add(dir);
           const depth = dir.split('/').filter(p => p.length > 0).length;
+          const absDirPath = path.join(projectRoot, dir);
+          const dirUuid = UniqueIDHelper.GenerateDirectoryUUID(absDirPath);
           nodes.push({
             labels: ['Directory'],
-            id: `dir:${dir}`,
+            id: dirUuid,
             properties: {
+              uuid: dirUuid,
               path: dir,
+              absolutePath: absDirPath,
               depth
             }
           });
@@ -1405,10 +1422,11 @@ export class CodeSourceAdapter extends SourceAdapter {
 
         // Create IN_DIRECTORY relationship (File -> Directory)
         if (currentPath === relPath) {
+          const absDirPath = path.join(projectRoot, dir);
           relationships.push({
             type: 'IN_DIRECTORY',
-            from: `file:${relPath}`,
-            to: `dir:${dir}`
+            from: UniqueIDHelper.GenerateFileUUID(filePath),
+            to: UniqueIDHelper.GenerateDirectoryUUID(absDirPath)
           });
         }
 
@@ -1429,6 +1447,7 @@ export class CodeSourceAdapter extends SourceAdapter {
               name: scope.name,
               type: scope.type,
               file: relPath,
+              absolutePath: filePath,
               language: 'typescript', // Embedded scripts are typically TS/JS
               startLine: scope.startLine,
               endLine: scope.endLine,
@@ -1455,7 +1474,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           relationships.push({
             type: 'DEFINED_IN',
             from: scopeUuid,
-            to: `file:${relPath}`
+            to: UniqueIDHelper.GenerateFileUUID(filePath)
           });
 
           // Create SCRIPT_OF relationship (Scope -> WebDocument)
@@ -1474,13 +1493,14 @@ export class CodeSourceAdapter extends SourceAdapter {
       const stylesheet = cssResult.stylesheet;
 
       // Create Stylesheet node
-      const stylesheetId = `stylesheet:${stylesheet.uuid}`;
+      const stylesheetId = UniqueIDHelper.GenerateStylesheetUUID(filePath);
       nodes.push({
         labels: ['Stylesheet'],
         id: stylesheetId,
         properties: {
           uuid: stylesheetId,
           file: relPath,
+          absolutePath: filePath,
           hash: stylesheet.hash,
           linesOfCode: stylesheet.linesOfCode,
           ruleCount: stylesheet.ruleCount,
@@ -1506,7 +1526,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const fileName = relPath.split('/').pop() || relPath;
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = fileName.includes('.') ? fileName.substring(fileName.lastIndexOf('.')) : '';
-      const fileUuid = `file:${relPath}`;
+      const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
       const { rawContentHash, mtime } = await this.computeFileMetadata(filePath);
 
       nodes.push({
@@ -1515,6 +1535,7 @@ export class CodeSourceAdapter extends SourceAdapter {
         properties: {
           uuid: fileUuid,
           path: relPath,
+          absolutePath: filePath,
           name: fileName,
           directory,
           extension,
@@ -1550,7 +1571,7 @@ export class CodeSourceAdapter extends SourceAdapter {
 
       // Create CSSVariable nodes
       for (const variable of stylesheet.variables) {
-        const varId = `cssvar:${stylesheet.uuid}:${variable.name}`;
+        const varId = UniqueIDHelper.GenerateCSSVariableUUID(filePath, variable.name);
         nodes.push({
           labels: ['CSSVariable'],
           id: varId,
@@ -1579,7 +1600,8 @@ export class CodeSourceAdapter extends SourceAdapter {
 
         if (!directories.has(dir)) {
           directories.add(dir);
-          const dirUuid = `dir:${dir}`;
+          const absDirPath = path.join(projectRoot, dir);
+          const dirUuid = UniqueIDHelper.GenerateDirectoryUUID(absDirPath);
           const depth = dir.split('/').filter(p => p.length > 0).length;
           nodes.push({
             labels: ['Directory'],
@@ -1587,16 +1609,18 @@ export class CodeSourceAdapter extends SourceAdapter {
             properties: {
               uuid: dirUuid,
               path: dir,
+              absolutePath: absDirPath,
               depth
             }
           });
         }
 
         if (currentPath === relPath) {
+          const absDirPath = path.join(projectRoot, dir);
           relationships.push({
             type: 'IN_DIRECTORY',
             from: fileUuid,
-            to: `dir:${dir}`
+            to: UniqueIDHelper.GenerateDirectoryUUID(absDirPath)
           });
         }
 
@@ -1610,13 +1634,14 @@ export class CodeSourceAdapter extends SourceAdapter {
       const stylesheet = scssResult.stylesheet;
 
       // Create Stylesheet node (same label as CSS, but with scss type)
-      const stylesheetId = `stylesheet:${stylesheet.uuid}`;
+      const stylesheetId = UniqueIDHelper.GenerateStylesheetUUID(filePath);
       nodes.push({
         labels: ['Stylesheet'],
         id: stylesheetId,
         properties: {
           uuid: stylesheetId,
           file: relPath,
+          absolutePath: filePath,
           type: 'scss',
           hash: stylesheet.hash,
           linesOfCode: stylesheet.linesOfCode,
@@ -1642,7 +1667,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const fileName = relPath.split('/').pop() || relPath;
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = fileName.includes('.') ? fileName.substring(fileName.lastIndexOf('.')) : '';
-      const fileUuid = `file:${relPath}`;
+      const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
       const { rawContentHash: scssRawHash, mtime: scssMtime } = await this.computeFileMetadata(filePath);
 
       nodes.push({
@@ -1651,6 +1676,7 @@ export class CodeSourceAdapter extends SourceAdapter {
         properties: {
           uuid: fileUuid,
           path: relPath,
+          absolutePath: filePath,
           name: fileName,
           directory,
           extension,
@@ -1673,7 +1699,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       });
 
       // Add directory handling
-      this.ensureDirectoryNodes(relPath, directories, nodes, relationships, fileUuid);
+      this.ensureDirectoryNodes(relPath, directories, nodes, relationships, fileUuid, projectRoot);
     }
 
     // Create VueSFC nodes for Vue files
@@ -1681,13 +1707,14 @@ export class CodeSourceAdapter extends SourceAdapter {
       const relPath = path.relative(projectRoot, filePath);
       const sfc = vueResult.sfc; // Access nested VueSFCInfo
 
-      const vueId = `vue:${sfc.uuid}`;
+      const vueId = UniqueIDHelper.GenerateVueSFCUUID(filePath);
       nodes.push({
         labels: ['VueSFC'],
         id: vueId,
         properties: {
           uuid: vueId,
           file: relPath,
+          absolutePath: filePath,
           componentName: sfc.componentName || path.basename(relPath, '.vue'),
           hash: sfc.hash,
           hasTemplate: sfc.hasTemplate,
@@ -1714,7 +1741,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const fileName = relPath.split('/').pop() || relPath;
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = '.vue';
-      const fileUuid = `file:${relPath}`;
+      const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
       const { rawContentHash: vueRawHash, mtime: vueMtime } = await this.computeFileMetadata(filePath);
 
       nodes.push({
@@ -1723,6 +1750,7 @@ export class CodeSourceAdapter extends SourceAdapter {
         properties: {
           uuid: fileUuid,
           path: relPath,
+          absolutePath: filePath,
           name: fileName,
           directory,
           extension,
@@ -1745,7 +1773,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       });
 
       // Add directory handling
-      this.ensureDirectoryNodes(relPath, directories, nodes, relationships, fileUuid);
+      this.ensureDirectoryNodes(relPath, directories, nodes, relationships, fileUuid, projectRoot);
 
       // Note: Vue script scopes would require parsing the script block content
       // This could be added later by extracting script content from vueResult.blocks
@@ -1756,13 +1784,14 @@ export class CodeSourceAdapter extends SourceAdapter {
       const relPath = path.relative(projectRoot, filePath);
       const component = svelteResult.component; // Access nested SvelteComponentInfo
 
-      const svelteId = `svelte:${component.uuid}`;
+      const svelteId = UniqueIDHelper.GenerateSvelteComponentUUID(filePath);
       nodes.push({
         labels: ['SvelteComponent'],
         id: svelteId,
         properties: {
           uuid: svelteId,
           file: relPath,
+          absolutePath: filePath,
           componentName: component.componentName || path.basename(relPath, '.svelte'),
           hash: component.hash,
           hasScript: component.hasScript,
@@ -1785,7 +1814,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const fileName = relPath.split('/').pop() || relPath;
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = '.svelte';
-      const fileUuid = `file:${relPath}`;
+      const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
       const { rawContentHash: svelteRawHash, mtime: svelteMtime } = await this.computeFileMetadata(filePath);
 
       nodes.push({
@@ -1794,6 +1823,7 @@ export class CodeSourceAdapter extends SourceAdapter {
         properties: {
           uuid: fileUuid,
           path: relPath,
+          absolutePath: filePath,
           name: fileName,
           directory,
           extension,
@@ -1815,7 +1845,7 @@ export class CodeSourceAdapter extends SourceAdapter {
         to: fileUuid
       });
 
-      this.ensureDirectoryNodes(relPath, directories, nodes, relationships, fileUuid);
+      this.ensureDirectoryNodes(relPath, directories, nodes, relationships, fileUuid, projectRoot);
 
       // Note: Svelte script scopes would require parsing the script block content
       // This could be added later by extracting script content from svelteResult.blocks
@@ -1826,13 +1856,14 @@ export class CodeSourceAdapter extends SourceAdapter {
       const relPath = path.relative(projectRoot, filePath);
       const doc = mdResult.document;
 
-      const mdId = `markdown:${doc.uuid}`;
+      const mdId = UniqueIDHelper.GenerateMarkdownDocumentUUID(filePath);
       nodes.push({
         labels: ['MarkdownDocument'],
         id: mdId,
         properties: {
           uuid: mdId,
           file: relPath,
+          absolutePath: filePath,
           type: 'markdown',
           hash: doc.hash,
           title: doc.title || null,
@@ -1857,7 +1888,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const fileName = relPath.split('/').pop() || relPath;
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = fileName.includes('.') ? fileName.substring(fileName.lastIndexOf('.')) : '';
-      const fileUuid = `file:${relPath}`;
+      const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
       const { rawContentHash: mdRawHash, mtime: mdMtime } = await this.computeFileMetadata(filePath);
 
       nodes.push({
@@ -1866,6 +1897,7 @@ export class CodeSourceAdapter extends SourceAdapter {
         properties: {
           uuid: fileUuid,
           path: relPath,
+          absolutePath: filePath,
           name: fileName,
           directory,
           extension,
@@ -1887,13 +1919,13 @@ export class CodeSourceAdapter extends SourceAdapter {
         to: fileUuid
       });
 
-      this.ensureDirectoryNodes(relPath, directories, nodes, relationships, fileUuid);
+      this.ensureDirectoryNodes(relPath, directories, nodes, relationships, fileUuid, projectRoot);
 
       // Create CodeBlock nodes for embedded code
       if (doc.codeBlocks && doc.codeBlocks.length > 0) {
         for (let i = 0; i < doc.codeBlocks.length; i++) {
           const block = doc.codeBlocks[i];
-          const blockId = `codeblock:${doc.uuid}:${i}`;
+          const blockId = UniqueIDHelper.GenerateCodeBlockUUID(filePath, block.startLine);
           // Compute hash from code for incremental ingestion
           const blockHash = createHash('sha256').update(block.code || '').digest('hex').slice(0, 16);
 
@@ -1904,6 +1936,7 @@ export class CodeSourceAdapter extends SourceAdapter {
               uuid: blockId,
               projectId,
               file: relPath,
+              absolutePath: filePath,
               language: block.language || 'text',
               code: block.code,
               rawText: block.code, // For unified search
@@ -1925,7 +1958,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       // Create MarkdownSection nodes for each section (searchable content)
       if (doc.sections && doc.sections.length > 0) {
         for (const section of doc.sections) {
-          const sectionId = `section:${section.uuid}`;
+          const sectionId = UniqueIDHelper.GenerateMarkdownSectionUUID(filePath, section.startLine);
           // Compute hash from content for incremental ingestion
           const sectionHash = createHash('sha256').update(section.content || '').digest('hex').slice(0, 16);
 
@@ -1936,6 +1969,7 @@ export class CodeSourceAdapter extends SourceAdapter {
               uuid: sectionId,
               projectId,
               file: relPath,
+              absolutePath: filePath,
               title: section.title,
               level: section.level,
               slug: section.slug,
@@ -1962,10 +1996,11 @@ export class CodeSourceAdapter extends SourceAdapter {
           if (section.parentTitle) {
             const parentSection = doc.sections.find(s => s.title === section.parentTitle);
             if (parentSection) {
+              const parentSectionId = UniqueIDHelper.GenerateMarkdownSectionUUID(filePath, parentSection.startLine);
               relationships.push({
                 type: 'CHILD_OF',
                 from: sectionId,
-                to: `section:${parentSection.uuid}`
+                to: parentSectionId
               });
             }
           }
@@ -1978,13 +2013,14 @@ export class CodeSourceAdapter extends SourceAdapter {
       const relPath = path.relative(projectRoot, filePath);
 
       // Generate UUID from hash since GenericFileAnalysis doesn't have uuid
-      const genericId = `generic:${genericResult.hash}`;
+      const genericId = UniqueIDHelper.GenerateGenericFileUUID(filePath);
       nodes.push({
         labels: ['GenericFile'],
         id: genericId,
         properties: {
           uuid: genericId,
           file: relPath,
+          absolutePath: filePath,
           hash: genericResult.hash,
           linesOfCode: genericResult.linesOfCode,
           language: genericResult.languageHint || 'unknown',
@@ -2004,7 +2040,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const fileName = relPath.split('/').pop() || relPath;
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = fileName.includes('.') ? fileName.substring(fileName.lastIndexOf('.')) : '';
-      const fileUuid = `file:${relPath}`;
+      const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
       const { rawContentHash: genericRawHash, mtime: genericMtime } = await this.computeFileMetadata(filePath);
 
       nodes.push({
@@ -2013,6 +2049,7 @@ export class CodeSourceAdapter extends SourceAdapter {
         properties: {
           uuid: fileUuid,
           path: relPath,
+          absolutePath: filePath,
           name: fileName,
           directory,
           extension,
@@ -2034,7 +2071,7 @@ export class CodeSourceAdapter extends SourceAdapter {
         to: fileUuid
       });
 
-      this.ensureDirectoryNodes(relPath, directories, nodes, relationships, fileUuid);
+      this.ensureDirectoryNodes(relPath, directories, nodes, relationships, fileUuid, projectRoot);
     }
 
     // Create DataFile nodes for data files (JSON, YAML, XML, TOML, ENV)
@@ -2058,13 +2095,14 @@ export class CodeSourceAdapter extends SourceAdapter {
       const relPath = path.relative(projectRoot, filePath);
 
       // Create DataFile node
-      const dataFileId = `datafile:${dataInfo.uuid}`;
+      const dataFileId = UniqueIDHelper.GenerateDataFileUUID(filePath);
       nodes.push({
         labels: ['DataFile'],
         id: dataFileId,
         properties: {
           uuid: dataFileId,
           file: relPath,
+          absolutePath: filePath,
           format: dataInfo.format,
           hash: dataInfo.hash,
           linesOfCode: dataInfo.linesOfCode,
@@ -2084,7 +2122,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const fileName = relPath.split('/').pop() || relPath;
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = fileName.includes('.') ? fileName.substring(fileName.lastIndexOf('.')) : '';
-      const fileUuid = `file:${relPath}`;
+      const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
       const { rawContentHash: dataRawHash, mtime: dataMtime } = await this.computeFileMetadata(filePath);
 
       nodes.push({
@@ -2093,6 +2131,7 @@ export class CodeSourceAdapter extends SourceAdapter {
         properties: {
           uuid: fileUuid,
           path: relPath,
+          absolutePath: filePath,
           name: fileName,
           directory,
           extension,
@@ -2114,11 +2153,11 @@ export class CodeSourceAdapter extends SourceAdapter {
         to: fileUuid
       });
 
-      this.ensureDirectoryNodes(relPath, directories, nodes, relationships, fileUuid);
+      this.ensureDirectoryNodes(relPath, directories, nodes, relationships, fileUuid, projectRoot);
 
       // Create DataSection nodes for top-level sections
       for (const section of dataInfo.sections) {
-        this.createDataSectionNodes(section, dataFileId, nodes, relationships, dataInfo.uuid);
+        this.createDataSectionNodes(section, dataFileId, nodes, relationships, filePath);
       }
 
       // Create REFERENCES relationships for detected references
@@ -2127,7 +2166,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           // Create or reference ExternalURL node
           let urlUuid = externalUrls.get(ref.value);
           if (!urlUuid) {
-            urlUuid = `url:${createHash('sha256').update(ref.value).digest('hex').substring(0, 12)}`;
+            urlUuid = UniqueIDHelper.GenerateExternalURLUUID(ref.value);
             externalUrls.set(ref.value, urlUuid);
 
             // Extract domain from URL
@@ -2160,10 +2199,11 @@ export class CodeSourceAdapter extends SourceAdapter {
           // Reference to a file - resolve relative path
           const refPath = this.resolveReferencePath(ref.value, relPath, projectRoot);
           if (refPath && allFilePaths.has(refPath)) {
+            const refAbsPath = path.join(projectRoot, refPath);
             relationships.push({
               type: 'REFERENCES',
               from: dataFileId,
-              to: `file:${refPath}`,
+              to: UniqueIDHelper.GenerateFileUUID(refAbsPath),
               properties: { path: ref.path, refType: ref.type }
             });
           }
@@ -2171,10 +2211,11 @@ export class CodeSourceAdapter extends SourceAdapter {
           // Reference to image - will link to MediaFile when created
           const refPath = this.resolveReferencePath(ref.value, relPath, projectRoot);
           if (refPath) {
+            const refAbsPath = path.join(projectRoot, refPath);
             relationships.push({
               type: 'REFERENCES_IMAGE',
               from: dataFileId,
-              to: `file:${refPath}`,
+              to: UniqueIDHelper.GenerateFileUUID(refAbsPath),
               properties: { path: ref.path }
             });
           }
@@ -2182,16 +2223,17 @@ export class CodeSourceAdapter extends SourceAdapter {
           // Reference to directory
           const refPath = this.resolveReferencePath(ref.value, relPath, projectRoot);
           if (refPath && directories.has(refPath)) {
+            const absRefPath = path.join(projectRoot, refPath);
             relationships.push({
               type: 'REFERENCES',
               from: dataFileId,
-              to: `dir:${refPath}`,
+              to: UniqueIDHelper.GenerateDirectoryUUID(absRefPath),
               properties: { path: ref.path, refType: 'directory' }
             });
           }
         } else if (ref.type === 'package') {
           // Reference to npm/pip package - create ExternalLibrary node
-          const pkgUuid = `pkg:${ref.value}`;
+          const pkgUuid = UniqueIDHelper.GenerateExternalLibraryUUID(ref.value);
           // Check if already created (avoid duplicates)
           if (!nodes.some(n => n.id === pkgUuid)) {
             nodes.push({
@@ -2229,6 +2271,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const properties: Record<string, unknown> = {
         uuid: mediaId,
         file: relPath,
+        absolutePath: filePath,
         format: mediaInfo.format,
         category: mediaInfo.category,
         hash: mediaInfo.hash,
@@ -2281,7 +2324,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const fileName = relPath.split('/').pop() || relPath;
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = path.extname(relPath);
-      const fileUuid = `file:${relPath}`;
+      const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
       const { rawContentHash: mediaRawHash, mtime: mediaMtime } = await this.computeFileMetadata(filePath);
 
       nodes.push({
@@ -2290,6 +2333,7 @@ export class CodeSourceAdapter extends SourceAdapter {
         properties: {
           uuid: fileUuid,
           path: relPath,
+          absolutePath: filePath,
           name: fileName,
           directory,
           extension,
@@ -2311,7 +2355,7 @@ export class CodeSourceAdapter extends SourceAdapter {
         to: fileUuid
       });
 
-      this.ensureDirectoryNodes(relPath, directories, nodes, relationships, fileUuid);
+      this.ensureDirectoryNodes(relPath, directories, nodes, relationships, fileUuid, projectRoot);
     }
 
     // Create DocumentFile nodes for PDFs, DOCX, XLSX (with full text extraction)
@@ -2329,6 +2373,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const properties: Record<string, unknown> = {
         uuid: docId,
         file: relPath,
+        absolutePath: filePath,
         format: docInfo.format,
         hash: docInfo.hash,
         sizeBytes: docInfo.sizeBytes,
@@ -2375,7 +2420,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const fileName = relPath.split('/').pop() || relPath;
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = path.extname(relPath);
-      const fileUuid = `file:${relPath}`;
+      const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
       const { rawContentHash: docRawHash, mtime: docMtime } = await this.computeFileMetadata(filePath);
 
       nodes.push({
@@ -2384,6 +2429,7 @@ export class CodeSourceAdapter extends SourceAdapter {
         properties: {
           uuid: fileUuid,
           path: relPath,
+          absolutePath: filePath,
           name: fileName,
           directory,
           extension,
@@ -2405,7 +2451,7 @@ export class CodeSourceAdapter extends SourceAdapter {
         to: fileUuid
       });
 
-      this.ensureDirectoryNodes(relPath, directories, nodes, relationships, fileUuid);
+      this.ensureDirectoryNodes(relPath, directories, nodes, relationships, fileUuid, projectRoot);
     }
 
     return {
@@ -2428,7 +2474,8 @@ export class CodeSourceAdapter extends SourceAdapter {
     directories: Set<string>,
     nodes: ParsedNode[],
     relationships: ParsedRelationship[],
-    fileUuid: string
+    fileUuid: string,
+    projectRoot: string
   ): void {
     let currentPath = relPath;
     while (true) {
@@ -2437,7 +2484,8 @@ export class CodeSourceAdapter extends SourceAdapter {
 
       if (!directories.has(dir)) {
         directories.add(dir);
-        const dirUuid = `dir:${dir}`;
+        const absDirPath = path.join(projectRoot, dir);
+        const dirUuid = UniqueIDHelper.GenerateDirectoryUUID(absDirPath);
         const depth = dir.split('/').filter(p => p.length > 0).length;
         nodes.push({
           labels: ['Directory'],
@@ -2445,16 +2493,18 @@ export class CodeSourceAdapter extends SourceAdapter {
           properties: {
             uuid: dirUuid,
             path: dir,
+            absolutePath: absDirPath,
             depth
           }
         });
       }
 
       if (currentPath === relPath) {
+        const absDirPath = path.join(projectRoot, dir);
         relationships.push({
           type: 'IN_DIRECTORY',
           from: fileUuid,
-          to: `dir:${dir}`
+          to: UniqueIDHelper.GenerateDirectoryUUID(absDirPath)
         });
       }
 
@@ -2470,10 +2520,10 @@ export class CodeSourceAdapter extends SourceAdapter {
     parentId: string,
     nodes: ParsedNode[],
     relationships: ParsedRelationship[],
-    fileUuid: string,
+    absolutePath: string,
     isRoot: boolean = true
   ): void {
-    const sectionId = `datasection:${fileUuid}:${section.path}`;
+    const sectionId = UniqueIDHelper.GenerateDataSectionUUID(absolutePath, section.path);
 
     nodes.push({
       labels: ['DataSection'],
@@ -2501,7 +2551,7 @@ export class CodeSourceAdapter extends SourceAdapter {
     // Recursively create child sections (limit depth to avoid explosion)
     if (section.children && section.depth < 3) {
       for (const child of section.children) {
-        this.createDataSectionNodes(child, sectionId, nodes, relationships, fileUuid, false);
+        this.createDataSectionNodes(child, sectionId, nodes, relationships, absolutePath, false);
       }
     }
   }

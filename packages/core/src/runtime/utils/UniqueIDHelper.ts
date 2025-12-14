@@ -184,6 +184,189 @@ export class UniqueIDHelper {
     return this.GenerateDeterministicUUID(input);
   }
 
+  // ==========================================================================
+  // File-specific UUID generators
+  // ==========================================================================
+
+  /**
+   * Generate a deterministic UUID for a file based on its absolute path
+   * This ensures the same file always gets the same UUID, regardless of
+   * whether it's accessed as an orphan (touched-files) or via ingest_directory
+   * @param absolutePath The absolute path to the file
+   * @returns A deterministic UUID string prefixed with "file:"
+   */
+  public static GenerateFileUUID(absolutePath: string): string {
+    const uuid = this.GenerateDeterministicUUID(`file:${absolutePath}`);
+    return `file:${uuid}`;
+  }
+
+  /**
+   * Generate a deterministic UUID for a directory based on its path
+   * @param dirPath The directory path (absolute)
+   * @returns A deterministic UUID string prefixed with "dir:"
+   */
+  public static GenerateDirectoryUUID(dirPath: string): string {
+    const uuid = this.GenerateDeterministicUUID(`dir:${dirPath}`);
+    return `dir:${uuid}`;
+  }
+
+  /**
+   * Generate a deterministic UUID for a MarkdownDocument
+   * @param absolutePath The absolute path to the markdown file
+   * @returns A deterministic UUID string prefixed with "markdown:"
+   */
+  public static GenerateMarkdownDocumentUUID(absolutePath: string): string {
+    const uuid = this.GenerateDeterministicUUID(`markdown:${absolutePath}`);
+    return `markdown:${uuid}`;
+  }
+
+  /**
+   * Generate a deterministic UUID for a MarkdownSection
+   * Identity = file + position (startLine)
+   * @param absolutePath The absolute path to the markdown file
+   * @param startLine The start line of the section
+   * @returns A deterministic UUID string prefixed with "section:"
+   */
+  public static GenerateMarkdownSectionUUID(absolutePath: string, startLine: number): string {
+    const uuid = this.GenerateDeterministicUUID(`section:${absolutePath}:${startLine}`);
+    return `section:${uuid}`;
+  }
+
+  /**
+   * Generate a deterministic UUID for a CodeBlock
+   * Identity = file + position (startLine)
+   * @param absolutePath The absolute path to the file containing the code block
+   * @param startLine The start line of the code block
+   * @returns A deterministic UUID string prefixed with "codeblock:"
+   */
+  public static GenerateCodeBlockUUID(absolutePath: string, startLine: number): string {
+    const uuid = this.GenerateDeterministicUUID(`codeblock:${absolutePath}:${startLine}`);
+    return `codeblock:${uuid}`;
+  }
+
+  /**
+   * Generate a deterministic UUID for a Stylesheet (CSS/SCSS)
+   * @param absolutePath The absolute path to the stylesheet file
+   * @returns A deterministic UUID string prefixed with "stylesheet:"
+   */
+  public static GenerateStylesheetUUID(absolutePath: string): string {
+    const uuid = this.GenerateDeterministicUUID(`stylesheet:${absolutePath}`);
+    return `stylesheet:${uuid}`;
+  }
+
+  /**
+   * Generate a deterministic UUID for a VueSFC component
+   * @param absolutePath The absolute path to the Vue file
+   * @returns A deterministic UUID string prefixed with "vue:"
+   */
+  public static GenerateVueSFCUUID(absolutePath: string): string {
+    const uuid = this.GenerateDeterministicUUID(`vue:${absolutePath}`);
+    return `vue:${uuid}`;
+  }
+
+  /**
+   * Generate a deterministic UUID for a SvelteComponent
+   * @param absolutePath The absolute path to the Svelte file
+   * @returns A deterministic UUID string prefixed with "svelte:"
+   */
+  public static GenerateSvelteComponentUUID(absolutePath: string): string {
+    const uuid = this.GenerateDeterministicUUID(`svelte:${absolutePath}`);
+    return `svelte:${uuid}`;
+  }
+
+  /**
+   * Generate a deterministic UUID for a WebDocument (HTML)
+   * @param absolutePath The absolute path to the HTML file
+   * @returns A deterministic UUID string prefixed with "webdoc:"
+   */
+  public static GenerateWebDocumentUUID(absolutePath: string): string {
+    const uuid = this.GenerateDeterministicUUID(`webdoc:${absolutePath}`);
+    return `webdoc:${uuid}`;
+  }
+
+  /**
+   * Generate a deterministic UUID for a GenericFile
+   * @param absolutePath The absolute path to the file
+   * @returns A deterministic UUID string prefixed with "generic:"
+   */
+  public static GenerateGenericFileUUID(absolutePath: string): string {
+    const uuid = this.GenerateDeterministicUUID(`generic:${absolutePath}`);
+    return `generic:${uuid}`;
+  }
+
+  /**
+   * Generate a deterministic UUID for a DataFile (JSON, YAML, etc.)
+   * @param absolutePath The absolute path to the data file
+   * @returns A deterministic UUID string prefixed with "datafile:"
+   */
+  public static GenerateDataFileUUID(absolutePath: string): string {
+    const uuid = this.GenerateDeterministicUUID(`datafile:${absolutePath}`);
+    return `datafile:${uuid}`;
+  }
+
+  /**
+   * Generate a deterministic UUID for a DataSection within a DataFile
+   * @param absolutePath The absolute path to the data file
+   * @param sectionPath The JSON path or key path within the data file
+   * @returns A deterministic UUID string prefixed with "datasection:"
+   */
+  public static GenerateDataSectionUUID(absolutePath: string, sectionPath: string): string {
+    const uuid = this.GenerateDeterministicUUID(`datasection:${absolutePath}:${sectionPath}`);
+    return `datasection:${uuid}`;
+  }
+
+  /**
+   * Generate a deterministic UUID for a CSSVariable
+   * @param absolutePath The absolute path to the stylesheet
+   * @param variableName The CSS variable name
+   * @returns A deterministic UUID string prefixed with "cssvar:"
+   */
+  public static GenerateCSSVariableUUID(absolutePath: string, variableName: string): string {
+    const uuid = this.GenerateDeterministicUUID(`cssvar:${absolutePath}:${variableName}`);
+    return `cssvar:${uuid}`;
+  }
+
+  /**
+   * Generate a deterministic UUID for an ExternalLibrary
+   * @param libraryName The name of the external library/package
+   * @returns A deterministic UUID string prefixed with "lib:"
+   */
+  public static GenerateExternalLibraryUUID(libraryName: string): string {
+    const uuid = this.GenerateDeterministicUUID(`lib:${libraryName}`);
+    return `lib:${uuid}`;
+  }
+
+  /**
+   * Generate a deterministic UUID for an ExternalURL
+   * @param url The external URL
+   * @returns A deterministic UUID string prefixed with "url:"
+   */
+  public static GenerateExternalURLUUID(url: string): string {
+    const uuid = this.GenerateDeterministicUUID(`url:${url}`);
+    return `url:${uuid}`;
+  }
+
+  /**
+   * Generate a deterministic UUID for a PackageJson
+   * @param absolutePath The absolute path to the package.json file
+   * @returns A deterministic UUID string prefixed with "pkg:"
+   */
+  public static GeneratePackageJsonUUID(absolutePath: string): string {
+    const uuid = this.GenerateDeterministicUUID(`pkg:${absolutePath}`);
+    return `pkg:${uuid}`;
+  }
+
+  /**
+   * Generate a deterministic UUID for an Image node
+   * @param absolutePath The absolute path to the file containing the image reference
+   * @param line The line number where the image is referenced
+   * @returns A deterministic UUID string prefixed with "img:"
+   */
+  public static GenerateImageUUID(absolutePath: string, line: number): string {
+    const uuid = this.GenerateDeterministicUUID(`img:${absolutePath}:${line}`);
+    return `img:${uuid}`;
+  }
+
   /**
    * Generate a unique conversation UUID with database collision check
    * Retries with a new random UUID if collision detected
