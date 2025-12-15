@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: file: blob:; connect-src 'self' blob:">
+  <title>RagForge</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body class="bg-bg-dark text-gray-300 h-screen overflow-hidden flex flex-col font-sans">
+
+  <!-- Titlebar -->
+  <div class="h-8 bg-bg-sidebar border-b border-border flex items-center px-3 shrink-0" style="-webkit-app-region: drag">
+    <img src="./ragforge_logo.png" alt="RagForge" class="h-5 w-5 object-contain">
+    <span class="text-gray-400 text-xs ml-2 font-medium">RagForge</span>
+  </div>
+
+  <!-- Main layout -->
+  <div class="flex-1 flex overflow-hidden min-h-0">
+
+    <!-- Left sidebar - Navigation -->
+    <div class="w-56 bg-bg-sidebar border-r border-border flex flex-col shrink-0">
+      <div class="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-gray-500 border-b border-border">
+        Places
+      </div>
+      <div id="places-list" class="flex-1 overflow-y-auto py-2">
+        <div class="px-3 py-2 flex items-center gap-3 cursor-pointer hover:bg-bg-hover rounded-md mx-2 text-sm" id="place-home">
+          <span>🏠</span>
+          <span>Home</span>
+        </div>
+        <div class="px-3 py-2 flex items-center gap-3 cursor-pointer hover:bg-bg-hover rounded-md mx-2 text-sm" id="place-cwd">
+          <span>📂</span>
+          <span>Project</span>
+        </div>
+      </div>
+
+      <!-- Indexed section -->
+      <div class="border-t border-border">
+        <div class="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-gray-500 flex items-center justify-between">
+          <span>Indexed</span>
+          <span id="status-indexed" class="text-emerald-400 normal-case font-normal">0</span>
+        </div>
+        <div id="indexed-list" class="max-h-48 overflow-y-auto pb-2">
+          <div class="px-4 py-2 text-center text-gray-600 text-xs">
+            No items indexed
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Main content -->
+    <div class="flex-1 flex flex-col bg-bg-dark min-w-0 overflow-hidden">
+
+      <!-- Toolbar with breadcrumb -->
+      <div class="px-4 py-2 border-b border-border flex items-center gap-3 bg-bg-panel shrink-0">
+        <!-- Navigation buttons -->
+        <button id="btn-back" class="w-8 h-8 flex items-center justify-center rounded text-gray-500 hover:text-gray-300 hover:bg-bg-hover transition-colors disabled:opacity-30" disabled>
+          ←
+        </button>
+        <button id="btn-forward" class="w-8 h-8 flex items-center justify-center rounded text-gray-500 hover:text-gray-300 hover:bg-bg-hover transition-colors disabled:opacity-30" disabled>
+          →
+        </button>
+        <button id="btn-up" class="w-8 h-8 flex items-center justify-center rounded text-gray-500 hover:text-gray-300 hover:bg-bg-hover transition-colors disabled:opacity-30" disabled>
+          ↑
+        </button>
+
+        <!-- Breadcrumb -->
+        <div id="breadcrumb" class="flex-1 flex items-center gap-1 text-sm overflow-x-auto min-w-0">
+          <span class="text-gray-500">No folder open</span>
+        </div>
+
+        <!-- Search bar -->
+        <div class="flex items-center gap-2 shrink-0">
+          <div class="relative">
+            <input id="search-input" type="text" placeholder="Search..." class="w-48 px-3 py-1.5 pl-8 text-sm bg-bg-dark border border-border rounded focus:border-accent focus:outline-none" style="-webkit-app-region: no-drag">
+            <span class="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-500 text-sm">🔍</span>
+          </div>
+          <label class="flex items-center gap-1.5 text-xs text-gray-500 cursor-pointer select-none" title="Search only in indexed files">
+            <input id="search-indexed-only" type="checkbox" class="w-3.5 h-3.5 rounded border-border bg-bg-dark accent-accent">
+            <span>Indexed</span>
+          </label>
+        </div>
+
+        <!-- View toggle -->
+        <div class="flex items-center gap-1 border border-border rounded overflow-hidden shrink-0">
+          <button id="btn-view-grid" class="w-8 h-8 flex items-center justify-center text-gray-300 bg-bg-selected text-sm" title="Grid view">
+            ⊞
+          </button>
+          <button id="btn-view-list" class="w-8 h-8 flex items-center justify-center text-gray-500 hover:text-gray-300 hover:bg-bg-hover text-sm" title="List view">
+            ☰
+          </button>
+        </div>
+
+        <!-- Refresh -->
+        <button id="btn-refresh" class="w-8 h-8 flex items-center justify-center rounded text-gray-500 hover:text-gray-300 hover:bg-bg-hover transition-colors shrink-0" title="Refresh">
+          ⟳
+        </button>
+      </div>
+
+      <!-- File grid -->
+      <div id="file-grid" class="flex-1 p-4 overflow-y-auto min-h-0">
+        <div class="h-full flex flex-col items-center justify-center text-gray-500">
+          <div class="text-6xl mb-4 opacity-30">📂</div>
+          <p class="text-sm">Select a folder to browse</p>
+        </div>
+      </div>
+
+      <!-- Chat panel -->
+      <div id="chat-wrapper" class="flex flex-col shrink-0 border-t border-border" style="height: 300px;">
+        <!-- Chat resize handle -->
+        <div id="chat-resize-handle" class="h-1 hover:h-1.5 bg-transparent hover:bg-accent/50 cursor-row-resize transition-all flex items-center justify-center group">
+          <div class="w-12 h-0.5 bg-gray-600 group-hover:bg-accent rounded-full opacity-0 group-hover:opacity-100 transition-opacity"></div>
+        </div>
+        <!-- Chat header -->
+        <div class="h-8 bg-bg-sidebar flex items-center px-3 gap-2 shrink-0">
+          <span class="text-xs font-medium text-gray-400">Research Assistant</span>
+          <!-- Conversation selector -->
+          <select id="chat-conversation-select" class="text-xs bg-bg-dark border border-border rounded px-2 py-0.5 text-gray-400 hover:text-gray-300 focus:outline-none focus:border-accent max-w-32 truncate">
+            <option value="">New conversation</option>
+          </select>
+          <div class="flex-1"></div>
+          <button id="btn-chat-new" class="text-xs text-gray-500 hover:text-gray-300 px-2" title="New conversation">+ New</button>
+          <button id="btn-chat-clear" class="text-xs text-gray-500 hover:text-gray-300 px-2" title="Clear conversation">Clear</button>
+          <button id="btn-chat-popout" class="text-xs text-gray-500 hover:text-gray-300 px-2" title="Pop out to window">↗</button>
+          <button id="btn-chat-toggle" class="text-gray-500 hover:text-gray-300 text-sm" title="Toggle chat">▼</button>
+        </div>
+        <!-- Chat messages -->
+        <div id="chat-messages" class="flex-1 overflow-y-auto p-3 space-y-3 bg-bg-dark min-h-0">
+          <div class="text-center text-gray-500 text-sm py-4">
+            <p>Ask questions about your codebase</p>
+            <p class="text-xs mt-1 text-gray-600">I can search, read files, and analyze code</p>
+          </div>
+        </div>
+        <!-- Chat input -->
+        <div class="p-2 bg-bg-sidebar border-t border-border flex gap-2 shrink-0">
+          <textarea id="chat-input" placeholder="Ask a question..." rows="1" class="flex-1 px-3 py-2 text-sm bg-bg-dark border border-border rounded resize-none focus:border-accent focus:outline-none max-h-24" style="-webkit-app-region: no-drag"></textarea>
+          <button id="btn-chat-send" class="px-4 py-2 bg-accent hover:bg-accent/80 text-white text-sm rounded font-medium disabled:opacity-50 disabled:cursor-not-allowed shrink-0" disabled>
+            Send
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right sidebar - Actions -->
+    <div id="action-panel-wrapper" class="relative flex shrink-0">
+      <!-- Resize handle -->
+      <div id="resize-handle" class="w-1 hover:w-1.5 bg-transparent hover:bg-accent/50 cursor-col-resize transition-all flex items-center justify-center group">
+        <div class="w-0.5 h-8 bg-gray-600 group-hover:bg-accent rounded-full opacity-0 group-hover:opacity-100 transition-opacity"></div>
+      </div>
+      <!-- Collapse toggle -->
+      <button id="btn-toggle-panel" class="absolute -left-6 top-1/2 -translate-y-1/2 w-5 h-10 bg-bg-sidebar border border-border border-r-0 rounded-l flex items-center justify-center text-gray-500 hover:text-gray-300 hover:bg-bg-hover transition-colors z-10" title="Toggle panel">
+        <span id="toggle-arrow">›</span>
+      </button>
+      <div id="action-panel" class="w-64 min-w-48 max-w-96 bg-bg-sidebar border-l border-border flex flex-col overflow-hidden">
+        <div class="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-gray-500 border-b border-border flex items-center justify-between shrink-0">
+          <span>Selection</span>
+        </div>
+        <div id="selection-info" class="flex-1 p-4 overflow-y-auto">
+          <div class="text-center text-gray-600 text-sm py-8">
+            <p>Select files or folders</p>
+            <p class="text-xs mt-1">Right-click for options</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Context menu -->
+  <div id="context-menu" class="fixed bg-bg-panel border border-border rounded-lg shadow-xl py-1 z-50 hidden min-w-48">
+    <button id="ctx-open" class="w-full px-4 py-2 text-left text-sm hover:bg-bg-hover flex items-center gap-3">
+      <span>📂</span> Open
+    </button>
+    <div class="border-t border-border my-1"></div>
+    <button id="ctx-ingest" class="w-full px-4 py-2 text-left text-sm hover:bg-bg-hover flex items-center gap-3">
+      <span>✨</span> <span id="ctx-ingest-label">Ingest</span>
+    </button>
+    <button id="ctx-remove" class="w-full px-4 py-2 text-left text-sm hover:bg-bg-hover flex items-center gap-3 text-red-400 hidden">
+      <span>✗</span> Remove from index
+    </button>
+  </div>
+
+  <!-- Status bar -->
+  <div class="h-6 bg-bg-panel border-t border-border flex items-center px-3 text-xs text-gray-500 shrink-0">
+    <div id="status-items" class="flex-1">Ready</div>
+    <div id="status-selection" class="text-gray-400"></div>
+  </div>
+
+  <script type="module" src="./main.ts"></script>
+</body>
+</html>

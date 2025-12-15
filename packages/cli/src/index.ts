@@ -2,47 +2,11 @@
 /**
  * RagForge CLI entry point.
  *
- * Provides commands to introspect Neo4j schemas, generate RagForge
- * configs, and emit TypeScript client artifacts.
+ * Brain-based knowledge management: index files, search, and query
+ * via daemon or MCP server.
  */
 
 import process from 'process';
-import {
-  parseInitOptions,
-  runInit,
-  printInitHelp
-} from './commands/init.js';
-import {
-  parseGenerateOptions,
-  runGenerate,
-  printGenerateHelp
-} from './commands/generate.js';
-import {
-  parseIntrospectOptions,
-  runIntrospect,
-  printIntrospectHelp
-} from './commands/introspect.js';
-import {
-  parseEmbeddingsOptions,
-  runEmbeddingsIndex,
-  runEmbeddingsGenerate,
-  printEmbeddingsHelp
-} from './commands/embeddings.js';
-import {
-  parseQuickstartOptions,
-  runQuickstart,
-  printQuickstartHelp
-} from './commands/quickstart.js';
-import {
-  parseCreateOptions,
-  runCreate,
-  printCreateHelp
-} from './commands/create.js';
-import {
-  parseAgentOptions,
-  runAgent,
-  printAgentHelp
-} from './commands/agent.js';
 import {
   parseMcpServerOptions,
   runMcpServer,
@@ -69,58 +33,51 @@ import {
   runClean,
   printCleanHelp
 } from './commands/clean.js';
+import {
+  parseSetupOptions,
+  runSetup,
+  printSetupHelp
+} from './commands/setup.js';
 
 import { VERSION } from './version.js';
 
 function printRootHelp(): void {
   console.log(`RagForge CLI v${VERSION}
 
-Quick start:
-  ragforge quickstart                # New to RagForge? Start here!
-  ragforge create <name>             # Create a new TypeScript project
-  ragforge init                      # Introspect Neo4j + generate client (uses .env)
-  ragforge init --auto-detect-fields # + LLM field detection (needs GEMINI_API_KEY)
+AI-powered document search and code analysis.
+Index any files, search with natural language, query via MCP.
 
-Connection defaults from .env in current directory:
-  NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD, NEO4J_DATABASE, GEMINI_API_KEY
+Quick start:
+  ragforge setup                   # Install Docker + Neo4j
+  ragforge                         # Launch interactive TUI
+  ragforge mcp-server              # Start MCP server (for Claude Code)
 
 Usage:
-  ragforge quickstart [options]      Quick setup for code RAG with defaults
-  ragforge create <name> [options]   Create a new TypeScript project
-  ragforge agent [options]           Launch RagForge agent (RAG + File + Project tools)
-  ragforge tui [options]             Launch terminal UI (interactive agent)
-  ragforge mcp-server [options]      Start as MCP server (for Claude Code)
-  ragforge test-tool <name> [opts]   Test a tool directly (for debugging)
-  ragforge daemon <cmd>              Brain daemon management (start|stop|status)
-  ragforge clean <path> [options]    Remove embeddings and/or all data for a project
-  ragforge init [options]            Complete setup (introspect + generate)
-  ragforge help <command>            Show detailed help for a specific command
-
-Advanced commands:
-  generate             Regenerate client from existing config
-  introspect           Just introspection, no client code
-  embeddings:index     Create vector indexes
-  embeddings:generate  Generate embeddings via Gemini
+  ragforge                         Launch interactive TUI (default)
+  ragforge setup [options]         Setup Docker + Neo4j environment
+  ragforge daemon <cmd>            Brain daemon (start|stop|status|logs)
+  ragforge mcp-server [options]    Start as MCP server
+  ragforge tui [options]           Launch terminal UI
+  ragforge test-tool <name>        Test a tool directly (debugging)
+  ragforge clean <path>            Remove data for a project
+  ragforge help <command>          Show help for a command
 
 Global options:
   -h, --help       Show this message
   -v, --version    Show CLI version
 
 Examples:
-  # Quick start (auto-detects TypeScript/Python, creates config, sets up Docker)
-  ragforge quickstart
+  # First time setup
+  ragforge setup
 
-  # Simple init - uses .env in current directory
-  ragforge init
+  # Interactive mode
+  ragforge
 
-  # With LLM field auto-detection
-  ragforge init --auto-detect-fields
+  # Use with Claude Code (add to MCP config)
+  ragforge mcp-server
 
-  # Custom project name and output
-  ragforge init --project myapp --out ./generated
-
-  # Override connection (instead of .env)
-  ragforge init --uri bolt://localhost:7687 --username neo4j --password secret
+  # Check daemon status
+  ragforge daemon status
 `);
 }
 
@@ -153,31 +110,14 @@ Endpoints (port 6969):
   GET  /tools        List available tools
   GET  /projects     List loaded projects
   GET  /watchers     List active file watchers
-  GET  /logs         View recent daemon logs (JSON)
-  GET  /logs/stream  Stream logs via SSE (real-time)
   POST /tool/:name   Execute a tool
   POST /shutdown     Graceful shutdown
 
-Logs: ~/.ragforge/logs/daemon.log
-
 Examples:
-  # Check if daemon is running
   ragforge daemon status
-
-  # Start daemon in foreground (for debugging)
   ragforge daemon start -v
-
-  # Stream logs in real-time
   ragforge daemon logs
-
-  # Show last 100 log lines and exit
-  ragforge daemon logs --tail=100 --no-follow
-
-  # Stop the daemon
   ragforge daemon stop
-
-  # Call a tool via daemon (auto-starts if needed)
-  ragforge test-tool get_brain_status
 `);
 }
 
@@ -207,14 +147,8 @@ async function main(): Promise<void> {
 
       case 'help':
         switch (rest[0]) {
-          case 'quickstart':
-            printQuickstartHelp();
-            break;
-          case 'create':
-            printCreateHelp();
-            break;
-          case 'agent':
-            printAgentHelp();
+          case 'setup':
+            printSetupHelp();
             break;
           case 'tui':
             printTuiHelp();
@@ -228,18 +162,6 @@ async function main(): Promise<void> {
           case 'daemon':
             printDaemonHelp();
             break;
-          case 'init':
-            printInitHelp();
-            break;
-          case 'generate':
-            printGenerateHelp();
-            break;
-          case 'introspect':
-            printIntrospectHelp();
-            break;
-          case 'embeddings':
-            printEmbeddingsHelp();
-            break;
           case 'clean':
             printCleanHelp();
             break;
@@ -248,21 +170,9 @@ async function main(): Promise<void> {
         }
         return;
 
-      case 'quickstart': {
-        const options = await parseQuickstartOptions(rest);
-        await runQuickstart(options);
-        return;
-      }
-
-      case 'create': {
-        const options = parseCreateOptions(rest);
-        await runCreate(options);
-        return;
-      }
-
-      case 'agent': {
-        const options = parseAgentOptions(rest);
-        await runAgent(options);
+      case 'setup': {
+        const options = parseSetupOptions(rest);
+        await runSetup(options);
         return;
       }
 
@@ -306,36 +216,6 @@ async function main(): Promise<void> {
           default:
             printDaemonHelp();
         }
-        return;
-      }
-
-      case 'init': {
-        const options = await parseInitOptions(rest);
-        await runInit(options);
-        return;
-      }
-
-      case 'generate': {
-        const options = parseGenerateOptions(rest);
-        await runGenerate(options);
-        return;
-      }
-
-      case 'introspect': {
-        const options = parseIntrospectOptions(rest);
-        await runIntrospect(options);
-        return;
-      }
-
-      case 'embeddings:index': {
-        const options = await parseEmbeddingsOptions(rest);
-        await runEmbeddingsIndex(options);
-        return;
-      }
-
-      case 'embeddings:generate': {
-        const options = await parseEmbeddingsOptions(rest);
-        await runEmbeddingsGenerate(options);
         return;
       }
 

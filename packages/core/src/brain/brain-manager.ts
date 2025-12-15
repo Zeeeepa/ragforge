@@ -41,6 +41,7 @@ import { IngestionLock, getGlobalIngestionLock, getGlobalEmbeddingLock } from '.
 import { UniqueIDHelper } from '../runtime/utils/UniqueIDHelper.js';
 import neo4j from 'neo4j-driver';
 import { matchesGlob } from '../runtime/utils/pattern-matching.js';
+import { processBatch } from '../runtime/utils/batch-processor.js';
 
 const execAsync = promisify(exec);
 
@@ -262,6 +263,8 @@ export interface BrainSearchOptions {
   textMatch?: string;
   /** Glob pattern to filter by file path. Matches against the 'file' or 'path' property of nodes */
   glob?: string;
+  /** Base path to filter results. Only returns nodes where absolutePath starts with this path. */
+  basePath?: string;
   /** Result limit */
   limit?: number;
   /** Result offset */
@@ -274,6 +277,17 @@ export interface BrainSearchOptions {
    * files whose absolutePath starts with this base path.
    */
   touchedFilesBasePath?: string;
+  /**
+   * Use hybrid search combining semantic (vector) and BM25 (full-text) search.
+   * Results are fused using Reciprocal Rank Fusion (RRF).
+   * Requires semantic: true to be effective.
+   */
+  hybrid?: boolean;
+  /**
+   * RRF k constant for rank fusion. Higher values give more weight to lower-ranked results.
+   * Default: 60 (standard value from the RRF paper)
+   */
+  rrfK?: number;
 }
 
 export interface BrainSearchResult {
@@ -293,6 +307,19 @@ export interface BrainSearchResult {
     endChar: number;
     chunkIndex: number;
     chunkScore: number; // Original chunk score
+  };
+  /** Details about how this result was found in hybrid search */
+  rrfDetails?: {
+    // New multiplicative boost format
+    searchType?: 'semantic' | 'bm25-only';
+    semanticScore?: number;
+    originalSemanticScore?: number;
+    bm25Rank?: number | null;
+    boostApplied?: number;
+    note?: string;
+    // Old RRF format (kept for compatibility)
+    ranks?: Record<string, number>;
+    originalScores?: Record<string, number>;
   };
 }
 
@@ -504,10 +531,94 @@ export class BrainManager {
 
     console.log('[Brain] Indexes ensured');
 
+    // Ensure full-text indexes for BM25 search
+    await this.ensureFullTextIndexes();
+
     // Ensure vector indexes for semantic search (if embeddings are enabled)
     if (this.embeddingService?.canGenerateEmbeddings()) {
       await this.ensureVectorIndexes();
     }
+  }
+
+  /**
+   * Ensure full-text indexes exist for BM25 keyword search
+   * Creates composite indexes covering textContent/source fields across node types
+   */
+  private async ensureFullTextIndexes(): Promise<void> {
+    if (!this.neo4jClient) return;
+
+    console.log('[Brain] Ensuring full-text indexes...');
+
+    // Full-text index configurations
+    // Each index covers specific node types and their text fields
+    // Aligned with MULTI_EMBED_CONFIGS for consistency
+    const fullTextIndexes = [
+      {
+        name: 'scope_fulltext',
+        labels: ['Scope'],
+        properties: ['source', 'name', 'signature', 'docstring'], // +docstring for descriptions
+      },
+      {
+        name: 'file_fulltext',
+        labels: ['File'],
+        properties: ['path', 'source'], // File nodes with source code
+      },
+      {
+        name: 'datafile_fulltext',
+        labels: ['DataFile'],
+        properties: ['path', 'rawContent'], // JSON, YAML, etc.
+      },
+      {
+        name: 'document_fulltext',
+        labels: ['DocumentFile', 'PDFDocument', 'WordDocument', 'SpreadsheetDocument'],
+        properties: ['textContent', 'file', 'title'], // +title
+      },
+      {
+        name: 'markdown_fulltext',
+        labels: ['MarkdownDocument', 'MarkdownSection'],
+        properties: ['textContent', 'title', 'file', 'ownContent', 'content'], // +ownContent, content
+      },
+      {
+        name: 'media_fulltext',
+        labels: ['MediaFile', 'ImageFile', 'ThreeDFile'],
+        properties: ['textContent', 'description', 'file', 'path'], // +description, path
+      },
+      {
+        name: 'webpage_fulltext',
+        labels: ['WebPage'],
+        properties: ['textContent', 'title', 'url', 'metaDescription'], // +metaDescription
+      },
+      {
+        name: 'codeblock_fulltext',
+        labels: ['CodeBlock'],
+        properties: ['code', 'language'],
+      },
+    ];
+
+    let created = 0;
+    let existed = 0;
+
+    for (const config of fullTextIndexes) {
+      try {
+        // Neo4j full-text index syntax:
+        // CREATE FULLTEXT INDEX name IF NOT EXISTS FOR (n:Label1|Label2) ON EACH [n.prop1, n.prop2]
+        const labelsPart = config.labels.join('|');
+        const propsPart = config.properties.map(p => `n.${p}`).join(', ');
+
+        const query = `CREATE FULLTEXT INDEX ${config.name} IF NOT EXISTS FOR (n:${labelsPart}) ON EACH [${propsPart}]`;
+
+        await this.neo4jClient.run(query);
+        created++;
+      } catch (err: any) {
+        if (err.message?.includes('already exists') || err.message?.includes('equivalent index')) {
+          existed++;
+        } else {
+          console.warn(`[Brain] Full-text index creation warning for ${config.name}: ${err.message}`);
+        }
+      }
+    }
+
+    console.log(`[Brain] Full-text indexes ensured (${created} created, ${existed} already existed)`);
   }
 
   /**
@@ -2918,7 +3029,8 @@ volumes:
     projectPath: string,
     analyzeImages: boolean,
     analyze3d: boolean,
-    ocrDocuments: boolean
+    ocrDocuments: boolean,
+    concurrency: number = 5
   ): Promise<number> {
     let analyzedCount = 0;
 
@@ -2926,166 +3038,247 @@ volumes:
     const IMAGE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'];
     const THREE_D_EXTENSIONS = ['.glb', '.gltf', '.obj', '.fbx'];
 
-    // Find MediaFiles (images only) without textContent
+    // Lazy-load services once
+    let ocrService: any = null;
+    let analyze3DHandler: any = null;
+
+    // ========================================
+    // IMAGES - Parallel batch processing
+    // ========================================
     if (analyzeImages) {
       const imageResult = await this.neo4jClient!.run(
         `MATCH (n:MediaFile {projectId: $projectId})
-         WHERE n.textContent IS NULL OR n.textContent = ''
+         WHERE (n.textContent IS NULL OR n.textContent = '') AND n.analyzed <> true
          RETURN n.uuid AS uuid, n.file AS file`,
         { projectId }
       );
 
-      for (const record of imageResult.records) {
-        const uuid = record.get('uuid');
-        const file = record.get('file');
-        const filePath = path.join(projectPath, file);
-        const ext = path.extname(filePath).toLowerCase();
+      // Filter to only valid image files
+      const imageItems = imageResult.records
+        .map(record => ({
+          uuid: record.get('uuid') as string,
+          file: record.get('file') as string,
+        }))
+        .filter(item => {
+          const ext = path.extname(item.file).toLowerCase();
+          return IMAGE_EXTENSIONS.includes(ext) && !THREE_D_EXTENSIONS.includes(ext);
+        });
 
-        // Skip 3D files - they need special handling
-        if (THREE_D_EXTENSIONS.includes(ext)) continue;
-        // Skip non-image files
-        if (!IMAGE_EXTENSIONS.includes(ext)) continue;
+      if (imageItems.length > 0) {
+        console.log(`[analyzeMediaFiles] Processing ${imageItems.length} images (concurrency: ${concurrency})...`);
 
-        try {
-          const { getOCRService } = await import('../runtime/index.js');
-          const ocrService = getOCRService({ primaryProvider: 'gemini' });
+        // Initialize OCR service once
+        const { getOCRService } = await import('../runtime/index.js');
+        ocrService = getOCRService({ primaryProvider: 'gemini' });
 
-          if (!ocrService.isAvailable()) {
-            console.warn(`[analyzeMediaFiles] Gemini Vision not available, skipping: ${file}`);
-            continue;
-          }
+        if (!ocrService.isAvailable()) {
+          console.warn(`[analyzeMediaFiles] Gemini Vision not available, skipping images`);
+        } else {
+          const imageResult = await processBatch({
+            items: imageItems,
+            concurrency,
+            maxRetries: 3,
+            baseDelayMs: 5000,
+            label: 'images',
+            onProgress: (progress) => {
+              if (progress.completed % 10 === 0 || progress.completed === progress.total) {
+                console.log(`[analyzeMediaFiles] Images: ${progress.completed}/${progress.total} (${progress.succeeded} ok, ${progress.failed} failed)`);
+              }
+            },
+            processor: async (item) => {
+              const filePath = path.join(projectPath, item.file);
+              const ext = path.extname(filePath).toLowerCase();
 
-          const imageBuffer = await fs.readFile(filePath);
-          const base64 = imageBuffer.toString('base64');
-          const mimeType = ext === '.png' ? 'image/png' :
-                           ext === '.gif' ? 'image/gif' :
-                           ext === '.webp' ? 'image/webp' : 'image/jpeg';
+              const imageBuffer = await fs.readFile(filePath);
+              const base64 = imageBuffer.toString('base64');
+              const mimeType = ext === '.png' ? 'image/png' :
+                               ext === '.gif' ? 'image/gif' :
+                               ext === '.webp' ? 'image/webp' : 'image/jpeg';
 
-          const result = await ocrService.extractTextFromData(base64, mimeType, {
-            prompt: 'Describe this image in detail. Include any text visible in the image.'
+              const result = await ocrService.extractTextFromData(base64, mimeType, {
+                prompt: 'Describe this image in detail. Include any text visible in the image.'
+              });
+              const description = result.text;
+
+              if (!description || description.trim().length === 0) {
+                throw new Error('Empty description');
+              }
+
+              // Mark as analyzed immediately (for resumability)
+              await this.neo4jClient!.run(
+                `MATCH (n:MediaFile {uuid: $uuid})
+                 SET n.textContent = $textContent,
+                     n.extractionMethod = 'gemini-vision',
+                     n.analyzed = true,
+                     n.embeddingsDirty = true`,
+                { uuid: item.uuid, textContent: description }
+              );
+
+              return { file: item.file, description };
+            },
+            onItemError: (item, error) => {
+              // Mark as analyzed even on failure to avoid retrying indefinitely
+              this.neo4jClient!.run(
+                `MATCH (n:MediaFile {uuid: $uuid}) SET n.analyzed = true`,
+                { uuid: item.uuid }
+              ).catch(() => {});
+              console.warn(`[analyzeMediaFiles] Failed image ${item.file}: ${error.message}`);
+            },
           });
-          const description = result.text;
 
-          // Only update if we got a non-empty description
-          if (!description || description.trim().length === 0) {
-            console.warn(`[analyzeMediaFiles] Empty description for ${file}, skipping`);
-            continue;
-          }
-
-          await this.neo4jClient!.run(
-            `MATCH (n:MediaFile {uuid: $uuid})
-             SET n.textContent = $textContent,
-                 n.extractionMethod = 'gemini-vision',
-                 n.embeddingsDirty = true`,
-            { uuid, textContent: description }
-          );
-
-          console.log(`[analyzeMediaFiles] Analyzed image: ${file}`);
-          analyzedCount++;
-        } catch (err: any) {
-          console.warn(`[analyzeMediaFiles] Failed to analyze ${file}: ${err.message}`);
+          analyzedCount += imageResult.stats.succeeded;
         }
       }
     }
 
-    // Find ThreeDFiles without textContent
+    // ========================================
+    // 3D FILES - Parallel batch processing
+    // ========================================
     if (analyze3d) {
       const threeDResult = await this.neo4jClient!.run(
         `MATCH (n:ThreeDFile {projectId: $projectId})
-         WHERE n.textContent IS NULL OR n.textContent = ''
+         WHERE (n.textContent IS NULL OR n.textContent = '') AND n.analyzed <> true
          RETURN n.uuid AS uuid, n.file AS file`,
         { projectId }
       );
 
-      for (const record of threeDResult.records) {
-        const uuid = record.get('uuid');
-        const file = record.get('file');
-        const filePath = path.join(projectPath, file);
+      const threeDItems = threeDResult.records.map(record => ({
+        uuid: record.get('uuid') as string,
+        file: record.get('file') as string,
+      }));
 
-        try {
-          // Use the 3D analysis pipeline: render + describe
-          const { generateAnalyze3DModelHandler } = await import('../tools/threed-tools.js');
+      if (threeDItems.length > 0) {
+        console.log(`[analyzeMediaFiles] Processing ${threeDItems.length} 3D models (concurrency: ${Math.min(concurrency, 2)})...`);
 
-          // Create minimal context for analysis
-          const analyzeCtx = {
-            projectRoot: projectPath,
-            onContentExtracted: async () => ({ updated: false }),
-          };
+        // Initialize 3D handler once
+        const { generateAnalyze3DModelHandler } = await import('../tools/threed-tools.js');
+        const analyzeCtx = {
+          projectRoot: projectPath,
+          onContentExtracted: async () => ({ updated: false }),
+        };
+        analyze3DHandler = generateAnalyze3DModelHandler(analyzeCtx);
 
-          const analyze3DHandler = generateAnalyze3DModelHandler(analyzeCtx);
-          const analysisResult = await analyze3DHandler({
-            model_path: filePath,
-            views: ['front', 'perspective'], // Multiple views for better description
-          });
+        // Lower concurrency for 3D (more resource-intensive)
+        const threeDResult = await processBatch({
+          items: threeDItems,
+          concurrency: Math.min(concurrency, 2), // Max 2 concurrent 3D renders
+          maxRetries: 2,
+          baseDelayMs: 10000,
+          label: '3D models',
+          onProgress: (progress) => {
+            console.log(`[analyzeMediaFiles] 3D: ${progress.completed}/${progress.total} (${progress.succeeded} ok, ${progress.failed} failed)`);
+          },
+          processor: async (item) => {
+            const filePath = path.join(projectPath, item.file);
 
-          if (analysisResult.error) {
-            console.warn(`[analyzeMediaFiles] 3D analysis error for ${file}: ${analysisResult.error}`);
-            continue;
-          }
+            const analysisResult = await analyze3DHandler({
+              model_path: filePath,
+              views: ['front', 'perspective'],
+            });
 
-          const description = analysisResult.global_description || analysisResult.description;
-          if (!description || description.trim().length === 0) {
-            console.warn(`[analyzeMediaFiles] Empty 3D description for ${file}, skipping`);
-            continue;
-          }
+            if (analysisResult.error) {
+              throw new Error(analysisResult.error);
+            }
 
-          await this.neo4jClient!.run(
-            `MATCH (n:ThreeDFile {uuid: $uuid})
-             SET n.textContent = $textContent,
-                 n.extractionMethod = '3d-render-describe',
-                 n.embeddingsDirty = true`,
-            { uuid, textContent: description }
-          );
+            const description = analysisResult.global_description || analysisResult.description;
+            if (!description || description.trim().length === 0) {
+              throw new Error('Empty 3D description');
+            }
 
-          console.log(`[analyzeMediaFiles] Analyzed 3D model: ${file}`);
-          analyzedCount++;
-        } catch (err: any) {
-          console.warn(`[analyzeMediaFiles] Failed to analyze 3D ${file}: ${err.message}`);
-        }
+            // Mark as analyzed immediately (for resumability)
+            await this.neo4jClient!.run(
+              `MATCH (n:ThreeDFile {uuid: $uuid})
+               SET n.textContent = $textContent,
+                   n.extractionMethod = '3d-render-describe',
+                   n.analyzed = true,
+                   n.embeddingsDirty = true`,
+              { uuid: item.uuid, textContent: description }
+            );
+
+            return { file: item.file, description };
+          },
+          onItemError: (item, error) => {
+            this.neo4jClient!.run(
+              `MATCH (n:ThreeDFile {uuid: $uuid}) SET n.analyzed = true`,
+              { uuid: item.uuid }
+            ).catch(() => {});
+            console.warn(`[analyzeMediaFiles] Failed 3D ${item.file}: ${error.message}`);
+          },
+        });
+
+        analyzedCount += threeDResult.stats.succeeded;
       }
     }
 
-    // Find DocumentFiles (PDFs) without textContent or with very short textContent (likely scanned)
+    // ========================================
+    // OCR DOCUMENTS - Parallel batch processing
+    // ========================================
     if (ocrDocuments) {
       const docResult = await this.neo4jClient!.run(
         `MATCH (n:DocumentFile {projectId: $projectId})
-         WHERE n.textContent IS NULL OR size(n.textContent) < 50
-         RETURN n.uuid AS uuid, n.file AS file, n.format AS format`,
+         WHERE (n.textContent IS NULL OR size(n.textContent) < 50)
+           AND n.format = 'pdf'
+           AND n.analyzed <> true
+         RETURN n.uuid AS uuid, n.file AS file`,
         { projectId }
       );
 
-      for (const record of docResult.records) {
-        const uuid = record.get('uuid');
-        const file = record.get('file');
-        const format = record.get('format');
-        const filePath = path.join(projectPath, file);
+      const docItems = docResult.records.map(record => ({
+        uuid: record.get('uuid') as string,
+        file: record.get('file') as string,
+      }));
 
-        // Only OCR PDF files (other formats have good text extraction)
-        if (format !== 'pdf') continue;
+      if (docItems.length > 0) {
+        console.log(`[analyzeMediaFiles] Processing ${docItems.length} PDF documents for OCR (concurrency: ${concurrency})...`);
 
-        try {
-          const { parseDocumentFile } = await import('../runtime/adapters/document-file-parser.js');
-          const docInfo = await parseDocumentFile(filePath, { useOcr: true });
+        const { parseDocumentFile } = await import('../runtime/adapters/document-file-parser.js');
 
-          if (docInfo && docInfo.textContent && docInfo.textContent.length > 50) {
+        const ocrResult = await processBatch({
+          items: docItems,
+          concurrency,
+          maxRetries: 2,
+          baseDelayMs: 5000,
+          label: 'OCR documents',
+          onProgress: (progress) => {
+            if (progress.completed % 5 === 0 || progress.completed === progress.total) {
+              console.log(`[analyzeMediaFiles] OCR: ${progress.completed}/${progress.total} (${progress.succeeded} ok, ${progress.failed} failed)`);
+            }
+          },
+          processor: async (item) => {
+            const filePath = path.join(projectPath, item.file);
+
+            const docInfo = await parseDocumentFile(filePath, { useOcr: true });
+
+            if (!docInfo || !docInfo.textContent || docInfo.textContent.length <= 50) {
+              throw new Error('OCR produced insufficient text');
+            }
+
+            // Mark as analyzed immediately (for resumability)
             await this.neo4jClient!.run(
               `MATCH (n:DocumentFile {uuid: $uuid})
                SET n.textContent = $textContent,
                    n.extractionMethod = $extractionMethod,
+                   n.analyzed = true,
                    n.embeddingsDirty = true`,
               {
-                uuid,
+                uuid: item.uuid,
                 textContent: docInfo.textContent,
                 extractionMethod: docInfo.extractionMethod || 'ocr'
               }
             );
 
-            console.log(`[analyzeMediaFiles] OCR'd document: ${file}`);
-            analyzedCount++;
-          }
-        } catch (err: any) {
-          console.warn(`[analyzeMediaFiles] Failed to OCR ${file}: ${err.message}`);
-        }
+            return { file: item.file, textLength: docInfo.textContent.length };
+          },
+          onItemError: (item, error) => {
+            this.neo4jClient!.run(
+              `MATCH (n:DocumentFile {uuid: $uuid}) SET n.analyzed = true`,
+              { uuid: item.uuid }
+            ).catch(() => {});
+            console.warn(`[analyzeMediaFiles] Failed OCR ${item.file}: ${error.message}`);
+          },
+        });
+
+        analyzedCount += ocrResult.stats.succeeded;
       }
     }
 
@@ -3641,65 +3834,52 @@ volumes:
       nodeTypeFilter = `AND n.type IN $nodeTypes`;
     }
 
+    // Build base path filter (only return nodes under this directory)
+    let basePathFilter = '';
+    if (options.basePath) {
+      params.basePath = options.basePath;
+      basePathFilter = `AND n.absolutePath STARTS WITH $basePath`;
+    }
+
     // Execute search
     let results: BrainSearchResult[];
 
-    if (options.semantic && this.embeddingService?.canGenerateEmbeddings()) {
+    if (options.hybrid && options.semantic && this.embeddingService?.canGenerateEmbeddings()) {
+      // Hybrid search: combine semantic (vector) + BM25 (full-text) with RRF fusion
+      const minScore = options.minScore ?? 0.3;
+      const rrfK = options.rrfK ?? 60;
+      results = await this.hybridSearch(query, {
+        embeddingType,
+        projectFilter,
+        nodeTypeFilter,
+        basePathFilter,
+        params,
+        limit,
+        minScore,
+        rrfK,
+      });
+    } else if (options.semantic && this.embeddingService?.canGenerateEmbeddings()) {
       // Semantic search using vector similarity
       const minScore = options.minScore ?? 0.3; // Default threshold for semantic search
       results = await this.vectorSearch(query, {
         embeddingType,
         projectFilter,
         nodeTypeFilter,
+        basePathFilter,
         params,
         limit,
         minScore,
       });
     } else {
-      // Text search (exact match)
-      // Search in: name, title, content (array), source, rawText (array), code (codeblocks), textContent (documents), url (web)
-      // Note: content and rawText are arrays, so we use ANY() to search within array elements
-      const cypher = `
-        MATCH (n)
-        WHERE (
-          n.name CONTAINS $query 
-          OR n.title CONTAINS $query 
-          OR (n.content IS NOT NULL AND ANY(text IN n.content WHERE text CONTAINS $query))
-          OR n.source CONTAINS $query 
-          OR (n.rawText IS NOT NULL AND ANY(text IN n.rawText WHERE text CONTAINS $query))
-          OR n.code CONTAINS $query 
-          OR n.textContent CONTAINS $query 
-          OR n.url CONTAINS $query
-        ) ${projectFilter} ${nodeTypeFilter}
-        RETURN n, 1.0 as score
-        ORDER BY n.name
-        SKIP $offset
-        LIMIT $limit
-      `;
-
-      const result = await this.neo4jClient.run(cypher, params);
-
-      results = result.records.map(record => {
-        const rawNode = record.get('n').properties;
-        const score = record.get('score');
-        const projectId = rawNode.projectId || 'unknown';
-        const project = this.registeredProjects.get(projectId);
-        const projectPath = project?.path || 'unknown';
-        
-        // Build absolute file path: projectPath + "/" + node.file
-        const nodeFile = rawNode.file || rawNode.path || '';
-        const filePath = projectPath !== 'unknown' && nodeFile
-          ? path.join(projectPath, nodeFile)
-          : nodeFile || 'unknown';
-
-        return {
-          node: this.stripEmbeddingFields(rawNode),
-          score,
-          projectId,
-          projectPath,
-          projectType: project?.type || 'unknown',
-          filePath, // Absolute path to the file
-        };
+      // BM25 keyword search using full-text indexes (better than simple CONTAINS)
+      // Provides relevance scoring and fuzzy matching
+      results = await this.fullTextSearch(query, {
+        projectFilter,
+        nodeTypeFilter,
+        basePathFilter,
+        params,
+        limit,
+        minScore: options.minScore,
       });
     }
 
@@ -3717,19 +3897,9 @@ volumes:
       results = results.filter(r => r.score >= options.minScore!);
     }
 
-    // Get total count (approximate for text search)
-    const countCypher = `
-      MATCH (n)
-      WHERE (n.name CONTAINS $query OR n.title CONTAINS $query OR n.content CONTAINS $query OR n.source CONTAINS $query OR n.rawText CONTAINS $query OR n.code CONTAINS $query OR n.textContent CONTAINS $query OR n.url CONTAINS $query) ${projectFilter} ${nodeTypeFilter}
-      RETURN count(n) as total
-    `;
-    const countResult = await this.neo4jClient.run(countCypher, params);
-    let totalCount = countResult.records[0]?.get('total')?.toNumber() || 0;
-
-    // Adjust count if glob filter was applied
-    if (options.glob) {
-      totalCount = results.length;
-    }
+    // Total count is just the number of results returned
+    // (Full-text search doesn't easily provide a total count without a separate query)
+    const totalCount = results.length;
 
     // Build list of actually searched projects
     const searchedProjects = options.projects
@@ -3755,12 +3925,13 @@ volumes:
       embeddingType: 'name' | 'content' | 'description' | 'all';
       projectFilter: string;
       nodeTypeFilter: string;
+      basePathFilter?: string;
       params: Record<string, any>;
       limit: number;
       minScore: number;
     }
   ): Promise<BrainSearchResult[]> {
-    const { embeddingType, projectFilter, nodeTypeFilter, params, limit, minScore } = options;
+    const { embeddingType, projectFilter, nodeTypeFilter, basePathFilter = '', params, limit, minScore } = options;
 
     // Get query embedding
     const queryEmbedding = await this.embeddingService!.getQueryEmbedding(query);
@@ -3840,7 +4011,7 @@ volumes:
           const cypher = `
             CALL db.index.vector.queryNodes($indexName, $requestTopK, $queryEmbedding)
             YIELD node AS n, score
-            WHERE score >= $minScore ${projectFilter} ${nodeTypeFilter}
+            WHERE score >= $minScore ${projectFilter} ${nodeTypeFilter} ${basePathFilter}
             RETURN n, score
             ORDER BY score DESC
             LIMIT $limit
@@ -4116,6 +4287,390 @@ volumes:
 
     if (normA === 0 || normB === 0) return 0;
     return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+  }
+
+  /**
+   * Full-text search using Neo4j Lucene indexes (BM25)
+   * Searches across all full-text indexes in PARALLEL and returns results with BM25 scores
+   */
+  private async fullTextSearch(
+    query: string,
+    options: {
+      projectFilter: string;
+      nodeTypeFilter: string;
+      basePathFilter?: string;
+      params: Record<string, any>;
+      limit: number;
+      minScore?: number;
+    }
+  ): Promise<BrainSearchResult[]> {
+    const { projectFilter, nodeTypeFilter, basePathFilter = '', params, limit, minScore } = options;
+
+    // Full-text index names to search (aligned with ensureFullTextIndexes)
+    const fullTextIndexes = [
+      'scope_fulltext',
+      'file_fulltext',
+      'datafile_fulltext',
+      'document_fulltext',
+      'markdown_fulltext',
+      'media_fulltext',
+      'webpage_fulltext',
+      'codeblock_fulltext',
+    ];
+
+    // Escape special Lucene characters in query
+    const escapedQuery = query.replace(/[+\-&|!(){}[\]^"~*?:\\/]/g, '\\$&');
+
+    // Use Lucene query syntax with fuzzy matching (~1 = 1 edit distance, more precise)
+    const words = escapedQuery.split(/\s+/).filter(w => w.length > 0);
+    const luceneQuery = words.map(w => `${w}~1`).join(' ');
+
+    // Build a single UNION ALL query for all indexes (1 network round-trip instead of 8)
+    const unionClauses = fullTextIndexes.map(indexName => `
+      CALL db.index.fulltext.queryNodes('${indexName}', $luceneQuery)
+      YIELD node AS n, score
+      WHERE true ${projectFilter} ${nodeTypeFilter} ${basePathFilter}
+      RETURN n, score
+    `);
+
+    const cypher = `
+      ${unionClauses.join('\nUNION ALL\n')}
+      ORDER BY score DESC
+      LIMIT $limit
+    `;
+
+    try {
+      const result = await this.neo4jClient!.run(cypher, {
+        luceneQuery,
+        ...params,
+        limit: neo4j.int(limit * 2), // Fetch more to account for deduplication
+      });
+
+      // Process results
+      const allResults: BrainSearchResult[] = [];
+      const seenUuids = new Set<string>();
+
+      for (const record of result.records) {
+        const rawNode = record.get('n').properties;
+        const uuid = rawNode.uuid;
+        const score = record.get('score');
+
+        // Skip duplicates (same node may appear in multiple indexes)
+        if (seenUuids.has(uuid)) continue;
+        seenUuids.add(uuid);
+
+        // Apply minScore filter if specified
+        if (minScore !== undefined && score < minScore) continue;
+
+        const projectId = rawNode.projectId || 'unknown';
+        const project = this.registeredProjects.get(projectId);
+        const projectPath = project?.path || 'unknown';
+
+        const nodeFile = rawNode.file || rawNode.path || '';
+        const filePath = projectPath !== 'unknown' && nodeFile
+          ? path.join(projectPath, nodeFile)
+          : nodeFile || 'unknown';
+
+        allResults.push({
+          node: this.stripEmbeddingFields(rawNode),
+          score,
+          projectId,
+          projectPath,
+          projectType: project?.type || 'unknown',
+          filePath,
+        });
+
+        // Stop if we have enough results
+        if (allResults.length >= limit) break;
+      }
+
+      return allResults;
+    } catch (err: any) {
+      // Fallback: if UNION fails (e.g., some indexes don't exist), try individual queries
+      console.debug(`[BrainManager] UNION ALL query failed, falling back to parallel queries: ${err.message}`);
+      return this.fullTextSearchFallback(luceneQuery, { ...options, basePathFilter });
+    }
+  }
+
+  /**
+   * Fallback method for full-text search when UNION ALL fails
+   * Executes queries in parallel against individual indexes
+   */
+  private async fullTextSearchFallback(
+    luceneQuery: string,
+    options: {
+      projectFilter: string;
+      nodeTypeFilter: string;
+      basePathFilter: string;
+      params: Record<string, any>;
+      limit: number;
+      minScore?: number;
+    }
+  ): Promise<BrainSearchResult[]> {
+    const { projectFilter, nodeTypeFilter, basePathFilter, params, limit, minScore } = options;
+
+    const fullTextIndexes = [
+      'scope_fulltext',
+      'file_fulltext',
+      'datafile_fulltext',
+      'document_fulltext',
+      'markdown_fulltext',
+      'media_fulltext',
+      'webpage_fulltext',
+      'codeblock_fulltext',
+    ];
+
+    const cypher = `
+      CALL db.index.fulltext.queryNodes($indexName, $luceneQuery)
+      YIELD node AS n, score
+      WHERE true ${projectFilter} ${nodeTypeFilter} ${basePathFilter}
+      RETURN n, score
+      ORDER BY score DESC
+      LIMIT $limit
+    `;
+
+    // Execute all index queries in PARALLEL
+    const queryPromises = fullTextIndexes.map(async (indexName) => {
+      try {
+        const result = await this.neo4jClient!.run(cypher, {
+          indexName,
+          luceneQuery,
+          ...params,
+          limit: neo4j.int(limit),
+        });
+        return { records: result.records };
+      } catch (err: any) {
+        if (!err.message?.includes('does not exist')) {
+          console.debug(`[BrainManager] Full-text search failed for ${indexName}: ${err.message}`);
+        }
+        return { records: [] };
+      }
+    });
+
+    const queryResults = await Promise.all(queryPromises);
+
+    // Merge results from all indexes
+    const allResults: BrainSearchResult[] = [];
+    const seenUuids = new Set<string>();
+
+    for (const { records } of queryResults) {
+      for (const record of records) {
+        const rawNode = record.get('n').properties;
+        const uuid = rawNode.uuid;
+        const score = record.get('score');
+
+        if (seenUuids.has(uuid)) continue;
+        seenUuids.add(uuid);
+
+        if (minScore !== undefined && score < minScore) continue;
+
+        const projectId = rawNode.projectId || 'unknown';
+        const project = this.registeredProjects.get(projectId);
+        const projectPath = project?.path || 'unknown';
+
+        const nodeFile = rawNode.file || rawNode.path || '';
+        const filePath = projectPath !== 'unknown' && nodeFile
+          ? path.join(projectPath, nodeFile)
+          : nodeFile || 'unknown';
+
+        allResults.push({
+          node: this.stripEmbeddingFields(rawNode),
+          score,
+          projectId,
+          projectPath,
+          projectType: project?.type || 'unknown',
+          filePath,
+        });
+      }
+    }
+
+    allResults.sort((a, b) => b.score - a.score);
+    return allResults.slice(0, limit);
+  }
+
+  /**
+   * Reciprocal Rank Fusion (RRF) to combine results from multiple search methods
+   * RRF score = sum(1 / (k + rank)) for each search method
+   *
+   * @param resultSets - Array of result sets, each already sorted by their respective scores
+   * @param k - RRF constant (default: 60, from the original RRF paper)
+   * @returns Fused results sorted by RRF score
+   */
+  private rrfFusion(
+    resultSets: BrainSearchResult[][],
+    k: number = 60
+  ): BrainSearchResult[] {
+    // Map: uuid -> { result, rrfScore, ranks: { semantic: number, bm25: number, ... } }
+    const fusedMap = new Map<string, {
+      result: BrainSearchResult;
+      rrfScore: number;
+      ranks: Record<string, number>;
+      originalScores: Record<string, number>;
+    }>();
+
+    // Process each result set
+    resultSets.forEach((results, setIndex) => {
+      const setName = setIndex === 0 ? 'semantic' : 'bm25';
+
+      results.forEach((result, rank) => {
+        const uuid = result.node.uuid;
+        const rrfContribution = 1 / (k + rank + 1); // rank is 0-indexed, so +1
+
+        if (fusedMap.has(uuid)) {
+          const existing = fusedMap.get(uuid)!;
+          existing.rrfScore += rrfContribution;
+          existing.ranks[setName] = rank + 1;
+          existing.originalScores[setName] = result.score;
+        } else {
+          fusedMap.set(uuid, {
+            result,
+            rrfScore: rrfContribution,
+            ranks: { [setName]: rank + 1 },
+            originalScores: { [setName]: result.score },
+          });
+        }
+      });
+    });
+
+    // Convert to array and sort by RRF score
+    const fusedResults = Array.from(fusedMap.values())
+      .sort((a, b) => b.rrfScore - a.rrfScore)
+      .map(item => ({
+        ...item.result,
+        score: item.rrfScore, // Replace original score with RRF score
+        rrfDetails: {
+          ranks: item.ranks,
+          originalScores: item.originalScores,
+        },
+      }));
+
+    return fusedResults;
+  }
+
+  /**
+   * Hybrid search combining semantic (vector) and BM25 (full-text) search
+   * Uses Reciprocal Rank Fusion (RRF) to merge results
+   */
+  private async hybridSearch(
+    query: string,
+    options: {
+      embeddingType: 'name' | 'content' | 'description' | 'all';
+      projectFilter: string;
+      nodeTypeFilter: string;
+      params: Record<string, any>;
+      limit: number;
+      minScore: number;
+      rrfK: number;
+      basePathFilter?: string;
+    }
+  ): Promise<BrainSearchResult[]> {
+    const { embeddingType, projectFilter, nodeTypeFilter, basePathFilter, params, limit, minScore, rrfK } = options;
+
+    // Run semantic and BM25 searches in parallel
+    // Fetch more candidates for better fusion (3x limit)
+    const candidateLimit = Math.min(limit * 3, 150);
+
+    const [semanticResults, bm25Results] = await Promise.all([
+      this.vectorSearch(query, {
+        embeddingType,
+        projectFilter,
+        nodeTypeFilter,
+        basePathFilter,
+        params,
+        limit: candidateLimit,
+        minScore: Math.max(minScore * 0.5, 0.1), // Lower threshold for candidates
+      }),
+      this.fullTextSearch(query, {
+        projectFilter,
+        nodeTypeFilter,
+        basePathFilter,
+        params,
+        limit: candidateLimit,
+        minScore: undefined, // BM25 scores are not normalized, don't filter
+      }),
+    ]);
+
+    console.log(`[Brain.hybridSearch] Semantic: ${semanticResults.length}, BM25: ${bm25Results.length}`);
+
+    // Hybrid strategy: semantic-first with BM25 boost + top BM25-only results
+    // 1. Semantic results are primary
+    // 2. BM25 boosts semantic results that also match keywords
+    // 3. Top BM25-only results are included with reduced score (for exact keyword matches)
+
+    const bm25BoostFactor = 0.3; // Max 30% boost for top BM25 matches
+    const bm25OnlyTopN = 5; // Include top N BM25-only results
+    const bm25OnlyScoreBase = 0.4; // Base score for BM25-only results (below typical semantic)
+
+    // Build maps for lookup
+    const semanticUuids = new Set<string>();
+    semanticResults.forEach(r => {
+      const uuid = r.node.uuid || r.node.path || r.filePath;
+      if (uuid) semanticUuids.add(uuid);
+    });
+
+    const bm25RankMap = new Map<string, number>();
+    bm25Results.forEach((r, idx) => {
+      const uuid = r.node.uuid || r.node.path || r.filePath;
+      if (uuid && !bm25RankMap.has(uuid)) {
+        bm25RankMap.set(uuid, idx + 1);
+      }
+    });
+
+    // Boost semantic results based on BM25 rank
+    const boostedResults: BrainSearchResult[] = semanticResults.map(r => {
+      const uuid = r.node.uuid || r.node.path || r.filePath;
+      const bm25Rank = bm25RankMap.get(uuid);
+
+      let boostedScore = r.score;
+      if (bm25Rank) {
+        // Boost formula: score * (1 + boost_factor / sqrt(rank))
+        // Rank 1 → +30%, Rank 4 → +15%, Rank 9 → +10%, etc.
+        const boost = bm25BoostFactor / Math.sqrt(bm25Rank);
+        boostedScore = r.score * (1 + boost);
+      }
+
+      return {
+        ...r,
+        score: boostedScore,
+        rrfDetails: {
+          searchType: 'semantic' as const,
+          originalSemanticScore: r.score,
+          bm25Rank: bm25Rank || null,
+          boostApplied: bm25Rank ? (boostedScore / r.score - 1) : 0,
+        },
+      };
+    });
+
+    // Add top BM25-only results (not in semantic results)
+    // These are exact keyword matches that might be relevant
+    let bm25OnlyCount = 0;
+    for (const r of bm25Results) {
+      if (bm25OnlyCount >= bm25OnlyTopN) break;
+
+      const uuid = r.node.uuid || r.node.path || r.filePath;
+      if (uuid && !semanticUuids.has(uuid)) {
+        const bm25Rank = bm25RankMap.get(uuid) || bm25OnlyCount + 1;
+        // Score decreases with rank: 0.4, 0.35, 0.3, 0.25, 0.2 for top 5
+        const bm25OnlyScore = bm25OnlyScoreBase - (bm25OnlyCount * 0.05);
+
+        boostedResults.push({
+          ...r,
+          score: bm25OnlyScore,
+          rrfDetails: {
+            searchType: 'bm25-only' as const,
+            bm25Rank,
+            note: 'Exact keyword match (not in semantic results)',
+          },
+        });
+        bm25OnlyCount++;
+      }
+    }
+
+    console.log(`[Brain.hybridSearch] Boosted: ${semanticResults.length} semantic + ${bm25OnlyCount} BM25-only`);
+
+    // Sort by score and return top results
+    boostedResults.sort((a, b) => b.score - a.score);
+    return boostedResults.slice(0, limit);
   }
 
   /**

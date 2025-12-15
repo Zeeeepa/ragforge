@@ -2238,6 +2238,59 @@ export class ConversationStorage {
    * Build enriched context for agent with all components
    * Launches semantic searches in parallel for optimal performance
    */
+  /**
+   * Get recent messages from conversation (fast, no semantic search)
+   * Useful for quick context without expensive searches
+   */
+  async getRecentMessages(
+    conversationId: string,
+    limit: number = 10
+  ): Promise<Array<{ role: string; content: string; timestamp: Date | string }>> {
+    const messages = await this.getMessages(conversationId, {
+      limit,
+      includeToolCalls: false
+    });
+
+    // Take last N messages and reverse to chronological order
+    return messages
+      .slice(-limit)
+      .map(m => ({
+        role: m.role,
+        content: m.content,
+        timestamp: m.timestamp
+      }));
+  }
+
+  /**
+   * Get recent context for agent (fast, no semantic search)
+   * Returns both recent turns (with tool calls) and recent L1 summaries
+   * This is the PRIMARY method for providing conversation context to agents
+   */
+  async getRecentContextForAgent(
+    conversationId: string,
+    options?: {
+      turnsMaxChars?: number;     // Default: 5000 (5% context)
+      l1MaxChars?: number;        // Default: 10000 (10% context)
+      turnsLimit?: number;        // Max turns
+      l1Limit?: number;           // Max L1 summaries
+    }
+  ): Promise<{
+    recentTurns: ConversationTurn[];
+    recentL1Summaries: Summary[];
+  }> {
+    const [recentTurns, recentL1Summaries] = await Promise.all([
+      this.getRecentTurns(conversationId, options?.turnsMaxChars ?? 5000, options?.turnsLimit),
+      this.getRecentL1Summaries(conversationId, options?.l1MaxChars ?? 10000)
+    ]);
+
+    return {
+      recentTurns,
+      recentL1Summaries: options?.l1Limit
+        ? recentL1Summaries.slice(0, options.l1Limit)
+        : recentL1Summaries
+    };
+  }
+
   async buildEnrichedContext(
     conversationId: string,
     userMessage: string,
@@ -2252,6 +2305,8 @@ export class ConversationStorage {
       level1SummariesLimit?: number;
       cwd?: string;                      // Current working directory pour détecter sous-répertoire
       projectRoot?: string;              // Project root for code search filtering
+      skipCodeSearch?: boolean;          // Skip code search (for simple questions)
+      skipHistorySearch?: boolean;       // Skip deep history search (for simple questions)
       // Note: locks are now automatically fetched from brainManager and waited for (like brain_search)
     }
   ): Promise<{
@@ -2290,18 +2345,22 @@ export class ConversationStorage {
     const recentMaxChars = options?.recentMaxChars ?? this.getLastUserQueriesMaxChars(); // 5% of context max (same as last user queries)
     const recentTurns = await this.getRecentTurns(conversationId, recentMaxChars, options?.recentLimit);
 
-    // 3. Launch semantic searches in parallel
+    // 3. Launch semantic searches in parallel (skip if flags are set)
     const [semanticResults, codeSemanticResults] = await Promise.all([
-      // Conversation semantic search (L0, L1, L2)
-      this.searchConversationHistory(conversationId, userMessage, {
-        semantic: true,
-        includeTurns: true,
-        levels: [0, 1, 2],
-        maxResults: options?.semanticMaxResults ?? 20,
-        minScore: options?.semanticMinScore ?? 0.3
-      }),
-      // Code search: semantic (if project known) + fuzzy search (always available)
-      (async () => {
+      // Conversation semantic search (L0, L1, L2) - skip if skipHistorySearch is true
+      options?.skipHistorySearch
+        ? Promise.resolve([])
+        : this.searchConversationHistory(conversationId, userMessage, {
+            semantic: true,
+            includeTurns: true,
+            levels: [0, 1, 2],
+            maxResults: options?.semanticMaxResults ?? 20,
+            minScore: options?.semanticMinScore ?? 0.3
+          }),
+      // Code search: semantic (if project known) + fuzzy search (always available) - skip if skipCodeSearch is true
+      options?.skipCodeSearch
+        ? Promise.resolve([])
+        : (async () => {
         // Resolve projectRoot and cwd (ensure they're strings)
         const projectRoot = options?.projectRoot || options?.cwd;
         const cwd = options?.cwd || projectRoot;

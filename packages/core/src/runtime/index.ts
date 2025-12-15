@@ -88,7 +88,8 @@ export type {
   ToolCallRequest,
   ToolExecutionResult,
   ToolExecutor,
-  SingleLLMCallConfig
+  SingleLLMCallConfig,
+  ProgressiveOutputConfig
   // Note: QueryFeedback is already exported from llm-reranker
 } from './llm/structured-llm-executor.js';
 
@@ -146,6 +147,16 @@ export {
   type AgentLogEntry,
   type AgentIdentitySettings,
 } from './agents/rag-agent.js';
+
+// ResearchAgent - Simplified agent for research tasks with full conversation memory
+export {
+  ResearchAgent,
+  createResearchAgent,
+  type ResearchAgentOptions,
+  type ResearchResult,
+  type ChatMessage,
+  type ChatResponse,
+} from './agents/research-agent.js';
 
 // Legacy Agent Runtime (kept for reference, not exported)
 // export { AgentRuntime } from './agents/agent-runtime.js';

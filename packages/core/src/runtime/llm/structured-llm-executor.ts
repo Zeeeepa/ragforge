@@ -342,6 +342,26 @@ export interface SingleLLMCallConfig<TOutput = any> {
   // === DEBUGGING ===
   logPrompts?: boolean | string;
   logResponses?: boolean | string;
+
+  // === PROGRESSIVE OUTPUT ===
+  /**
+   * Progressive output mode: The LLM refines its output over multiple iterations.
+   * Previous output is passed back to the LLM so it can improve/extend it.
+   * Useful for building reports incrementally until confident.
+   */
+  progressiveOutput?: ProgressiveOutputConfig<TOutput>;
+}
+
+/**
+ * Progressive output configuration
+ */
+export interface ProgressiveOutputConfig<TOutput = any> {
+  /** Field name in output that indicates completion status (default: 'confidence') */
+  completionField?: keyof TOutput | string;
+  /** Value(s) that indicate completion (default: ['high', 'complete', 'done', true]) */
+  completionValues?: any[];
+  /** Callback called with each partial output for streaming to UI */
+  onProgress?: (output: Partial<TOutput>, iteration: number, isComplete: boolean) => void;
 }
 
 /**
@@ -437,7 +457,13 @@ export class StructuredLLMExecutor {
     const maxIterations = config.maxIterations ?? 10;
     const toolsUsed: string[] = [];
     let toolContext: ToolExecutionResult[] = [];
-    
+
+    // Progressive output mode: track accumulated output across iterations
+    let progressiveOutput: Partial<TOutput> | undefined = undefined;
+    const progressiveConfig = config.progressiveOutput;
+    const completionField = progressiveConfig?.completionField ?? 'confidence';
+    const completionValues = progressiveConfig?.completionValues ?? ['high', 'complete', 'done', true];
+
     // Debug logging for fuzzy search decision
     if (config.requestId?.includes('fuzzy-search-decision')) {
       console.log(`[executeSingle] [${config.requestId}] Starting with maxIterations=${maxIterations}, config.maxIterations=${config.maxIterations}, hasTools=${!!(config.tools && config.tools.length > 0)}`);
@@ -463,8 +489,8 @@ export class StructuredLLMExecutor {
       while (toolCallRound < maxToolCallRounds) {
         toolCallRound++;
 
-        // Build prompt
-        const prompt = this.buildSinglePrompt(config, toolContext);
+        // Build prompt (pass progressiveOutput for progressive mode)
+        const prompt = this.buildSinglePrompt(config, toolContext, progressiveOutput);
 
         // Generate request ID for this iteration/round
         requestId = iteration === 1 && toolCallRound === 1 
@@ -511,6 +537,28 @@ export class StructuredLLMExecutor {
             toolCalls: validToolCalls,
             output: parsed,
           });
+        }
+
+        // Progressive output mode: update accumulated output and check for completion
+        if (progressiveConfig && parsed) {
+          // Update progressive output (excluding tool_calls)
+          const { tool_calls: _, ...outputWithoutTools } = parsed as any;
+          const prevOutput = (progressiveOutput ?? {}) as Record<string, unknown>;
+          progressiveOutput = { ...prevOutput, ...outputWithoutTools } as Partial<TOutput>;
+
+          // Check if completion criteria is met
+          const completionValue = (progressiveOutput as any)?.[completionField];
+          const isComplete = completionValues.includes(completionValue);
+
+          // Call progress callback
+          if (progressiveConfig.onProgress && progressiveOutput) {
+            progressiveConfig.onProgress(progressiveOutput, iteration, isComplete);
+          }
+
+          // If complete and no more tool calls, we can return early
+          if (isComplete && validToolCalls.length === 0) {
+            return progressiveOutput as TOutput;
+          }
         }
 
         // If we have tool calls, execute them
@@ -615,8 +663,21 @@ export class StructuredLLMExecutor {
 
       // No tool calls and no valid output - error
       if (iteration === maxIterations) {
+        // In progressive mode, return the accumulated output even if not complete
+        if (progressiveConfig && progressiveOutput) {
+          // Call progress callback with isComplete=false
+          if (progressiveConfig.onProgress) {
+            progressiveConfig.onProgress(progressiveOutput, iteration, false);
+          }
+          return progressiveOutput as TOutput;
+        }
         throw new Error(`Max iterations (${maxIterations}) reached without valid output`);
       }
+    }
+
+    // In progressive mode, return the accumulated output
+    if (progressiveConfig && progressiveOutput) {
+      return progressiveOutput as TOutput;
     }
 
     throw new Error(`Max iterations (${maxIterations}) reached without valid output`);
@@ -627,7 +688,8 @@ export class StructuredLLMExecutor {
    */
   private buildSinglePrompt<TOutput>(
     config: SingleLLMCallConfig<TOutput>,
-    toolContext: ToolExecutionResult[]
+    toolContext: ToolExecutionResult[],
+    previousOutput?: Partial<TOutput>
   ): string {
     const parts: string[] = [];
 
@@ -698,6 +760,34 @@ export class StructuredLLMExecutor {
         parts.push(resultStr);
         parts.push('');
       }
+    }
+
+    // Previous output (for progressive mode)
+    if (previousOutput && config.progressiveOutput) {
+      parts.push('## Your Previous Output');
+      parts.push('This is your output from the previous iteration. Refine and improve it based on new tool results.');
+      parts.push('You should:');
+      parts.push('- Keep what is correct');
+      parts.push('- Add new information discovered');
+      parts.push('- Correct any errors');
+      parts.push('- Update confidence level based on completeness');
+      parts.push('');
+      const format = config.outputFormat || 'xml';
+      if (format === 'xml') {
+        parts.push('<previous_output>');
+        for (const [key, value] of Object.entries(previousOutput)) {
+          if (key !== 'tool_calls') {
+            const formattedValue = typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value ?? '');
+            parts.push(`  <${key}>${formattedValue}</${key}>`);
+          }
+        }
+        parts.push('</previous_output>');
+      } else {
+        parts.push('```' + format);
+        parts.push(JSON.stringify(previousOutput, null, 2));
+        parts.push('```');
+      }
+      parts.push('');
     }
 
     // Output instructions

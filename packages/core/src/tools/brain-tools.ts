@@ -404,7 +404,7 @@ Example usage:
         },
         semantic: {
           type: 'boolean',
-          description: 'Use semantic/embedding-based search (default: false, uses text matching). **Recommended: true** for best results.',
+          description: 'Use semantic/embedding-based search (default: false, uses text matching). **Recommended: true** for best results. Automatically combines vector similarity with BM25 keyword matching via RRF fusion.',
         },
         embedding_type: {
           type: 'string',
@@ -419,6 +419,11 @@ Example usage:
           type: 'string',
           optional: true,
           description: 'Filter results by file path glob pattern (e.g., "**/*.ts", "src/tools/*.ts"). Optional, no filtering by default.',
+        },
+        base_path: {
+          type: 'string',
+          optional: true,
+          description: 'Filter results to only include files under this absolute path (e.g., "/home/user/project"). Useful for limiting search to a specific directory.',
         },
         limit: {
           type: 'number',
@@ -474,6 +479,7 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
     semantic?: boolean;
     embedding_type?: 'name' | 'content' | 'description' | 'all';
     glob?: string;
+    base_path?: string;
     limit?: number;
     use_reranking?: boolean;
     min_score?: number;
@@ -627,8 +633,11 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
         projects: params.projects,
         nodeTypes: params.types,
         semantic: params.semantic,
+        // Automatically enable hybrid search (semantic + BM25 with RRF fusion) when semantic is true
+        hybrid: params.semantic === true,
         embeddingType: params.embedding_type,
         glob: params.glob,
+        basePath: params.base_path,
         limit: searchLimit,
         minScore: params.min_score,
         // Include orphan files under cwd when user doesn't specify projects

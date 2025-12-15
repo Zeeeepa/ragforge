@@ -24,8 +24,10 @@ import {
   generate3DTools,
   generateAgentToolHandlers,
   generateAllDebugHandlers,
+  createWebToolHandlers,
   getLocalTimestamp,
   createRagAgent,
+  createResearchAgent,
   createClient,
   ConversationStorage,
   GeminiEmbeddingProvider,
@@ -36,7 +38,9 @@ import {
   type ThreeDToolsContext,
   type AgentToolsContext,
   type DebugToolsContext,
+  type WebToolsContext,
   type RagAgentOptions,
+  type ResearchAgent,
 } from '@luciformresearch/ragforge';
 
 // ============================================================================
@@ -274,6 +278,9 @@ class BrainDaemon {
   private lastActivity: Date;
   // Agent conversation state (shared across all agent tool calls)
   private currentConversationId: string | undefined = undefined;
+  // Research Agent for chat interface
+  private researchAgent: ResearchAgent | null = null;
+  private researchAgentConversationId: string | undefined = undefined;
 
   /**
    * Sanitize tool arguments for logging:
@@ -326,6 +333,50 @@ class BrainDaemon {
     }
 
     return String(args);
+  }
+
+  /**
+   * Create a readable summary of tool results for logging
+   */
+  private summarizeResult(toolName: string, result: any): Record<string, any> {
+    if (!result || typeof result !== 'object') {
+      return { result_preview: result };
+    }
+
+    // brain_search specific summary
+    if (toolName === 'brain_search' && result.results) {
+      const topResults = result.results.slice(0, 3).map((r: any) => {
+        const name = r.node?.name || r.node?.title || 'unnamed';
+        const type = r.node?.type || 'unknown';
+        const file = r.filePath ? r.filePath.split('/').slice(-2).join('/') : '';
+        return `${name} (${type}) ${file}`;
+      });
+      return {
+        count: result.totalCount || result.results.length,
+        top_results: topResults,
+        projects: result.searchedProjects?.length || 0,
+      };
+    }
+
+    // read_file specific summary
+    if (toolName === 'read_file' && typeof result.content === 'string') {
+      return {
+        lines: result.content.split('\n').length,
+        size: result.content.length,
+      };
+    }
+
+    // ingest_directory summary
+    if (toolName === 'ingest_directory' && result.stats) {
+      return {
+        files: result.stats.filesProcessed,
+        scopes: result.stats.scopesCreated,
+        duration_ms: result.stats.duration,
+      };
+    }
+
+    // Default: use sanitized preview with more depth
+    return { result_preview: this.sanitizeToolArgs(result, 3, 100, 3) };
   }
 
   constructor() {
@@ -560,6 +611,28 @@ class BrainDaemon {
         ? generateAllDebugHandlers(debugCtx)
         : {};
 
+      // Generate web tools handlers (search_web, fetch_web_page)
+      const webToolsCtx: WebToolsContext = {
+        geminiApiKey: process.env.GEMINI_API_KEY,
+        playwrightAvailable: true,
+        ingestWebPage: async (params) => {
+          if (!this.brain) return { success: false };
+          try {
+            await this.brain.ingestWebPage({
+              url: params.url,
+              title: params.title,
+              textContent: params.textContent,
+              rawHtml: params.rawHtml,
+              projectName: params.projectName,
+            });
+            return { success: true };
+          } catch (err) {
+            return { success: false };
+          }
+        },
+      };
+      const webToolHandlers = createWebToolHandlers(webToolsCtx);
+
       this.toolHandlers = {
         ...brainHandlers,
         ...setupHandlers,
@@ -567,6 +640,7 @@ class BrainDaemon {
         ...threeDTools.handlers,
         ...agentHandlers,
         ...debugHandlers,
+        ...webToolHandlers,
       };
 
       this.logger.info(`${Object.keys(this.toolHandlers).length} tools ready (including ${Object.keys(debugHandlers).length} debug tools)`);
@@ -777,11 +851,11 @@ class BrainDaemon {
         const result = await handler(args);
         const duration = Date.now() - startTime;
 
-        // Log completion with result summary (truncated if too large)
-        const resultSummary = this.sanitizeToolArgs(result, 2, 100, 5);
-        this.logger.info(`Tool ${toolName} completed in ${duration}ms`, { 
+        // Log completion with result summary
+        const resultSummary = this.summarizeResult(toolName, result);
+        this.logger.info(`Tool ${toolName} completed in ${duration}ms`, {
           result_size: typeof result === 'string' ? result.length : JSON.stringify(result).length,
-          result_preview: resultSummary 
+          ...resultSummary
         });
         return { success: true, result, duration_ms: duration };
       } catch (error: any) {
@@ -1059,6 +1133,180 @@ class BrainDaemon {
 
       // Don't end the response - keep it open for streaming
       // Fastify will handle this with the raw response
+    });
+
+    // ============================================
+    // Research Agent Chat Endpoint (SSE streaming)
+    // ============================================
+
+    // Chat with Research Agent
+    this.server.post<{
+      Body: { message: string; conversationId?: string; cwd?: string };
+    }>('/agent/chat', async (request, reply) => {
+      const { message, conversationId, cwd } = request.body || {};
+
+      if (!message) {
+        reply.status(400);
+        return { success: false, error: 'Missing message' };
+      }
+
+      // Use provided cwd or fallback to process.cwd()
+      const workingDir = cwd || process.cwd();
+
+      this.logger.info(`Agent chat: ${message.substring(0, 100)}...`, {
+        conversationId: conversationId || 'new',
+        cwd: workingDir,
+      });
+
+      // Set SSE headers
+      reply.raw.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*',
+      });
+
+      try {
+        // Ensure brain is initialized
+        const brain = await this.ensureBrain();
+
+        // Create or reuse ResearchAgent
+        if (!this.researchAgent || (conversationId && conversationId !== this.researchAgentConversationId)) {
+          // Get API key
+          const brainConfig = brain.getConfig();
+          const apiKey = process.env.GEMINI_API_KEY || brainConfig.apiKeys.gemini;
+
+          if (!apiKey) {
+            reply.raw.write(`data: ${JSON.stringify({ type: 'error', error: 'GEMINI_API_KEY not configured' })}\n\n`);
+            reply.raw.end();
+            return;
+          }
+
+          this.researchAgent = await createResearchAgent({
+            apiKey,
+            model: 'gemini-2.0-flash',
+            conversationId: conversationId || undefined,
+            brainManager: brain,
+            cwd: workingDir,
+            verbose: !!process.env.RAGFORGE_DAEMON_VERBOSE,
+            onToolCall: (name, args) => {
+              this.logger.debug(`Agent tool call: ${name}`);
+              try {
+                reply.raw.write(`data: ${JSON.stringify({ type: 'tool_call', name, args: this.sanitizeToolArgs(args) })}\n\n`);
+              } catch {}
+            },
+            onToolResult: (name, result, success, duration) => {
+              this.logger.debug(`Agent tool result: ${name} (${duration}ms)`);
+              const summary = this.summarizeResult(name, result);
+              try {
+                reply.raw.write(`data: ${JSON.stringify({ type: 'tool_result', name, success, duration, summary })}\n\n`);
+              } catch {}
+            },
+            onThinking: (thought) => {
+              if (thought) {
+                try {
+                  reply.raw.write(`data: ${JSON.stringify({ type: 'thinking', content: thought.substring(0, 500) })}\n\n`);
+                } catch {}
+              }
+            },
+            onReportUpdate: (report, confidence, missingInfo) => {
+              try {
+                reply.raw.write(`data: ${JSON.stringify({ type: 'report_update', report, confidence, missingInfo })}\n\n`);
+              } catch {}
+            },
+          });
+
+          this.researchAgentConversationId = this.researchAgent.getConversationId();
+          this.logger.info(`Created ResearchAgent with conversation: ${this.researchAgentConversationId}`);
+        }
+
+        // Send message to agent
+        const response = await this.researchAgent.chat(message);
+
+        // Send final response
+        reply.raw.write(`data: ${JSON.stringify({
+          type: 'response',
+          conversationId: this.researchAgentConversationId,
+          content: response.message,
+          toolsUsed: response.toolsUsed || [],
+          sourcesUsed: response.sourcesUsed || [],
+        })}\n\n`);
+
+        // Send done event
+        reply.raw.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
+        reply.raw.end();
+
+      } catch (error: any) {
+        this.logger.error(`Agent chat error: ${error.message}`, { stack: error.stack });
+        try {
+          reply.raw.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
+          reply.raw.end();
+        } catch {}
+      }
+    });
+
+    // List conversations
+    this.server.get('/agent/conversations', async () => {
+      const brain = await this.ensureBrain();
+      const neo4jClient = brain.getNeo4jClient();
+
+      if (!neo4jClient) {
+        return { conversations: [] };
+      }
+
+      try {
+        // Query conversations from Neo4j
+        const result = await neo4jClient.run(`
+          MATCH (c:Conversation)
+          RETURN c.id as id, c.title as title, c.updatedAt as updatedAt
+          ORDER BY c.updatedAt DESC
+          LIMIT 50
+        `);
+
+        const conversations = result.records.map((record: any) => ({
+          id: record.get('id'),
+          title: record.get('title') || 'Untitled',
+          updatedAt: record.get('updatedAt'),
+        }));
+
+        return { conversations };
+      } catch (err: any) {
+        this.logger.warn(`Failed to list conversations: ${err.message}`);
+        return { conversations: [] };
+      }
+    });
+
+    // Get conversation messages
+    this.server.get<{
+      Params: { conversationId: string };
+    }>('/agent/conversations/:conversationId', async (request) => {
+      const { conversationId } = request.params;
+      const brain = await this.ensureBrain();
+      const neo4jClient = brain.getNeo4jClient();
+
+      if (!neo4jClient) {
+        return { messages: [] };
+      }
+
+      try {
+        const result = await neo4jClient.run(`
+          MATCH (c:Conversation {id: $conversationId})-[:HAS_MESSAGE]->(m:Message)
+          RETURN m.role as role, m.content as content, m.timestamp as timestamp, m.toolCalls as toolCalls
+          ORDER BY m.timestamp ASC
+        `, { conversationId });
+
+        const messages = result.records.map((record: any) => ({
+          role: record.get('role'),
+          content: record.get('content'),
+          timestamp: record.get('timestamp'),
+          toolCalls: record.get('toolCalls'),
+        }));
+
+        return { messages };
+      } catch (err: any) {
+        this.logger.warn(`Failed to get conversation: ${err.message}`);
+        return { messages: [] };
+      }
     });
   }
 

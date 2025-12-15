@@ -234,6 +234,11 @@ export {
   generateCopyFileHandler,
   generateCreateDirectoryTool,
   generateCreateDirectoryHandler,
+  // Grep/search tools
+  generateGrepFilesTool,
+  generateGrepFilesHandler,
+  generateSearchFilesTool,
+  generateSearchFilesHandler,
 } from './tools/fs-tools.js';
 export type { FsToolsContext, FsToolsResult } from './tools/fs-tools.js';
 
@@ -333,6 +338,10 @@ export {
   formatLocalDate,
 } from './runtime/utils/timestamp.js';
 
+// ============================================
+// Docker Management
+// ============================================
+export * from './docker/index.js';
+
 // Version
-export const VERSION = '0.2.0';
-// test 1765365652
+export const VERSION = '0.3.0';

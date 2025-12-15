@@ -327,7 +327,7 @@ export function generateRender3DAssetHandler(ctx: ThreeDToolsContext): (args: an
     } catch (err: any) {
       return {
         error: `Rendering failed: ${err.message}`,
-        hint: 'Make sure three, canvas, and gl packages are installed for headless rendering.',
+        hint: 'Make sure playwright is installed and Chromium is available (npx playwright install chromium).',
       };
     }
   };
