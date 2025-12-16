@@ -335,6 +335,89 @@ export async function callToolViaDaemon(
 }
 
 /**
+ * Research result from the agent
+ */
+export interface ResearchResult {
+  success: boolean;
+  report?: string;
+  confidence?: 'high' | 'medium' | 'low';
+  sourcesUsed?: string[];
+  toolsUsed?: string[];
+  toolCallDetails?: Array<{
+    tool_name: string;
+    arguments: Record<string, any>;
+    result: any;
+    success: boolean;
+    duration_ms: number;
+  }>;
+  iterations?: number;
+  logPath?: string;
+  reportPath?: string;
+  error?: string;
+}
+
+/**
+ * Call the research agent synchronously (waits for completion)
+ */
+export async function research(
+  question: string,
+  cwd?: string,
+  options: { verbose?: boolean } = {}
+): Promise<ResearchResult> {
+  const { verbose = false } = options;
+  const callStart = Date.now();
+
+  await logToFile('info', `research: "${question.substring(0, 50)}..."`, { cwd });
+
+  // Ensure daemon is running
+  const daemonReady = await ensureDaemonRunning(verbose);
+  if (!daemonReady) {
+    await logToFile('error', 'Daemon not ready for research');
+    return { success: false, error: 'Failed to start daemon' };
+  }
+
+  try {
+    if (verbose) {
+      console.log(`⏳ Researching...`);
+    }
+
+    const url = `${DAEMON_URL}/agent/research-sync`;
+    await logToFile('debug', `Calling ${url}`);
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: question, cwd }),
+    });
+
+    const data = await response.json() as ResearchResult;
+
+    await logToFile('info', `Research complete`, {
+      status: response.status,
+      success: data.success,
+      confidence: data.confidence,
+      iterations: data.iterations,
+      totalTime: Date.now() - callStart,
+    });
+
+    if (!response.ok) {
+      return {
+        success: false,
+        error: data.error || `HTTP ${response.status}`,
+      };
+    }
+
+    return data;
+  } catch (error: any) {
+    await logToFile('error', `Research failed`, { error: error.message });
+    return {
+      success: false,
+      error: error.message,
+    };
+  }
+}
+
+/**
  * Get daemon status
  */
 export async function getDaemonStatus(): Promise<any | null> {

@@ -165,13 +165,23 @@ Example:
     type: 'function',
     function: {
       name: 'finalize_report',
-      description: `Mark the report as complete with a confidence level.
-Call this when you have gathered enough information and the report is ready.
+      description: `Mark the report as complete. ONLY call this when you have HIGH confidence.
+
+**IMPORTANT**: If you don't have high confidence yet, DO NOT call this tool. Instead:
+- Perform additional searches with different terms
+- Read more files to gather missing information
+- Use explore_node to find related code
+- Keep researching until you're confident
+
+Only finalize when:
+- You've done multiple searches (at least 2-3)
+- All claims in your report have source citations with line numbers
+- You've explored related terms and followed the trail
 
 Confidence levels:
-- "high": All information gathered, no missing pieces
-- "medium": Most information found, some minor gaps
-- "low": Partial information, significant gaps remain
+- "high": Multiple searches done, all sources cited, comprehensive coverage
+- "medium": Most info found but some gaps - consider more research first
+- "low": Significant gaps remain - you should NOT finalize, keep researching
 
 Example:
   finalize_report({ confidence: "high" })`,

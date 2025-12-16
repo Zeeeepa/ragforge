@@ -3765,6 +3765,121 @@ export function generateUpdateTodosHandler() {
 }
 
 // ============================================
+// call_research_agent
+// ============================================
+
+/**
+ * Generate call_research_agent tool definition
+ * Allows calling the research agent with a question and getting a structured response
+ */
+export function generateCallResearchAgentTool(): GeneratedToolDefinition {
+  return {
+    name: 'call_research_agent',
+    description: `Call the Research Agent with a question and get a comprehensive answer.
+
+The Research Agent is optimized for information gathering:
+- Searches the knowledge base (brain_search)
+- Reads files (code, images, PDFs, documents)
+- Explores file systems and dependencies
+- Produces comprehensive markdown reports
+
+Returns:
+- report: The markdown report/answer
+- confidence: 'high', 'medium', or 'low'
+- sourcesUsed: List of files/searches referenced
+- toolsUsed: List of tool names called
+- toolCallDetails: Detailed history of each tool call with arguments and results
+- iterations: Number of research iterations
+
+Parameters:
+- question: The question or research task
+- cwd: Optional working directory for file operations
+
+Example: call_research_agent({ question: "How does authentication work in this project?" })
+Example: call_research_agent({ question: "Explain the data flow from API to database", cwd: "/path/to/project" })`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        question: {
+          type: 'string',
+          description: 'The question or research task for the agent',
+        },
+        cwd: {
+          type: 'string',
+          description: 'Optional working directory for file operations',
+        },
+      },
+      required: ['question'],
+    },
+  };
+}
+
+/**
+ * Generate handler for call_research_agent
+ * Creates agent directly with logging enabled
+ */
+export function generateCallResearchAgentHandler(ctx: BrainToolsContext) {
+  return async (params: { question: string; cwd?: string }): Promise<any> => {
+    const { question, cwd } = params;
+    const os = await import('os');
+    const fsPromises = await import('fs/promises');
+    const pathModule = await import('path');
+
+    // Dynamically import ResearchAgent to avoid circular dependencies
+    const { createResearchAgent } = await import('../runtime/agents/research-agent.js');
+
+    // Setup logging
+    const logDir = pathModule.default.join(os.default.homedir(), '.ragforge', 'logs', 'agent-sessions');
+    await fsPromises.mkdir(logDir, { recursive: true });
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const logPath = pathModule.default.join(logDir, `session-${timestamp}.json`);
+    const reportPath = pathModule.default.join(logDir, `report-${timestamp}.md`);
+
+    const agent = await createResearchAgent({
+      brainManager: ctx.brain,
+      cwd: cwd || process.cwd(),
+      verbose: true,
+      maxIterations: 15,
+      logPath,
+      onReportUpdate: async (report: string) => {
+        try {
+          await fsPromises.writeFile(reportPath, report, 'utf-8');
+        } catch {
+          // Ignore write errors
+        }
+      },
+    });
+
+    const result = await agent.research(question);
+
+    // Write final report
+    await fsPromises.writeFile(reportPath, result.report, 'utf-8');
+
+    // Return a structured response with all details
+    return {
+      report: result.report,
+      confidence: result.confidence,
+      sourcesUsed: result.sourcesUsed,
+      toolsUsed: result.toolsUsed,
+      toolCallDetails: result.toolCallDetails.map(tc => ({
+        tool: tc.tool_name,
+        arguments: tc.arguments,
+        success: tc.success,
+        duration_ms: tc.duration_ms,
+        // Don't include full result to avoid bloating response, just a summary
+        result_preview: typeof tc.result === 'string'
+          ? tc.result.slice(0, 500) + (tc.result.length > 500 ? '...' : '')
+          : JSON.stringify(tc.result).slice(0, 500),
+      })),
+      turns: result.turns,
+      iterations: result.iterations,
+      logPath,
+      reportPath,
+    };
+  };
+}
+
+// ============================================
 // Export all tools
 // ============================================
 
@@ -3809,6 +3924,8 @@ export function generateBrainTools(): GeneratedToolDefinition[] {
     // User communication
     generateNotifyUserTool(),
     generateUpdateTodosTool(),
+    // Research agent
+    generateCallResearchAgentTool(),
   ];
 }
 
@@ -3853,6 +3970,8 @@ export function generateBrainToolHandlers(ctx: BrainToolsContext): Record<string
     // User communication
     notify_user: generateNotifyUserHandler(),
     update_todos: generateUpdateTodosHandler(),
+    // Research agent
+    call_research_agent: generateCallResearchAgentHandler(ctx),
   };
 }
 

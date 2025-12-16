@@ -15,7 +15,7 @@
  * - Enriched context from codebase
  */
 
-import { StructuredLLMExecutor, BaseToolExecutor, type ToolCallRequest, type ProgressiveOutputConfig } from '../llm/structured-llm-executor.js';
+import { StructuredLLMExecutor, BaseToolExecutor, LLMParseError, type ToolCallRequest, type ProgressiveOutputConfig } from '../llm/structured-llm-executor.js';
 import { GeminiAPIProvider } from '../reranking/gemini-api-provider.js';
 import { type ToolDefinition } from '../llm/native-tool-calling/index.js';
 import { AgentLogger } from './rag-agent.js';
@@ -34,6 +34,8 @@ import {
   generateIngestDirectoryHandler,
   generateExploreNodeTool,
   generateExploreNodeHandler,
+  generateBrainReadFileTool,
+  generateBrainReadFileHandler,
   generateBrainReadFilesTool,
   generateBrainReadFilesHandler,
   type BrainToolsContext,
@@ -124,6 +126,14 @@ export interface ResearchAgentOptions {
   onReportUpdate?: (report: string, confidence: 'high' | 'medium' | 'low', missingInfo: string[]) => void;
 }
 
+export interface ToolCallDetail {
+  tool_name: string;
+  arguments: Record<string, any>;
+  result: any;
+  success: boolean;
+  duration_ms: number;
+}
+
 export interface ResearchResult {
   /** The markdown report produced by the agent */
   report: string;
@@ -137,7 +147,13 @@ export interface ResearchResult {
   /** List of tools that were called */
   toolsUsed: string[];
 
-  /** Number of iterations used */
+  /** Detailed tool call history with arguments and results */
+  toolCallDetails: ToolCallDetail[];
+
+  /** Number of LLM calls (turns) */
+  turns: number;
+
+  /** Number of outer iterations (restarts) */
   iterations: number;
 }
 
@@ -245,23 +261,99 @@ This is powerful for understanding how code/content is interconnected. The tool 
 - \`grep_files\`: Search file contents with regex
 - \`search_files\`: Fuzzy text search
 
-## Research Workflow
-1. **Search first**: Use \`brain_search\` to find relevant indexed content
-2. **Explore relationships**: Use \`explore_node\` to understand how results connect to other code/content
-3. **Explore filesystem if needed**: Use \`list_directory\`/\`glob_files\` to discover files not yet indexed
-4. **Read files**: Use \`read_file\` to examine specific files (this also indexes them)
-5. **Synthesize**: Combine findings into a coherent answer
+## Research Workflow - BE THOROUGH
 
-## Guidelines
-- Be thorough but focused - gather all relevant information
-- Always cite your sources (file paths, specific code sections)
+**CRITICAL: Never rely on a single search result.** Your job is to gather ALL relevant information, not just the first match.
+
+### Step 1: Initial Search
+Start with \`brain_search\` using the user's terms, but **don't stop there**.
+
+**RULE: You MUST perform at least 2-3 different searches before writing your report.**
+
+### Step 2: Expand Your Search
+From initial results, identify:
+- **Related terms** you didn't search for (e.g., if searching "authentication", also try "login", "session", "token", "auth")
+- **File/function names** mentioned in results → search for those specifically
+- **Imports/dependencies** → explore what else is connected
+
+### Step 3: Follow the Trail
+- Use \`explore_node\` on interesting UUIDs to find connected code
+- Use \`grep_files\` to find usages of functions/classes you discovered
+- Read the actual source files to understand context
+
+### Step 4: Verify Completeness
+Before finalizing, ask yourself:
+- Have I found ALL the relevant files, not just one?
+- Are there related concepts I haven't explored?
+- Would the user be surprised by something I missed?
+
+### Step 5: Synthesize with Citations
+Combine findings into a coherent answer WITH proper citations.
+
+## Guidelines - CITATIONS WITH CODE ARE MANDATORY
+
+**Every claim must include a code block with the source citation:**
+
+✅ GOOD - citation with code block:
+\`\`\`
+The authentication is handled by the \`validateToken\` function:
+
+\`\`\`typescript
+// src/auth.ts:45-52
+export function validateToken(token: string): boolean {
+  const decoded = jwt.verify(token, SECRET);
+  return decoded.exp > Date.now();
+}
+\`\`\`
+\`\`\`
+
+❌ BAD - just mentioning without code:
+\`\`\`
+"The function validates tokens (src/auth.ts:45)"
+\`\`\`
+
+**Format for code blocks:**
+\`\`\`language
+// file/path.ts:startLine-endLine
+<actual code from the file>
+\`\`\`
+
+**Other guidelines:**
+- Be thorough - gather ALL relevant information, not just the first match
+- Infer related terms the user might not have mentioned
 - For images, PDFs, and 3D models, describe what you observe in detail
 - When uncertain, say so - don't make up information
 - Prefer \`read_file\` over \`ingest_directory\` for individual files
 
 ## Report Building
 
-Build your report incrementally using report tools:
+**ALWAYS build your report as you research.** Don't wait until the end.
+
+### CRITICAL RULES
+
+**1. Make MULTIPLE tool calls per turn (parallel execution):**
+\`\`\`
+// GOOD - multiple searches + report update in ONE turn:
+brain_search({ query: "authentication" })
+brain_search({ query: "login session token" })
+grep_files({ pattern: "**/*.ts", regex: "validateToken" })
+set_report({ content: "# Auth Report\\n\\nSearching auth, login, tokens..." })
+\`\`\`
+
+\`\`\`
+// BAD - only one tool call per turn (too slow!):
+brain_search({ query: "authentication" })
+// ... wait for next turn ...
+\`\`\`
+
+**2. Always include a report tool with your search tools:**
+Every turn should update the report with your findings so far.
+
+### Workflow
+1. First search → immediately \`set_report\` with initial findings
+2. Each additional search → \`append_to_report\` or \`edit_report\` with new findings
+3. Keep researching and updating until comprehensive
+4. Only call \`finalize_report\` when you have high confidence
 
 ### Starting a report
 Use \`set_report\` to create an initial draft with your structure:
@@ -283,12 +375,18 @@ When confident in your findings, call \`finalize_report\`:
 finalize_report({ confidence: "high" })
 \`\`\`
 
-Confidence levels:
-- **high**: All information gathered, no missing pieces
-- **medium**: Most information found, minor gaps remain
-- **low**: Partial information, significant gaps
+**IMPORTANT**: Only call \`finalize_report\` when you have HIGH confidence!
 
-**Important**: Call \`finalize_report\` when done. The report content comes from your editing tools, not from regular text output.
+If you don't have high confidence yet, **keep researching**:
+- Try different search terms
+- Read more source files
+- Use \`explore_node\` to find connected code
+- Use \`grep_files\` to find usages
+
+Confidence levels:
+- **high**: Multiple searches done (2-3+), every claim has line-number citations, comprehensive coverage
+- **medium**: Some gaps remain → do more research before finalizing
+- **low**: Significant gaps → do NOT finalize, keep researching
 
 ## Working Directory
 {CWD_PLACEHOLDER}`;
@@ -1059,7 +1157,8 @@ Examples:
       },
     };
 
-    let actualIterations = 0;
+    let turns = 0; // Count actual LLM calls (tool rounds)
+    let outerIteration = 0; // Track outer iteration number
 
     try {
       await this.executor.executeSingle<{ reasoning?: string }>({
@@ -1075,18 +1174,20 @@ Examples:
         logPrompts: this.verbose,
         logResponses: this.verbose,
         onLLMResponse: (response) => {
-          actualIterations = response.iteration;
+          turns++; // Count each LLM call
+          outerIteration = response.iteration;
 
-          // Log iteration to AgentLogger (including current report state from editor)
-          this.logger?.logIteration(response.iteration, {
+          // Log with turn number
+          this.logger?.logIteration(turns, {
             reasoning: response.reasoning,
             toolCalls: response.toolCalls?.map(tc => tc.tool_name),
             report: toolExecutor.getReportContent(),
             confidence: toolExecutor.reportConfidence,
+            outerIteration: response.iteration,
           });
 
           if (this.verbose) {
-            console.log(`   [Iteration ${response.iteration}]`);
+            console.log(`   [Turn ${turns}] (iteration ${response.iteration})`);
           }
           // Notify thinking callback if reasoning is present
           if (response.reasoning && this.onThinking) {
@@ -1107,12 +1208,13 @@ Examples:
         reportPreview: report.substring(0, 100) || '(empty)',
         confidence,
         isFinalized,
-        iterations: actualIterations,
+        turns,
+        iterations: outerIteration,
       });
 
       // Warn if report is empty
       if (!report || report.trim() === '') {
-        console.warn(`[ResearchAgent] WARNING: No report built after ${actualIterations} iterations`);
+        console.warn(`[ResearchAgent] WARNING: No report built after ${turns} turns`);
       } else if (!isFinalized) {
         console.warn(`[ResearchAgent] WARNING: Report not finalized (confidence: ${confidence})`);
       }
@@ -1135,7 +1237,9 @@ Examples:
         confidence,
         sourcesUsed: Array.from(toolExecutor.sourcesUsed),
         toolsUsed: toolExecutor.toolsUsed,
-        iterations: actualIterations,
+        toolCallDetails: toolExecutor.toolCallDetails,
+        turns,
+        iterations: outerIteration,
       };
 
       // Log final answer to AgentLogger
@@ -1146,22 +1250,30 @@ Examples:
         confidence,
         toolsUsed: result_final.toolsUsed.length,
         sourcesUsed: result_final.sourcesUsed.length,
-        iterations: actualIterations,
+        turns,
+        iterations: outerIteration,
       });
 
       return result_final;
     } catch (error: any) {
+      // Check if this is an LLM parse error with raw response
+      const isParseError = error instanceof LLMParseError;
+      const rawResponse = isParseError ? error.responsePreview : undefined;
+
       console.error(`[ResearchAgent] Research failed:`, {
         message: error.message,
         name: error.name,
         stack: error.stack?.split('\n').slice(0, 3).join('\n'),
+        ...(rawResponse && { rawResponse }),
       });
 
-      // Log error to AgentLogger
+      // Log error to AgentLogger with raw response if available
       this.logger?.logError(error.message, {
         toolsUsed: toolExecutor.toolsUsed,
         sourcesUsed: Array.from(toolExecutor.sourcesUsed),
-        iterations: actualIterations,
+        turns,
+        iterations: outerIteration,
+        ...(rawResponse && { rawResponse }),
       });
 
       const errorReport = `Research failed: ${error.message}`;
@@ -1174,7 +1286,9 @@ Examples:
         confidence: 'low',
         sourcesUsed: Array.from(toolExecutor.sourcesUsed),
         toolsUsed: toolExecutor.toolsUsed,
-        iterations: actualIterations,
+        toolCallDetails: toolExecutor.toolCallDetails,
+        turns,
+        iterations: outerIteration,
       };
     }
   }
@@ -1258,6 +1372,7 @@ export async function createResearchAgent(options: ResearchAgentOptions): Promis
     apiKey,
     model,
     temperature,
+    maxOutputTokens: 10000, // Increased for comprehensive reports
   });
 
   const executor = new StructuredLLMExecutor();
@@ -1265,22 +1380,31 @@ export async function createResearchAgent(options: ResearchAgentOptions): Promis
   const tools: GeneratedToolDefinition[] = [];
   const handlers: Record<string, (args: Record<string, any>) => Promise<any>> = {};
 
-  // 1. File tools (read_file only - research is read-only)
-  const fileCtx: FileToolsContext = {
-    projectRoot: options.projectRoot || options.cwd || process.cwd,
-  };
-  const fileTools = generateFileTools(fileCtx);
-
-  // Only include read_file for research (read-only)
-  const readFileTool = fileTools.tools.find((t) => t.name === 'read_file');
-  if (readFileTool) {
+  // 1. File tools - use brain-aware read_file if brainManager available
+  if (options.brainManager) {
+    // Use brain-aware read_file (same as MCP tools)
+    const brainCtx: BrainToolsContext = {
+      brain: options.brainManager,
+    };
+    const readFileTool = generateBrainReadFileTool();
     tools.push(readFileTool);
-    handlers['read_file'] = fileTools.handlers['read_file'];
+    handlers['read_file'] = generateBrainReadFileHandler(brainCtx);
+  } else {
+    // Fallback to file-tools read_file (less features but works without brain)
+    const fileCtx: FileToolsContext = {
+      projectRoot: options.projectRoot || options.cwd || process.cwd(),
+    };
+    const fileTools = generateFileTools(fileCtx);
+    const readFileTool = fileTools.tools.find((t) => t.name === 'read_file');
+    if (readFileTool) {
+      tools.push(readFileTool);
+      handlers['read_file'] = fileTools.handlers['read_file'];
+    }
   }
 
   // 2. FS tools (exploration only)
   const fsCtx: FsToolsContext = {
-    projectRoot: options.projectRoot || options.cwd || process.cwd,
+    projectRoot: options.projectRoot || options.cwd || process.cwd(),
   };
   const fsTools = generateFsTools(fsCtx);
 

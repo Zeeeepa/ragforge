@@ -24,6 +24,24 @@ import {
   type NativeToolCallingProvider,
 } from './native-tool-calling/index.js';
 
+// ===== CUSTOM ERRORS =====
+
+/**
+ * Error thrown when LLM response parsing fails
+ * Includes the raw response for debugging
+ */
+export class LLMParseError extends Error {
+  public rawResponse: string;
+  public responsePreview: string;
+
+  constructor(message: string, rawResponse: string) {
+    super(message);
+    this.name = 'LLMParseError';
+    this.rawResponse = rawResponse;
+    this.responsePreview = rawResponse.substring(0, 2000);
+  }
+}
+
 // ===== CORE INTERFACES =====
 
 /**
@@ -918,7 +936,10 @@ export class StructuredLLMExecutor {
       if (!parseResult.document?.root) {
         console.error('[parseSingleXMLResponse] No XML root element found in response:');
         console.error(xmlText.substring(0, 500));
-        throw new Error('Malformed LLM response: No XML root element found. Expected <response>...</response>');
+        throw new LLMParseError(
+          'Malformed LLM response: No XML root element found. Expected <response>...</response>',
+          xmlText
+        );
       }
 
       const root = parseResult.document.root;
@@ -984,7 +1005,11 @@ export class StructuredLLMExecutor {
     } catch (error: any) {
       console.error('[parseSingleXMLResponse] Failed to parse XML response:', error.message);
       console.error('[parseSingleXMLResponse] Raw response (first 500 chars):', xmlText.substring(0, 500));
-      throw error; // Re-throw to let caller handle it
+      // Re-throw as LLMParseError if not already
+      if (error instanceof LLMParseError) {
+        throw error;
+      }
+      throw new LLMParseError(error.message || 'Failed to parse XML response', xmlText);
     }
 
     return output as TOutput;

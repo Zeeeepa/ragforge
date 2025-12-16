@@ -41,7 +41,7 @@ export class GeminiAPIProvider implements LLMProvider {
     this.client = new GoogleGenAI({ apiKey: config.apiKey });
     this.modelName = config.model;
     this.temperature = config.temperature || 0.3;
-    this.maxOutputTokens = config.maxOutputTokens || 512;
+    this.maxOutputTokens = config.maxOutputTokens || 10000;
     this.retryAttempts = config.retryAttempts ?? 3;
     this.retryDelay = config.retryDelay ?? 1000;
     this.rateLimitStrategy = config.rateLimitStrategy ?? 'reactive'; // Default to reactive (model-agnostic)
@@ -62,7 +62,7 @@ export class GeminiAPIProvider implements LLMProvider {
     // For reranking with 100 items per batch, responses can be large
     // Each evaluation: ~80-100 tokens (uuid + score + reasoning + relevant)
     // 100 items × 100 tokens = 10000 tokens, so we need at least 12k for safety
-    const calculatedMaxTokens = this.maxOutputTokens === 512 // Check if it's still the default
+    const calculatedMaxTokens = this.maxOutputTokens === 10000 // Check if it's still the default
       ? Math.max(
           Math.min(promptTokens * 2, 16384), // Cap at 16k output tokens (allows 100-item batches)
           12288 // Minimum 12k tokens for reranking responses (100 items × ~120 tokens each)

@@ -1463,6 +1463,88 @@ class BrainDaemon {
       }
     });
 
+    // Start a research task synchronously (waits for completion)
+    this.server.post<{
+      Body: { message: string; conversationId?: string; cwd?: string };
+    }>('/agent/research-sync', async (request, reply) => {
+      try {
+        const { message, conversationId, cwd } = request.body;
+        const brain = await this.ensureBrain();
+
+        // Determine working directory
+        const workingDir = cwd || process.cwd();
+
+        // Get API key
+        const brainConfig = await brain.getConfig();
+        const apiKey = process.env.GEMINI_API_KEY || brainConfig.apiKeys.gemini;
+
+        if (!apiKey) {
+          reply.status(500);
+          return { success: false, error: 'GEMINI_API_KEY not configured' };
+        }
+
+        // Generate log path for agent session
+        const agentLogDir = path.join(LOG_DIR, 'agent-sessions');
+        await fs.mkdir(agentLogDir, { recursive: true });
+        const timestamp = getFilenameTimestamp();
+        const agentLogPath = path.join(agentLogDir, `session-${timestamp}.json`);
+        const reportPath = path.join(agentLogDir, `report-${timestamp}.md`);
+
+        this.logger.info(`[Research Sync] Starting research for: "${message.substring(0, 50)}..."`);
+
+        // Create agent
+        const agent = await createResearchAgent({
+          apiKey,
+          model: 'gemini-2.0-flash',
+          conversationId: conversationId || undefined,
+          brainManager: brain,
+          cwd: workingDir,
+          verbose: true,
+          maxIterations: 15, // Give agent room to research thoroughly
+          logPath: agentLogPath,
+          onReportUpdate: async (report, confidence, missingInfo) => {
+            // Write report to file for progressive checking
+            try {
+              await fs.writeFile(reportPath, report, 'utf-8');
+            } catch (err: any) {
+              this.logger.warn(`Failed to write report: ${err.message}`);
+            }
+          },
+        });
+
+        // Run research synchronously (wait for completion)
+        const result = await agent.research(message);
+
+        // Write final report
+        await fs.writeFile(reportPath, result.report, 'utf-8');
+
+        this.logger.info(`[Research Sync] Complete`, {
+          confidence: result.confidence,
+          reportLength: result.report.length,
+          iterations: result.iterations,
+          toolsUsed: result.toolsUsed.length,
+        });
+
+        // Return full result
+        return {
+          success: true,
+          report: result.report,
+          confidence: result.confidence,
+          sourcesUsed: result.sourcesUsed,
+          toolsUsed: result.toolsUsed,
+          toolCallDetails: result.toolCallDetails,
+          iterations: result.iterations,
+          logPath: agentLogPath,
+          reportPath: reportPath,
+        };
+
+      } catch (error: any) {
+        this.logger.error(`Agent research-sync error: ${error.message}`);
+        reply.status(500);
+        return { success: false, error: error.message };
+      }
+    });
+
     // Get conversation messages
     this.server.get<{
       Params: { conversationId: string };
