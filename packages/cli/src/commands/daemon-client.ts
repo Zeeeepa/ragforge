@@ -19,7 +19,7 @@ const __dirname = path.dirname(__filename);
 
 const DAEMON_PORT = 6969;
 const DAEMON_URL = `http://127.0.0.1:${DAEMON_PORT}`;
-const STARTUP_TIMEOUT_MS = 30000; // 30 seconds to start daemon
+const STARTUP_TIMEOUT_MS = 90000; // 90 seconds to start daemon (Neo4j + watchers can be slow)
 const STARTUP_CHECK_INTERVAL_MS = 500;
 const LOG_DIR = path.join(os.homedir(), '.ragforge', 'logs');
 const CLIENT_LOG_FILE = path.join(LOG_DIR, 'daemon-client.log');
@@ -41,7 +41,7 @@ async function logToFile(level: string, message: string, meta?: any): Promise<vo
 }
 
 /**
- * Check if the daemon is running
+ * Check if the daemon is running AND ready (brain initialized)
  */
 export async function isDaemonRunning(): Promise<boolean> {
   const url = `${DAEMON_URL}/health`;
@@ -49,13 +49,39 @@ export async function isDaemonRunning(): Promise<boolean> {
 
   try {
     const response = await fetch(url, {
-      signal: AbortSignal.timeout(2000),
+      signal: AbortSignal.timeout(5000), // Increased timeout for slow init
     });
-    const isRunning = response.ok;
-    await logToFile('debug', `Daemon health check result`, { ok: isRunning, status: response.status });
-    return isRunning;
+
+    // 200 = ready, 503 = starting, 500 = error
+    if (response.ok) {
+      await logToFile('debug', `Daemon is ready`, { status: response.status });
+      return true;
+    }
+
+    // Daemon is responding but not ready yet
+    await logToFile('debug', `Daemon responding but not ready`, { status: response.status });
+    return false;
   } catch (error: any) {
     await logToFile('debug', `Daemon health check failed`, { error: error.message, code: error.code });
+    return false;
+  }
+}
+
+/**
+ * Check if the daemon is started (responding to requests, even if not fully ready)
+ */
+export async function isDaemonStarted(): Promise<boolean> {
+  const url = `${DAEMON_URL}/health`;
+
+  try {
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(5000),
+    });
+    // Any response means daemon is started (200, 503, or 500)
+    await logToFile('debug', `Daemon is started`, { status: response.status });
+    return true;
+  } catch (error: any) {
+    // Connection refused = daemon not started
     return false;
   }
 }
@@ -131,21 +157,43 @@ async function isPortInUse(port: number): Promise<boolean> {
 export async function ensureDaemonRunning(verbose: boolean = false): Promise<boolean> {
   await logToFile('info', 'ensureDaemonRunning called', { verbose });
 
-  // First check if daemon is already running (health check)
-  const alreadyRunning = await isDaemonRunning();
-  if (alreadyRunning) {
-    await logToFile('info', 'Daemon already running (health check)');
+  // First check if daemon is already ready
+  const alreadyReady = await isDaemonRunning();
+  if (alreadyReady) {
+    await logToFile('info', 'Daemon already ready');
     if (verbose) {
       console.log('✓ Daemon already running');
     }
     return true;
   }
 
-  // Also check if port is in use (more reliable - catches daemon starting)
+  // Check if daemon is started but not ready yet (initializing brain)
+  const alreadyStarted = await isDaemonStarted();
+  if (alreadyStarted) {
+    await logToFile('info', 'Daemon started but not ready, waiting for initialization...');
+    if (verbose) {
+      console.log('⏳ Daemon starting, waiting for initialization...');
+    }
+    // Wait for daemon to become ready
+    const startTime = Date.now();
+    while (Date.now() - startTime < STARTUP_TIMEOUT_MS) {
+      await new Promise(resolve => setTimeout(resolve, STARTUP_CHECK_INTERVAL_MS));
+      if (await isDaemonRunning()) {
+        await logToFile('info', 'Daemon became ready');
+        if (verbose) {
+          console.log('✓ Daemon ready');
+        }
+        return true;
+      }
+    }
+    await logToFile('error', 'Timeout waiting for daemon to become ready');
+    return false;
+  }
+
+  // Check if port is in use (daemon might be starting)
   const portInUse = await isPortInUse(DAEMON_PORT);
   if (portInUse) {
-    await logToFile('info', 'Port already in use, waiting for daemon to be ready...');
-    // Wait for daemon to be ready
+    await logToFile('info', 'Port in use, waiting for daemon...');
     const startTime = Date.now();
     while (Date.now() - startTime < STARTUP_TIMEOUT_MS) {
       await new Promise(resolve => setTimeout(resolve, STARTUP_CHECK_INTERVAL_MS));
@@ -162,7 +210,6 @@ export async function ensureDaemonRunning(verbose: boolean = false): Promise<boo
   const lockAcquired = await acquireStartupLock();
   if (!lockAcquired) {
     await logToFile('info', 'Another process is starting the daemon, waiting...');
-    // Wait for the other process to finish starting
     const startTime = Date.now();
     while (Date.now() - startTime < STARTUP_TIMEOUT_MS) {
       await new Promise(resolve => setTimeout(resolve, STARTUP_CHECK_INTERVAL_MS));

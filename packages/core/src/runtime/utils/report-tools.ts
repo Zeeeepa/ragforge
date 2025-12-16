@@ -216,7 +216,7 @@ export interface ReportToolHandlers {
   insert_after_heading: (args: { heading: string; content: string }) => EditResult;
   replace_section: (args: { heading: string; new_content: string }) => EditResult;
   delete_section: (args: { heading: string }) => EditResult;
-  finalize_report: (args: { confidence: 'high' | 'medium' | 'low' }) => { finalized: true; confidence: string; report: string };
+  finalize_report: (args: { confidence: 'high' | 'medium' | 'low' }) => { success: true; finalized: true; confidence: string };
 }
 
 /**
@@ -237,9 +237,9 @@ export function createReportToolHandlers(editor: ReportEditor): ReportToolHandle
     delete_section: (args) => editor.deleteSection(args.heading),
 
     finalize_report: (args) => ({
+      success: true,
       finalized: true,
       confidence: args.confidence,
-      report: editor.getContent(),
     }),
   };
 }

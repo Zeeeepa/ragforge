@@ -90,6 +90,7 @@ Assistant: ${turn.assistantMessage}${toolsInfo}`;
     const result = await this.executor.executeLLMBatch(
       [{ conversation: formattedTurns }],
       {
+        caller: 'ConversationSummarizer.summarizeTurns',
         inputFields: ['conversation'],
         systemPrompt: `You are analyzing a conversation between a user and an AI assistant. 
 Extract structured information including files mentioned, key findings, tools used, and topics discussed.`,
@@ -199,6 +200,7 @@ Topics: ${s.topics.join(', ')}`;
     const result = await this.executor.executeLLMBatch(
       [{ summaries: formattedSummaries }],
       {
+        caller: 'ConversationSummarizer.summarizeSummaries',
         inputFields: ['summaries'],
         systemPrompt: `You are analyzing multiple conversation summaries to create a higher-level summary.
 Synthesize the information, merge duplicate files/findings, and create a coherent overview.`,

@@ -587,7 +587,7 @@ export function generateCreateFileHandler(ctx: FileToolsContext): (args: any) =>
  * Strip line number prefixes from text (e.g., "00001| content" -> "content")
  * Handles the format from read_file output
  */
-function stripLineNumberPrefixes(text: string): string {
+export function stripLineNumberPrefixes(text: string): string {
   // Pattern: 5 digits + "| " at the start of each line
   return text.replace(/^\d{5}\| /gm, '');
 }
@@ -818,7 +818,7 @@ const MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD = 0.3;
  * Replace with fuzzy matching (inspired by OpenCode)
  * Tries multiple strategies to find and replace text
  */
-function replaceWithFuzzyMatch(
+export function replaceWithFuzzyMatch(
   content: string,
   oldString: string,
   newString: string,
@@ -1284,19 +1284,13 @@ export interface FileToolsResult {
  * Generate all file tools with handlers
  */
 export function generateFileTools(ctx: FileToolsContext): FileToolsResult {
+  // NOTE: read_file, write_file, create_file, edit_file moved to brain-tools.ts
+  // Use generateBrainTools() for those - they have better handling for projects
   return {
     tools: [
-      generateReadFileTool(),
-      generateWriteFileTool(),
-      generateCreateFileTool(),
-      generateEditFileTool(),
       generateInstallPackageTool(),
     ],
     handlers: {
-      read_file: generateReadFileHandler(ctx),
-      write_file: generateWriteFileHandler(ctx),
-      create_file: generateCreateFileHandler(ctx),
-      edit_file: generateEditFileHandler(ctx),
       install_package: generateInstallPackageHandler(ctx),
     },
   };

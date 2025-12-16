@@ -248,6 +248,7 @@ Be factual and preserve critical details.`,
           },
         },
         llmProvider: this.llmProvider,
+        caller: 'ConversationSummarizer.generateL1Summary',
         batchSize: 1,
       }
     );
@@ -465,6 +466,7 @@ Be thorough in synthesizing information while keeping it concise.`,
           },
         },
         llmProvider: this.llmProvider,
+        caller: 'ConversationSummarizer.generateL2Summary',
         batchSize: 1,
       }
     );

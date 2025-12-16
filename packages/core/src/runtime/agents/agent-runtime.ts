@@ -25,6 +25,7 @@ import {
   type ToolDefinition,
   type Message as NativeMessage,
 } from '../llm/native-tool-calling/index.js';
+import { ToolLogger } from '../utils/tool-logger.js';
 
 // ============================================
 // Types for Agent Loop
@@ -406,6 +407,7 @@ export class AgentRuntime {
         outputSchema: this.buildOutputSchema(),
         outputFormat: 'xml',
         llmProvider: this.llmProvider,
+        caller: 'AgentRuntime.iterate',
         batchSize: 1,
       }
     );
@@ -608,6 +610,7 @@ Please provide your analysis in the requested structured format.`;
         outputSchema: config.schema,
         outputFormat: config.format || 'xml',
         llmProvider: this.llmProvider,
+        caller: 'AgentRuntime.generateStructuredResponse',
         batchSize: 1,
       }
     );
@@ -796,8 +799,17 @@ Description: ${tool.description}`;
           };
         }
 
+        const startTime = Date.now();
         try {
           const result = await tool.execute(tc.arguments);
+
+          // Log tool call (if enabled)
+          await ToolLogger.logToolCall(tc.tool_name, tc.arguments, result, {
+            duration: Date.now() - startTime,
+            success: true,
+            source: 'agent',
+          });
+
           return {
             tool_name: tc.tool_name,
             success: true,
@@ -805,6 +817,15 @@ Description: ${tool.description}`;
           };
         } catch (error: any) {
           console.error(`   ❌ Tool ${tc.tool_name} failed:`, error.message);
+
+          // Log failed tool call (if enabled)
+          await ToolLogger.logToolCall(tc.tool_name, tc.arguments, { error: error.message }, {
+            duration: Date.now() - startTime,
+            success: false,
+            error: error.message,
+            source: 'agent',
+          });
+
           return {
             tool_name: tc.tool_name,
             success: false,

@@ -686,7 +686,8 @@ export class QueryBuilder<T = any> {
     return this.llmGenerateStructured({
       inputFields: config.inputFields,
       outputSchema,
-      llm: config.llm
+      llm: config.llm,
+      caller: 'QueryBuilder.summarizeFields',
     });
   }
 
@@ -1574,8 +1575,12 @@ export class QueryBuilder<T = any> {
       // Extract entities from SearchResults
       const entities = currentResults.map(r => r.entity);
 
-      // Execute LLM batch generation
-      const result = await this.structuredLLMExecutor.executeLLMBatch(entities, config);
+      // Execute LLM batch generation (add default caller if not provided)
+      const configWithCaller = {
+        ...config,
+        caller: config.caller || 'QueryBuilder.executeLLMStructured',
+      };
+      const result = await this.structuredLLMExecutor.executeLLMBatch(entities, configWithCaller);
 
       // Handle return type (array or LLMBatchResult)
       const enriched = Array.isArray(result) ? result : result.items;

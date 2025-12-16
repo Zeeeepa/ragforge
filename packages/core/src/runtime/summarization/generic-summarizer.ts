@@ -168,6 +168,7 @@ export class GenericSummarizer {
       userTask: strategy.promptConfig.userTask,
       outputSchema,
       outputFormat: 'xml',
+      caller: 'GenericSummarizer.summarizeEntity',
       batchSize: 1
     });
 

@@ -12,10 +12,12 @@
 // To restore, uncomment and reinstall: npm i llamaindex @llamaindex/google @llamaindex/openai @llamaindex/anthropic @llamaindex/ollama
 // import { LLMProviderAdapter, EmbeddingProviderAdapter } from './provider-adapter.js';
 // import type { LLM, BaseEmbedding } from 'llamaindex';
+import * as fs from 'fs';
 import { LuciformXMLParser } from '@luciformresearch/xmlparser';
 import type { EntityContext, EntityField } from '../types/entity-context.js';
 import type { LLMProvider } from '../reranking/llm-provider.js';
 import type { QueryFeedback } from '../reranking/llm-reranker.js';
+import { getFilenameTimestamp, formatLocalDate } from '../utils/timestamp.js';
 import {
   GeminiNativeToolProvider,
   type ToolDefinition,
@@ -37,8 +39,8 @@ export class LLMParseError extends Error {
   constructor(message: string, rawResponse: string) {
     super(message);
     this.name = 'LLMParseError';
-    this.rawResponse = rawResponse;
-    this.responsePreview = rawResponse.substring(0, 2000);
+    this.rawResponse = rawResponse ?? '';
+    this.responsePreview = (rawResponse ?? '').substring(0, 2000);
   }
 }
 
@@ -157,6 +159,8 @@ export interface LLMStructuredCallConfig<TInput = any, TOutput = any> {
   fallback?: FallbackConfig;
   /** Request ID for tracing (auto-generated if not provided) */
   requestId?: string;
+  /** Caller identifier for logging (e.g., "GenericSummarizer.summarize", "RagAgent.iterate") */
+  caller: string;
 
   // === PERFORMANCE ===
   batchSize?: number;
@@ -203,6 +207,81 @@ export interface ToolExecutionResult {
   success: boolean;
   result?: any;
   error?: string;
+  /** Reasoning from the LLM that led to this tool call (for context in subsequent iterations) */
+  reasoning?: string;
+}
+
+// ===== TOOL CONTEXT SUMMARIZATION =====
+
+/**
+ * A file/resource mentioned in tool results
+ */
+export interface ToolContextResource {
+  path: string;
+  type: 'file' | 'url' | 'directory' | 'other';
+  relevance: string;  // Why this resource matters
+  keyExcerpts?: Array<{
+    lines?: string;     // e.g., "42-58"
+    content: string;    // Relevant snippet
+  }>;
+}
+
+/**
+ * A Neo4j node mentioned in tool results
+ */
+export interface ToolContextNode {
+  uuid: string;
+  name: string;
+  type: 'scope' | 'file' | 'webpage' | 'document' | 'markdown_section' | 'codeblock' | 'other';
+  subtype?: string;     // For scope: function, method, class, interface
+  location?: string;    // File path or URL
+  relevance: string;    // Why this node matters
+  lines?: string;       // e.g., "10-25"
+}
+
+/**
+ * Summarized tool context - replaces raw ToolExecutionResult[] when context gets too large
+ */
+export interface ToolContextSummary {
+  /** Indicates this is a summarized context */
+  isSummarized: true;
+
+  /** Resources (files, URLs) referenced */
+  resources: ToolContextResource[];
+
+  /** Neo4j nodes mentioned (with UUIDs) */
+  nodes: ToolContextNode[];
+
+  /** Narrative summary of findings */
+  findings: string;
+
+  /** What remains to be explored */
+  gaps?: string[];
+
+  /** Suggested next steps (searches, reads, explores) */
+  suggestions?: Array<{
+    type: 'search' | 'explore' | 'read';
+    target: string;
+    reason: string;
+  }>;
+
+  /** Original tool count before summarization */
+  originalToolCount: number;
+
+  /** Character count before summarization */
+  originalCharCount: number;
+}
+
+/**
+ * Tool context can be either raw results or a summarized version
+ */
+export type ToolContext = ToolExecutionResult[] | ToolContextSummary;
+
+/**
+ * Check if tool context is summarized
+ */
+export function isToolContextSummary(ctx: ToolContext): ctx is ToolContextSummary {
+  return (ctx as ToolContextSummary).isSummarized === true;
 }
 
 /**
@@ -232,6 +311,20 @@ export abstract class BaseToolExecutor implements ToolExecutor {
     const promises = toolCalls.map(async (toolCall) => {
       try {
         const result = await this.execute(toolCall);
+
+        // Check if result contains an error field (some handlers return { error: "..." } instead of throwing)
+        const hasError = result && typeof result === 'object' && 'error' in result && !('success' in result);
+
+        if (hasError) {
+          console.error(`   ❌ Tool ${toolCall.tool_name} returned error:`, result.error);
+          return {
+            tool_name: toolCall.tool_name,
+            success: false,
+            error: result.error,
+            result, // Include full result for context
+          };
+        }
+
         return {
           tool_name: toolCall.tool_name,
           success: true,
@@ -307,6 +400,38 @@ export interface LLMBatchResult<TInput, TOutput, TGlobal = any> {
 // ===== SINGLE CALL TYPES =====
 
 /**
+ * Prompt sections that can be reordered in SingleLLMCallConfig
+ * This allows customizing which sections appear and in what order
+ */
+export type PromptSection =
+  | 'system_prompt'      // System prompt (persona, guidelines)
+  | 'tool_descriptions'  // Available tools and their descriptions
+  | 'current_report'     // Current report in progress (for report-building agents)
+  | 'user_task'          // The user's task/question
+  | 'context_data'       // Additional context data (JSON)
+  | 'input_fields'       // Input fields with values
+  | 'tool_results'       // Results from previous tool calls
+  | 'previous_output'    // Previous output (for progressive mode)
+  | 'output_format'      // Required output format instructions
+  | 'instructions';      // Additional instructions
+
+/**
+ * Default prompt sequence - sections appear in this order
+ */
+export const DEFAULT_PROMPT_SEQUENCE: PromptSection[] = [
+  'system_prompt',
+  'tool_descriptions',
+  'current_report',
+  'user_task',
+  'context_data',
+  'input_fields',
+  'tool_results',
+  'previous_output',
+  'output_format',
+  'instructions',
+];
+
+/**
  * Configuration for single structured LLM call (no batching)
  * Same abstractions as LLMStructuredCallConfig but for a single call
  */
@@ -338,16 +463,30 @@ export interface SingleLLMCallConfig<TOutput = any> {
   llmProvider: LLMProvider;
   /** Request ID for tracing (auto-generated if not provided) */
   requestId?: string;
+  /** Caller identifier for logging (e.g., "ResearchAgent.iterate", "brain_search.summarize") */
+  caller: string;
 
   // === TOOL CALLING ===
   /** Available tools */
   tools?: ToolDefinition[];
   /** Custom tool executor */
   toolExecutor?: ToolExecutor;
-  /** Max iterations for tool loop (default: 10) */
+  /** Max tool call rounds (default: 10). This is the primary limit on how many times the LLM can call tools. */
   maxIterations?: number;
-  /** Max tool call rounds within a single iteration (default: 5 when maxIterations=1, unlimited otherwise) */
+  /** Max tool call rounds within a single outer iteration (default: same as maxIterations) */
   maxToolCallRounds?: number;
+  /** Callback to get current report content (displayed in prompt if report exists) */
+  getCurrentReport?: () => string | null;
+
+  // === TOOL CONTEXT SUMMARIZATION ===
+  /**
+   * Summarize tool context when it exceeds a threshold (default: false)
+   * When enabled, accumulated tool results are compressed into a structured summary
+   * containing resources, Neo4j nodes, and key findings.
+   */
+  summarizeToolContext?: boolean;
+  /** Character threshold to trigger summarization (default: 50000 ~= 12k tokens) */
+  toolContextSummarizationThreshold?: number;
 
   /** Callback called with each LLM response */
   onLLMResponse?: (response: {
@@ -368,6 +507,21 @@ export interface SingleLLMCallConfig<TOutput = any> {
    * Useful for building reports incrementally until confident.
    */
   progressiveOutput?: ProgressiveOutputConfig<TOutput>;
+
+  // === PROMPT SEQUENCE ===
+  /**
+   * Custom prompt section sequence.
+   * Controls the order of sections in the prompt.
+   * Default: DEFAULT_PROMPT_SEQUENCE (system_prompt, tool_descriptions, current_report, user_task, etc.)
+   *
+   * Use this to:
+   * - Move tool_results closer to the end to focus attention on recent findings
+   * - Put current_report right before output_format to emphasize it
+   * - Omit sections by not including them in the array
+   *
+   * Example: ['system_prompt', 'tool_descriptions', 'user_task', 'input_fields', 'tool_results', 'current_report', 'output_format', 'instructions']
+   */
+  promptSequence?: PromptSection[];
 }
 
 /**
@@ -391,10 +545,225 @@ export class StructuredLLMExecutor {
   // private embeddingProviders: Map<string, EmbeddingProviderAdapter> = new Map();
   private nativeToolProvider?: GeminiNativeToolProvider;
 
+  // Global logging configuration (lazy initialized from ~/.ragforge/.env)
+  private static _loggingEnabled: boolean | null = null;
+  private static _analyzeEnabled: boolean | null = null;
+  private static _logDir: string = process.env.RAGFORGE_LLM_LOG_DIR || '';
+
+  /** Enable/disable global LLM call logging */
+  static set loggingEnabled(value: boolean) {
+    StructuredLLMExecutor._loggingEnabled = value;
+  }
+  static get loggingEnabled(): boolean {
+    return StructuredLLMExecutor.isLoggingEnabled();
+  }
+
+  /** Set custom log directory (default: ~/.ragforge/logs/llm-calls) */
+  static set logDir(value: string) {
+    StructuredLLMExecutor._logDir = value;
+  }
+  static get logDir(): string {
+    return StructuredLLMExecutor._logDir;
+  }
+
+  /** Read a boolean env var from process.env or ~/.ragforge/.env (sync version using imports at top) */
+  private static readEnvBool(varName: string): boolean {
+    // Check process.env first
+    if (process.env[varName] === 'true') {
+      return true;
+    }
+    // Check ~/.ragforge/.env using already-imported modules
+    try {
+      const envPath = `${process.env.HOME || ''}/.ragforge/.env`;
+      if (fs.existsSync(envPath)) {
+        const content = fs.readFileSync(envPath, 'utf-8');
+        const regex = new RegExp(`^${varName}\\s*=\\s*["']?true["']?\\s*$`, 'm');
+        if (content.match(regex)) {
+          return true;
+        }
+      }
+    } catch {
+      // Ignore errors
+    }
+    return false;
+  }
+
+  /** Check if LLM call logging is enabled (lazy init) */
+  private static isLoggingEnabled(): boolean {
+    if (this._loggingEnabled === null) {
+      this._loggingEnabled = this.readEnvBool('RAGFORGE_LOG_LLM_CALLS');
+      if (this._loggingEnabled) {
+        console.log('[StructuredLLMExecutor] LLM call logging enabled');
+      }
+    }
+    return this._loggingEnabled;
+  }
+
+  /** Check if LLM call analysis is enabled (lazy init) */
+  private static isAnalyzeEnabled(): boolean {
+    if (this._analyzeEnabled === null) {
+      this._analyzeEnabled = this.readEnvBool('RAGFORGE_ANALYZE_LLM_CALLS');
+      if (this._analyzeEnabled) {
+        console.log('[StructuredLLMExecutor] LLM call analysis enabled');
+      }
+    }
+    return this._analyzeEnabled;
+  }
+
   constructor(
     private defaultLLMConfig?: LLMConfig,
     private defaultEmbeddingConfig?: { provider?: string; model?: string }
   ) {}
+
+  /**
+   * Log an LLM call (prompt + response) to disk for debugging.
+   * Files are saved to: {logDir}/{caller}/{timestamp}/prompt.txt and response.txt
+   *
+   * @param caller - Explicit caller identifier (e.g., "ResearchAgent.iterate")
+   * @param prompt - The prompt sent to the LLM
+   * @param response - The LLM's response
+   * @param requestId - Request ID for tracing
+   * @param metadata - Additional metadata to log
+   */
+  private async logLLMCall(
+    caller: string,
+    prompt: string,
+    response: string,
+    requestId: string,
+    metadata?: Record<string, any>
+  ): Promise<void> {
+    if (!StructuredLLMExecutor.isLoggingEnabled()) return;
+
+    try {
+      const fs = await import('fs/promises');
+      const path = await import('path');
+      const os = await import('os');
+
+      // Sanitize caller for use as folder name
+      const safeCaller = caller.replace(/[^a-zA-Z0-9._-]/g, '_') || 'unknown';
+
+      // Generate timestamp for this call (local timezone)
+      const timestamp = getFilenameTimestamp();
+
+      // Build log directory path
+      const baseDir = StructuredLLMExecutor._logDir || path.join(os.homedir(), '.ragforge', 'logs', 'llm-calls');
+      const callDir = path.join(baseDir, safeCaller, timestamp);
+
+      await fs.mkdir(callDir, { recursive: true });
+
+      // Write prompt
+      await fs.writeFile(path.join(callDir, 'prompt.txt'), prompt, 'utf-8');
+
+      // Write response
+      await fs.writeFile(path.join(callDir, 'response.txt'), response, 'utf-8');
+
+      // Write metadata
+      const fullMetadata = {
+        caller,
+        requestId,
+        timestamp: formatLocalDate(),
+        ...metadata,
+      };
+      await fs.writeFile(
+        path.join(callDir, 'metadata.json'),
+        JSON.stringify(fullMetadata, null, 2),
+        'utf-8'
+      );
+
+      // Auto-analyze if enabled (skip for analysis calls themselves to prevent recursion)
+      if (StructuredLLMExecutor.isAnalyzeEnabled() && !caller.includes('LLMCallAnalyzer')) {
+        // Fire and forget - don't block the main flow
+        this.analyzeLLMCall(prompt, response, caller, callDir).catch(err => {
+          console.warn('[StructuredLLMExecutor] LLM call analysis failed:', err.message);
+        });
+      }
+    } catch (error) {
+      // Don't fail the main operation if logging fails
+      console.warn('[StructuredLLMExecutor] Failed to log LLM call:', error);
+    }
+  }
+
+  /**
+   * Analyze an LLM call (prompt + response) and write feedback to disk.
+   * This helps identify issues with prompts and suggests improvements.
+   */
+  private async analyzeLLMCall(
+    prompt: string,
+    response: string,
+    caller: string,
+    callDir: string
+  ): Promise<void> {
+    const fs = await import('fs/promises');
+    const path = await import('path');
+
+    const geminiApiKey = process.env.GEMINI_API_KEY;
+    if (!geminiApiKey) return;
+
+    const analysisPrompt = `Tu es un expert en prompt engineering. Analyse cet appel LLM et fournis un feedback concis.
+
+## Contexte
+- Caller: ${caller}
+- Prompt length: ${prompt.length} chars
+- Response length: ${response.length} chars
+
+## Prompt
+\`\`\`
+${prompt}
+\`\`\`
+
+## Response
+\`\`\`
+${response}
+\`\`\`
+
+## Analyse demandée
+
+Réponds en français avec ces sections:
+
+### 1. Validité de la réponse (score /10)
+La réponse est-elle correcte et complète par rapport au prompt?
+
+### 2. Problèmes détectés
+Liste les problèmes (si présents):
+- Instructions ambiguës
+- Informations manquantes dans le prompt
+- Réponse hors-sujet ou incomplète
+- Format de sortie incorrect
+
+### 3. Améliorations suggérées pour le prompt
+Suggestions concrètes pour améliorer ce prompt:
+- Clarifications à ajouter
+- Exemples à inclure
+- Structure à modifier
+
+### 4. Score global (/10)
+Note globale de la qualité de cet échange prompt/response.
+
+Sois concis et actionnable.`;
+
+    try {
+      const { GoogleGenerativeAI } = await import('@google/generative-ai');
+      const genAI = new GoogleGenerativeAI(geminiApiKey);
+      const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+
+      const result = await model.generateContent(analysisPrompt);
+      const analysis = result.response.text();
+
+      // Write analysis to file
+      await fs.writeFile(
+        path.join(callDir, 'analysis.md'),
+        `# Analyse automatique de l'appel LLM\n\n_Généré le ${formatLocalDate()}_\n\n${analysis}`,
+        'utf-8'
+      );
+    } catch (error: any) {
+      // Write error to file instead of failing silently
+      await fs.writeFile(
+        path.join(callDir, 'analysis-error.txt'),
+        `Analysis failed: ${error.message}`,
+        'utf-8'
+      ).catch(() => {});
+    }
+  }
 
   /**
    * Execute structured LLM generation on batch of items
@@ -475,6 +844,7 @@ export class StructuredLLMExecutor {
     const maxIterations = config.maxIterations ?? 10;
     const toolsUsed: string[] = [];
     let toolContext: ToolExecutionResult[] = [];
+    let summarizedToolContext: ToolContextSummary | null = null; // Cached summary when threshold is hit
 
     // Progressive output mode: track accumulated output across iterations
     let progressiveOutput: Partial<TOutput> | undefined = undefined;
@@ -491,8 +861,8 @@ export class StructuredLLMExecutor {
     const baseRequestId = config.requestId || `llm-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
 
     // Allow multiple tool call rounds within a single iteration (for mini-agents like fuzzy search)
-    // This is controlled by maxToolCallRounds (default: 5 for single iteration, unlimited for multi-iteration)
-    const maxToolCallRounds = maxIterations === 1 ? (config.maxToolCallRounds ?? 5) : Infinity;
+    // This is controlled by maxToolCallRounds (default: same as maxIterations for intuitive behavior)
+    const maxToolCallRounds = config.maxToolCallRounds ?? maxIterations;
     let toolCallRound = 0;
 
     for (let iteration = 1; iteration <= maxIterations; iteration++) {
@@ -507,8 +877,29 @@ export class StructuredLLMExecutor {
       while (toolCallRound < maxToolCallRounds) {
         toolCallRound++;
 
+        // Check if tool context summarization is needed
+        let toolContextForPrompt: ToolContext = toolContext;
+        if (config.summarizeToolContext && toolContext.length > 0) {
+          const threshold = config.toolContextSummarizationThreshold ?? 50000;
+          const currentSize = toolContext.reduce(
+            (sum, r) => sum + JSON.stringify(r.result ?? r.error ?? '').length,
+            0
+          );
+
+          if (currentSize > threshold) {
+            // Summarize if we don't have a cached summary or if new results were added
+            if (!summarizedToolContext || toolContext.length > summarizedToolContext.originalToolCount) {
+              console.log(
+                `[executeSingle] Tool context exceeds threshold (${currentSize} > ${threshold}), summarizing...`
+              );
+              summarizedToolContext = await this.summarizeToolContext(toolContext, config.llmProvider);
+            }
+            toolContextForPrompt = summarizedToolContext;
+          }
+        }
+
         // Build prompt (pass progressiveOutput for progressive mode)
-        const prompt = this.buildSinglePrompt(config, toolContext, progressiveOutput);
+        const prompt = this.buildSinglePrompt(config, toolContextForPrompt, progressiveOutput);
 
         // Generate request ID for this iteration/round
         requestId = iteration === 1 && toolCallRound === 1 
@@ -522,6 +913,13 @@ export class StructuredLLMExecutor {
 
         // Call LLM with request ID
         const response = await config.llmProvider.generateContent(prompt, requestId);
+
+        // Global LLM call logging (if enabled)
+        await this.logLLMCall(config.caller, prompt, response, requestId, {
+          method: 'executeSingle',
+          iteration,
+          toolCallRound,
+        });
 
         // Log raw response for fuzzy search decision debugging
         if (requestId.includes('fuzzy-search-decision')) {
@@ -582,6 +980,14 @@ export class StructuredLLMExecutor {
         // If we have tool calls, execute them
         if (validToolCalls.length > 0 && config.toolExecutor) {
           const toolResults = await this.executeToolCalls(validToolCalls, config.toolExecutor);
+
+          // Attach the reasoning that led to these tool calls (for context in subsequent iterations)
+          const currentReasoning = (parsed as any).answer || (parsed as any).reasoning;
+          if (currentReasoning && toolResults.length > 0) {
+            // Only attach reasoning to the first tool result to avoid duplication
+            toolResults[0].reasoning = currentReasoning;
+          }
+
           toolContext.push(...toolResults);
           toolResults.forEach(r => {
             if (!toolsUsed.includes(r.tool_name)) {
@@ -703,124 +1109,406 @@ export class StructuredLLMExecutor {
 
   /**
    * Build prompt for single call (no batching)
+   * Uses configurable section sequence via config.promptSequence
    */
   private buildSinglePrompt<TOutput>(
     config: SingleLLMCallConfig<TOutput>,
-    toolContext: ToolExecutionResult[],
+    toolContext: ToolContext,
     previousOutput?: Partial<TOutput>
   ): string {
+    // Use custom sequence or default
+    const sequence = config.promptSequence ?? DEFAULT_PROMPT_SEQUENCE;
+
+    // Build each section
+    const sections: Record<PromptSection, string | null> = {
+      system_prompt: this.buildSystemPromptSection(config),
+      tool_descriptions: this.buildToolDescriptionsSection(config),
+      current_report: this.buildCurrentReportSection(config),
+      user_task: this.buildUserTaskSection(config),
+      context_data: this.buildContextDataSection(config),
+      input_fields: this.buildInputFieldsSection(config),
+      tool_results: this.buildToolResultsSection(toolContext),
+      previous_output: this.buildPreviousOutputSection(config, previousOutput),
+      output_format: this.buildOutputFormatSection(config),
+      instructions: this.buildInstructionsSection(config),
+    };
+
+    // Assemble in sequence order
     const parts: string[] = [];
-
-    // System prompt
-    if (config.systemPrompt) {
-      parts.push(config.systemPrompt);
-      parts.push('');
-    }
-
-    // Tool descriptions (if tools provided)
-    if (config.tools && config.tools.length > 0) {
-      parts.push(this.buildSystemPromptWithTools(config.tools));
-      parts.push('');
-    }
-
-    // User task
-    if (config.userTask) {
-      parts.push('## Task');
-      parts.push(config.userTask);
-      parts.push('');
-    }
-
-    // Context data
-    if (config.contextData) {
-      parts.push('## Context');
-      parts.push(JSON.stringify(config.contextData, null, 2));
-      parts.push('');
-    }
-
-    // Input fields
-    if (config.inputFields && config.inputFields.length > 0) {
-      parts.push('## Input');
-      for (const fieldConfig of config.inputFields) {
-        const fieldName = typeof fieldConfig === 'string' ? fieldConfig : fieldConfig.name;
-        let value = config.input[fieldName];
-
-        // Apply transformations
-        if (typeof fieldConfig !== 'string') {
-          if (fieldConfig.transform) {
-            value = fieldConfig.transform(value);
-          }
-          if (fieldConfig.maxLength && typeof value === 'string') {
-            value = this.truncate(value, fieldConfig.maxLength);
-          }
-          if (fieldConfig.prompt) {
-            parts.push(`${fieldName} (${fieldConfig.prompt}):`);
-          } else {
-            parts.push(`${fieldName}:`);
-          }
-        } else {
-          parts.push(`${fieldName}:`);
-        }
-
-        parts.push(this.formatValue(value));
-        parts.push('');
+    for (const section of sequence) {
+      const content = sections[section];
+      if (content) {
+        parts.push(content);
       }
     }
 
-    // Tool results context (if any)
-    if (toolContext.length > 0) {
-      parts.push('## Tool Results');
+    return parts.join('\n');
+  }
+
+  // ===== PROMPT SECTION BUILDERS =====
+
+  private buildSystemPromptSection<TOutput>(config: SingleLLMCallConfig<TOutput>): string | null {
+    if (!config.systemPrompt) return null;
+    return config.systemPrompt + '\n';
+  }
+
+  private buildToolDescriptionsSection<TOutput>(config: SingleLLMCallConfig<TOutput>): string | null {
+    if (!config.tools || config.tools.length === 0) return null;
+    return this.buildSystemPromptWithTools(config.tools) + '\n';
+  }
+
+  private buildCurrentReportSection<TOutput>(config: SingleLLMCallConfig<TOutput>): string | null {
+    if (!config.getCurrentReport) return null;
+    const currentReport = config.getCurrentReport();
+    if (!currentReport || currentReport.trim().length === 0) return null;
+
+    const lines: string[] = [
+      '## Current Report',
+      'This is your report in progress. Update it with new findings using set_report or append_to_report:',
+      '```markdown',
+      currentReport,
+      '```',
+      '',
+    ];
+    return lines.join('\n');
+  }
+
+  private buildUserTaskSection<TOutput>(config: SingleLLMCallConfig<TOutput>): string | null {
+    if (!config.userTask) return null;
+    return `## Task\n${config.userTask}\n`;
+  }
+
+  private buildContextDataSection<TOutput>(config: SingleLLMCallConfig<TOutput>): string | null {
+    if (!config.contextData) return null;
+    return `## Context\n${JSON.stringify(config.contextData, null, 2)}\n`;
+  }
+
+  private buildInputFieldsSection<TOutput>(config: SingleLLMCallConfig<TOutput>): string | null {
+    if (!config.inputFields || config.inputFields.length === 0) return null;
+
+    const lines: string[] = ['## Input'];
+    for (const fieldConfig of config.inputFields) {
+      const fieldName = typeof fieldConfig === 'string' ? fieldConfig : fieldConfig.name;
+      let value = config.input[fieldName];
+
+      // Apply transformations
+      if (typeof fieldConfig !== 'string') {
+        if (fieldConfig.transform) {
+          value = fieldConfig.transform(value);
+        }
+        if (fieldConfig.maxLength && typeof value === 'string') {
+          value = this.truncate(value, fieldConfig.maxLength);
+        }
+        if (fieldConfig.prompt) {
+          lines.push(`${fieldName} (${fieldConfig.prompt}):`);
+        } else {
+          lines.push(`${fieldName}:`);
+        }
+      } else {
+        lines.push(`${fieldName}:`);
+      }
+
+      lines.push(this.formatValue(value));
+      lines.push('');
+    }
+    return lines.join('\n');
+  }
+
+  private buildToolResultsSection(toolContext: ToolContext): string | null {
+    if (isToolContextSummary(toolContext)) {
+      // Summarized context
+      const lines: string[] = [
+        '## Tool Results Summary',
+        `(Summarized from ${toolContext.originalToolCount} tool calls, ${toolContext.originalCharCount} chars)`,
+        '',
+      ];
+
+      // Resources
+      if (toolContext.resources.length > 0) {
+        lines.push('### Resources Referenced');
+        for (const res of toolContext.resources) {
+          lines.push(`- **${res.path}** (${res.type}): ${res.relevance}`);
+          if (res.keyExcerpts && res.keyExcerpts.length > 0) {
+            for (const excerpt of res.keyExcerpts) {
+              if (!excerpt?.content) continue; // Skip invalid excerpts
+              const lineInfo = excerpt.lines ? ` [lines ${excerpt.lines}]` : '';
+              const content = excerpt.content ?? '';
+              lines.push(`  - Excerpt${lineInfo}: \`${content.substring(0, 200)}${content.length > 200 ? '...' : ''}\``);
+            }
+          }
+        }
+        lines.push('');
+      }
+
+      // Neo4j Nodes
+      if (toolContext.nodes.length > 0) {
+        lines.push('### Nodes Discovered');
+        for (const node of toolContext.nodes) {
+          const location = node.location ? ` @ ${node.location}` : '';
+          const nodeLines = node.lines ? `:${node.lines}` : '';
+          const subtype = node.subtype ? ` (${node.subtype})` : '';
+          lines.push(`- **[${node.type}:${node.uuid}]** ${node.name}${subtype}${location}${nodeLines}`);
+          lines.push(`  → ${node.relevance}`);
+        }
+        lines.push('');
+      }
+
+      // Findings
+      lines.push('### Key Findings');
+      lines.push(toolContext.findings);
+      lines.push('');
+
+      // Suggestions
+      if (toolContext.suggestions && toolContext.suggestions.length > 0) {
+        lines.push('### Suggested Next Steps');
+        for (const suggestion of toolContext.suggestions) {
+          lines.push(`- **${suggestion.type}**: ${suggestion.target}`);
+          lines.push(`  → ${suggestion.reason}`);
+        }
+        lines.push('');
+      }
+
+      // Gaps
+      if (toolContext.gaps && toolContext.gaps.length > 0) {
+        lines.push('### Remaining Gaps');
+        for (const gap of toolContext.gaps) {
+          lines.push(`- ${gap}`);
+        }
+        lines.push('');
+      }
+
+      return lines.join('\n');
+    } else if (toolContext.length > 0) {
+      // Raw tool results with reasoning
+      const lines: string[] = ['## Tool Results'];
       for (const result of toolContext) {
+        // Show reasoning before tool result (if present - indicates start of a new reasoning round)
+        if (result.reasoning) {
+          lines.push('');
+          lines.push('#### Your Previous Reasoning');
+          lines.push(result.reasoning);
+          lines.push('');
+        }
         const status = result.success ? '✓ SUCCESS' : '✗ FAILED';
         const resultStr = typeof result.result === 'object'
           ? JSON.stringify(result.result, null, 2)
           : String(result.result ?? result.error);
-        parts.push(`### ${result.tool_name} [${status}]`);
-        parts.push(resultStr);
-        parts.push('');
+        lines.push(`### ${result.tool_name} [${status}]`);
+        lines.push(resultStr);
+        lines.push('');
       }
+      return lines.join('\n');
     }
 
-    // Previous output (for progressive mode)
-    if (previousOutput && config.progressiveOutput) {
-      parts.push('## Your Previous Output');
-      parts.push('This is your output from the previous iteration. Refine and improve it based on new tool results.');
-      parts.push('You should:');
-      parts.push('- Keep what is correct');
-      parts.push('- Add new information discovered');
-      parts.push('- Correct any errors');
-      parts.push('- Update confidence level based on completeness');
-      parts.push('');
-      const format = config.outputFormat || 'xml';
-      if (format === 'xml') {
-        parts.push('<previous_output>');
-        for (const [key, value] of Object.entries(previousOutput)) {
-          if (key !== 'tool_calls') {
-            const formattedValue = typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value ?? '');
-            parts.push(`  <${key}>${formattedValue}</${key}>`);
-          }
+    return null;
+  }
+
+  private buildPreviousOutputSection<TOutput>(
+    config: SingleLLMCallConfig<TOutput>,
+    previousOutput?: Partial<TOutput>
+  ): string | null {
+    if (!previousOutput || !config.progressiveOutput) return null;
+
+    const lines: string[] = [
+      '## Your Previous Output',
+      'This is your output from the previous iteration. Refine and improve it based on new tool results.',
+      'You should:',
+      '- Keep what is correct',
+      '- Add new information discovered',
+      '- Correct any errors',
+      '- Update confidence level based on completeness',
+      '',
+    ];
+
+    const format = config.outputFormat || 'xml';
+    if (format === 'xml') {
+      lines.push('<previous_output>');
+      for (const [key, value] of Object.entries(previousOutput)) {
+        if (key !== 'tool_calls') {
+          const formattedValue = typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value ?? '');
+          lines.push(`  <${key}>${formattedValue}</${key}>`);
         }
-        parts.push('</previous_output>');
-      } else {
-        parts.push('```' + format);
-        parts.push(JSON.stringify(previousOutput, null, 2));
-        parts.push('```');
       }
-      parts.push('');
+      lines.push('</previous_output>');
+    } else {
+      lines.push('```' + format);
+      lines.push(JSON.stringify(previousOutput, null, 2));
+      lines.push('```');
     }
+    lines.push('');
 
-    // Output instructions
-    parts.push('## Required Output Format');
-    parts.push(this.generateSingleOutputInstructions(config.outputSchema, config.outputFormat || 'xml', !!config.tools));
-    parts.push('');
+    return lines.join('\n');
+  }
 
-    // Additional instructions
-    if (config.instructions) {
-      parts.push('## Additional Instructions');
-      parts.push(config.instructions);
-      parts.push('');
-    }
+  private buildOutputFormatSection<TOutput>(config: SingleLLMCallConfig<TOutput>): string | null {
+    const lines: string[] = [
+      '## Required Output Format',
+      this.generateSingleOutputInstructions(config.outputSchema, config.outputFormat || 'xml', !!config.tools),
+      '',
+    ];
+    return lines.join('\n');
+  }
 
-    return parts.join('\n');
+  private buildInstructionsSection<TOutput>(config: SingleLLMCallConfig<TOutput>): string | null {
+    if (!config.instructions) return null;
+    return `## Additional Instructions\n${config.instructions}\n`;
+  }
+
+  /**
+   * Summarize tool context when it exceeds the threshold
+   * Extracts resources, Neo4j nodes, and key findings
+   */
+  private async summarizeToolContext(
+    toolContext: ToolExecutionResult[],
+    llmProvider: LLMProvider
+  ): Promise<ToolContextSummary> {
+    const originalCharCount = toolContext.reduce(
+      (sum, r) => sum + JSON.stringify(r.result ?? r.error ?? '').length,
+      0
+    );
+
+    console.log(`[StructuredLLMExecutor] 📦 Summarizing tool context: ${toolContext.length} tools, ${originalCharCount} chars`);
+
+    // Format tool results for summarization (compact, no indentation)
+    const formattedResults = toolContext.map((r, i) => {
+      const status = r.success ? 'OK' : 'FAIL';
+      const resultStr = typeof r.result === 'object'
+        ? JSON.stringify(r.result)
+        : String(r.result ?? r.error ?? '');
+      // Truncate very long results for the summary prompt
+      const truncated = resultStr.length > 2000
+        ? resultStr.substring(0, 2000) + '... [truncated]'
+        : resultStr;
+      return `[${i + 1}] ${r.tool_name} [${status}]: ${truncated}`;
+    }).join('\n\n');
+
+    const result = await this.executeLLMBatch(
+      [{ toolResults: formattedResults }],
+      {
+        inputFields: ['toolResults'],
+        outputFormat: 'json', // Use JSON format - LLMs follow this better than XML
+        systemPrompt: `You are summarizing tool execution results for an AI agent.
+Extract and structure the key information so the agent can continue working efficiently.
+Focus on extracting resources with their paths and key excerpts, and nodes with their UUIDs for future reference.`,
+        userTask: `Analyze these tool results and create a structured summary:
+
+1. **resources** - Files, URLs, directories that were accessed:
+   - path and type (file/url/directory)
+   - relevance: why it matters (1 sentence)
+   - keyExcerpts: snippets with line numbers if available (keep brief, 1-2 per resource max)
+
+2. **nodes** - Neo4j nodes discovered (look for UUIDs in format [type:UUID] or uuid fields):
+   - uuid, name, type (scope/file/webpage/document/etc)
+   - subtype if applicable (function, method, class, interface)
+   - location (file path or URL) and lines if available
+   - relevance: why it matters (1 sentence)
+
+3. **findings** - Narrative summary of what was discovered (3-5 sentences)
+
+4. **suggestions** - SPECIFIC actionable next steps based on the tool results:
+   - Look at function/class names CALLED or IMPORTED and suggest searching for them
+   - Suggest exploring specific UUIDs with explore_node to see relationships
+   - Suggest reading specific files for more context
+   - Do NOT give generic suggestions - be SPECIFIC based on what you found
+
+5. **gaps** - What information is still missing or needs investigation (optional)
+
+Be thorough with resources and nodes - these are critical for the agent's memory.
+Keep excerpts brief but informative.`,
+        outputSchema: {
+          resources: {
+            type: 'array' as const,
+            description: 'Files, URLs, directories accessed',
+            items: {
+              type: 'object' as const,
+              description: 'A resource that was accessed',
+              properties: {
+                path: { type: 'string' as const, description: 'Path or URL', required: true },
+                type: { type: 'string' as const, description: 'Resource type', enum: ['file', 'url', 'directory', 'other'], required: true },
+                relevance: { type: 'string' as const, description: 'Why this resource matters', required: true },
+                keyExcerpts: {
+                  type: 'array' as const,
+                  description: 'Key snippets from this resource',
+                  items: {
+                    type: 'object' as const,
+                    description: 'A key excerpt from the resource',
+                    properties: {
+                      lines: { type: 'string' as const, description: 'Line range e.g. "42-58"' },
+                      content: { type: 'string' as const, description: 'The excerpt content', required: true },
+                    },
+                  },
+                },
+              },
+            },
+            required: true,
+          },
+          nodes: {
+            type: 'array' as const,
+            description: 'Neo4j nodes discovered with UUIDs',
+            items: {
+              type: 'object' as const,
+              description: 'A Neo4j node mentioned in the results',
+              properties: {
+                uuid: { type: 'string' as const, description: 'Node UUID', required: true },
+                name: { type: 'string' as const, description: 'Node name', required: true },
+                type: { type: 'string' as const, description: 'Node type', enum: ['scope', 'file', 'webpage', 'document', 'markdown_section', 'codeblock', 'other'], required: true },
+                subtype: { type: 'string' as const, description: 'For scope: function, method, class, interface' },
+                location: { type: 'string' as const, description: 'File path or URL' },
+                relevance: { type: 'string' as const, description: 'Why this node matters', required: true },
+                lines: { type: 'string' as const, description: 'Line range e.g. "10-25"' },
+              },
+            },
+            required: true,
+          },
+          findings: {
+            type: 'string' as const,
+            description: 'Narrative summary of discoveries (3-5 sentences)',
+            required: true,
+          },
+          suggestions: {
+            type: 'array' as const,
+            description: 'Specific actionable suggestions for next steps',
+            items: {
+              type: 'object' as const,
+              description: 'A specific suggestion for follow-up',
+              properties: {
+                type: { type: 'string' as const, description: 'Type: "search" (brain_search query), "explore" (explore_node UUID), or "read" (read_file path)', required: true },
+                target: { type: 'string' as const, description: 'The search query, UUID, or file path depending on type', required: true },
+                reason: { type: 'string' as const, description: 'Why this would be useful (be specific)', required: true },
+              },
+            },
+          },
+          gaps: {
+            type: 'array' as const,
+            description: 'What information is still missing',
+            items: { type: 'string' as const, description: 'A gap or missing piece of information' },
+          },
+        },
+        llmProvider,
+        caller: 'StructuredLLMExecutor.summarizeToolContext',
+        batchSize: 1,
+        requestId: `tool-context-summary-${Date.now()}`,
+      }
+    );
+
+    const rawResult: any = Array.isArray(result) ? result[0] : result;
+
+    const summary: ToolContextSummary = {
+      isSummarized: true,
+      resources: Array.isArray(rawResult.resources) ? rawResult.resources : [],
+      nodes: Array.isArray(rawResult.nodes) ? rawResult.nodes : [],
+      findings: String(rawResult.findings || 'No findings extracted'),
+      suggestions: Array.isArray(rawResult.suggestions) ? rawResult.suggestions : undefined,
+      gaps: Array.isArray(rawResult.gaps) ? rawResult.gaps : undefined,
+      originalToolCount: toolContext.length,
+      originalCharCount,
+    };
+
+    console.log(
+      `[StructuredLLMExecutor] ✅ Tool context summarized: ${summary.resources.length} resources, ${summary.nodes.length} nodes`
+    );
+
+    return summary;
   }
 
   /**
@@ -840,9 +1528,15 @@ export class StructuredLLMExecutor {
 
       for (const [fieldName, fieldSchema] of Object.entries(schema)) {
         const required = fieldSchema.required ? ' (REQUIRED)' : '';
-        instructions.push(`  <${fieldName}>${fieldSchema.description}${required}</${fieldName}>`);
+        // Generate XML structure recursively for complex types
+        const xmlLines = this.generateXMLSchemaExample(fieldName, fieldSchema, 1);
+        instructions.push(...xmlLines);
         if (fieldSchema.prompt) {
           instructions.push(`  <!-- ${fieldSchema.prompt} -->`);
+        }
+        // Add required marker as comment if needed
+        if (required) {
+          instructions.push(`  <!-- ${fieldName} is REQUIRED -->`);
         }
       }
 
@@ -1180,6 +1874,7 @@ export class StructuredLLMExecutor {
     
     const rerankConfig: LLMStructuredCallConfig<T, ItemEvaluation> = {
       ...config,
+      caller: config.caller || 'StructuredLLMExecutor.executeReranking',
       systemPrompt: config.systemPrompt || `You are ranking ${config.entityContext?.displayName || 'items'} for relevance.${implementationPreference}`,
       userTask: `User question: "${config.userQuestion}"`,
       tokenBudget: config.tokenBudget || 6250, // ~25k chars ≈ 6250 tokens per batch (smaller batches for parallel processing)
@@ -1570,6 +2265,12 @@ export class StructuredLLMExecutor {
       // Generate request ID for batch call (use config.requestId if available, otherwise generate)
       const requestId = (config as any).requestId || `batch-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
       response = await config.llmProvider.generateContent(prompt, requestId);
+
+      // Global LLM call logging (if enabled)
+      await this.logLLMCall(config.caller, prompt, response, requestId, {
+        method: 'executeLLMBatch',
+        itemCount: batch.items.length,
+      });
     } else {
       // LlamaIndex multi-provider fallback - DISABLED
       // To restore, uncomment provider-adapter.ts imports and getLLMProvider method
@@ -1600,28 +2301,63 @@ export class StructuredLLMExecutor {
 
   /**
    * Log content to console or file
+   *
+   * @param label - Label for the log entry (e.g., "PROMPT [req-123] [iter 1, round 2]")
+   * @param content - The content to log
+   * @param logTo - Where to log:
+   *   - true: log to console
+   *   - string ending with '/': directory mode - create individual files per call
+   *   - string (file path): append to that file
    */
   private async logContent(label: string, content: string, logTo: boolean | string): Promise<void> {
     const timestamp = new Date().toISOString();
     const separator = '='.repeat(80);
-    const logMessage = `\n${separator}\n${label} @ ${timestamp}\n${separator}\n${content}\n${separator}\n`;
 
     if (logTo === true) {
       // Log to console
+      const logMessage = `\n${separator}\n${label} @ ${timestamp}\n${separator}\n${content}\n${separator}\n`;
       console.log(logMessage);
     } else if (typeof logTo === 'string') {
-      // Log to file
       const fs = await import('fs');
       const path = await import('path');
 
-      // Ensure directory exists
-      const dir = path.dirname(logTo);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
+      if (logTo.endsWith('/')) {
+        // Directory mode: create individual files per call
+        // Parse label to create filename: "PROMPT [req-123] [iter 1, round 2]" -> "prompt-iter1-round2.txt"
+        const isPrompt = label.toLowerCase().includes('prompt');
+        const isResponse = label.toLowerCase().includes('response');
+        const prefix = isPrompt ? 'prompt' : isResponse ? 'response' : 'log';
 
-      // Append to file
-      fs.appendFileSync(logTo, logMessage);
+        // Extract iter and round from label
+        const iterMatch = label.match(/iter\s*(\d+)/i);
+        const roundMatch = label.match(/round\s*(\d+)/i);
+        const iter = iterMatch ? iterMatch[1] : '0';
+        const round = roundMatch ? roundMatch[1] : '1';
+
+        const filename = `${prefix}-iter${iter}-round${round}.txt`;
+        const filePath = path.join(logTo, filename);
+
+        // Ensure directory exists
+        if (!fs.existsSync(logTo)) {
+          fs.mkdirSync(logTo, { recursive: true });
+        }
+
+        // Write individual file (overwrite if exists)
+        const fileContent = `${label}\nTimestamp: ${timestamp}\n\n${content}`;
+        fs.writeFileSync(filePath, fileContent);
+      } else {
+        // File mode: append to single file
+        const logMessage = `\n${separator}\n${label} @ ${timestamp}\n${separator}\n${content}\n${separator}\n`;
+
+        // Ensure directory exists
+        const dir = path.dirname(logTo);
+        if (!fs.existsSync(dir)) {
+          fs.mkdirSync(dir, { recursive: true });
+        }
+
+        // Append to file
+        fs.appendFileSync(logTo, logMessage);
+      }
     }
   }
 
@@ -2090,6 +2826,77 @@ export class StructuredLLMExecutor {
     }
 
     return instructions.join('\n');
+  }
+
+  /**
+   * Generate XML schema example for a field (recursive for arrays/objects)
+   */
+  private generateXMLSchemaExample(
+    fieldName: string,
+    fieldSchema: OutputFieldSchema,
+    indentLevel: number
+  ): string[] {
+    const indent = '  '.repeat(indentLevel);
+    const lines: string[] = [];
+
+    if (fieldSchema.type === 'array') {
+      // Array: show wrapper with item examples
+      lines.push(`${indent}<${fieldName}>`);
+
+      if (fieldSchema.items) {
+        // Singularize the field name for item tag
+        const itemName = this.singularize(fieldName);
+
+        if (fieldSchema.items.type === 'object' && fieldSchema.items.properties) {
+          // Array of objects - show nested structure
+          lines.push(`${indent}  <${itemName}>`);
+          for (const [propName, propSchema] of Object.entries(fieldSchema.items.properties)) {
+            const propLines = this.generateXMLSchemaExample(propName, propSchema, indentLevel + 2);
+            lines.push(...propLines);
+          }
+          lines.push(`${indent}  </${itemName}>`);
+          lines.push(`${indent}  <!-- more ${itemName} elements as needed -->`);
+        } else {
+          // Array of primitives
+          const itemDesc = fieldSchema.items.description || 'value';
+          lines.push(`${indent}  <${itemName}>${itemDesc}</${itemName}>`);
+          lines.push(`${indent}  <!-- more ${itemName} elements as needed -->`);
+        }
+      } else {
+        lines.push(`${indent}  <!-- items -->`);
+      }
+
+      lines.push(`${indent}</${fieldName}>`);
+    } else if (fieldSchema.type === 'object' && fieldSchema.properties) {
+      // Object with properties - show nested structure
+      lines.push(`${indent}<${fieldName}>`);
+      for (const [propName, propSchema] of Object.entries(fieldSchema.properties)) {
+        const propLines = this.generateXMLSchemaExample(propName, propSchema, indentLevel + 1);
+        lines.push(...propLines);
+      }
+      lines.push(`${indent}</${fieldName}>`);
+    } else {
+      // Simple type (string, number, boolean, or unstructured object)
+      const desc = fieldSchema.description || fieldSchema.type;
+      lines.push(`${indent}<${fieldName}>${desc}</${fieldName}>`);
+    }
+
+    return lines;
+  }
+
+  /**
+   * Singularize a plural field name for array item tags
+   */
+  private singularize(name: string): string {
+    // Simple heuristics for common patterns
+    if (name.endsWith('ies')) {
+      return name.slice(0, -3) + 'y'; // e.g., "entries" -> "entry"
+    } else if (name.endsWith('es') && !name.endsWith('ses')) {
+      return name.slice(0, -2); // e.g., "matches" -> "match"
+    } else if (name.endsWith('s') && !name.endsWith('ss')) {
+      return name.slice(0, -1); // e.g., "snippets" -> "snippet"
+    }
+    return name + '_item'; // Fallback: add _item suffix
   }
 
   private describeJSONType(fieldSchema: OutputFieldSchema): string {
@@ -2713,7 +3520,35 @@ export class StructuredLLMExecutor {
         if (typeof value === 'string') {
           try {
             return JSON.parse(value);
-          } catch {
+          } catch (parseError: any) {
+            // Try to recover: sanitize newlines inside JSON strings
+            // LLMs often output actual newlines instead of \n in JSON
+            try {
+              // Replace actual newlines inside strings with \n
+              const sanitized = value.replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t');
+              return JSON.parse(sanitized);
+            } catch {
+              // Sanitization didn't help
+            }
+
+            // Try to recover: if the string looks like JSON wrapped in extra quotes
+            if (value.startsWith('"{') && value.endsWith('}"')) {
+              try {
+                const unescaped = JSON.parse(value);
+                if (typeof unescaped === 'string') {
+                  return JSON.parse(unescaped);
+                }
+              } catch {
+                // Ignore recovery failure
+              }
+            }
+
+            // Log the parsing error for debugging (only if all recovery failed)
+            console.warn(`[convertValue] Failed to parse JSON for object type:`);
+            console.warn(`  Value (first 200 chars): ${value.substring(0, 200)}`);
+            console.warn(`  Error: ${(parseError as Error).message}`);
+
+            // Return wrapped value as fallback
             return { value };
           }
         }
@@ -3030,6 +3865,7 @@ export class StructuredLLMExecutor {
         },
         outputFormat: 'xml',
         llmProvider: config.llmProvider,
+        caller: 'StructuredLLMExecutor.requestGlobalToolCalls',
         batchSize: 1,
       }
     );

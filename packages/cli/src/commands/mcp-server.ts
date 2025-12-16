@@ -53,6 +53,9 @@ import {
   type RagForgeConfig,
   type GeneratedToolDefinition,
   type ToolSection,
+  // Tool Logging
+  ToolLogger,
+  withToolLogging,
 } from '@luciformresearch/ragforge';
 import { startMcpServer, type McpServerConfig } from '../mcp/server.js';
 import { ensureEnvLoaded, getEnv } from '../utils/env.js';
@@ -320,14 +323,10 @@ async function prepareToolsForMcp(
   }
 
   // Add FS tools (list_directory, glob_files, etc.) - these run locally as they don't need brain
+  // NOTE: delete_path, move_file, copy_file are now in brain-tools only
   const fsTools = generateFsTools({ projectRoot: () => ctx.currentProjectPath || process.cwd() });
-  // Filter out tools that are routed via daemon for brain integration
-  const daemonRoutedFsTools = new Set(['delete_path', 'move_file', 'copy_file']);
-  const filteredFsTools = fsTools.tools.filter(t => !daemonRoutedFsTools.has(t.name));
-  allTools.push(...filteredFsTools);
+  allTools.push(...fsTools.tools);
   for (const [name, handler] of Object.entries(fsTools.handlers)) {
-    // Skip tools routed via daemon
-    if (daemonRoutedFsTools.has(name)) continue;
     // Wrap handlers for grep_files and search_files to handle extract_hierarchy via daemon
     if (name === 'grep_files' || name === 'search_files') {
       allHandlers[name] = async (args: any) => {
@@ -472,13 +471,14 @@ async function prepareToolsForMcp(
       return result.result;
     };
 
-    // Add file tools via daemon (for brain integration - touchFile on read, triggerReIngestion on modify)
+    // Add file tools that don't need brain integration (install_package runs locally)
+    // NOTE: read_file, write_file, edit_file, etc. are now in brain-tools and routed via daemon above
     const fileTools = generateFileTools({ projectRoot: () => ctx.currentProjectPath || process.cwd() });
     allTools.push(...fileTools.tools);
-    for (const toolDef of fileTools.tools) {
-      allHandlers[toolDef.name] = createDaemonProxyHandler(toolDef.name);
+    for (const [name, handler] of Object.entries(fileTools.handlers)) {
+      allHandlers[name] = handler; // Run locally, no daemon needed
     }
-    log('debug', `File tools enabled (via daemon) - ${fileTools.tools.length} tools`);
+    log('debug', `File tools enabled (local) - ${fileTools.tools.length} tools`);
 
     // Add web tools via daemon (for brain integration and web page ingestion)
     allTools.push(...webToolDefinitions);
@@ -524,7 +524,18 @@ async function prepareToolsForMcp(
 
   log('debug', 'All tools prepared');
 
-  return { tools: allTools, handlers: allHandlers, onBeforeToolCall };
+  // Initialize tool logging
+  ToolLogger.initialize();
+
+  // Wrap all handlers with logging (if enabled via RAGFORGE_LOG_TOOL_CALLS=true)
+  const wrappedHandlers: Record<string, (args: any) => Promise<any>> = {};
+  for (const [name, handler] of Object.entries(allHandlers)) {
+    wrappedHandlers[name] = withToolLogging(name, handler, 'mcp');
+  }
+
+  log('debug', `Tool logging ${ToolLogger.isEnabled() ? 'enabled' : 'disabled'}`);
+
+  return { tools: allTools, handlers: wrappedHandlers, onBeforeToolCall };
 }
 
 // ============================================

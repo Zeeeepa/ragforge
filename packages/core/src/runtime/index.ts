@@ -224,6 +224,10 @@ export { runEmbeddingPipelines } from './embedding/pipeline.js';
 // Source Adapters
 export * from './adapters/index.js';
 
+// Tool Logging
+export { ToolLogger, withToolLogging } from './utils/tool-logger.js';
+export type { ToolCallMetadata } from './utils/tool-logger.js';
+
 // OCR (Optical Character Recognition)
 export * from './ocr/index.js';
 

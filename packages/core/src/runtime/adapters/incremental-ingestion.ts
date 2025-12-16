@@ -265,6 +265,48 @@ export class IncrementalIngestionManager {
   }
 
   /**
+   * Update rawContentHash for File nodes AFTER successful ingestion
+   *
+   * This ensures atomicity: if ingestion is interrupted (e.g., daemon killed during build),
+   * the hash won't be updated, so next sync will correctly detect the file as changed
+   * and re-ingest all nodes.
+   *
+   * @param hashes - Map of relative file path -> new hash
+   * @param projectId - Project ID to filter files
+   * @param verbose - Enable verbose logging
+   */
+  async updateFileHashes(
+    hashes: Map<string, string>,
+    projectId: string,
+    verbose: boolean = false
+  ): Promise<void> {
+    if (hashes.size === 0) return;
+
+    // Convert to array for UNWIND
+    const hashUpdates = Array.from(hashes.entries()).map(([path, hash]) => ({
+      path,
+      hash
+    }));
+
+    // Batch update all File hashes in a single query
+    const result = await this.client.run(
+      `
+      UNWIND $updates AS update
+      MATCH (f:File {path: update.path})-[:BELONGS_TO]->(p:Project {projectId: $projectId})
+      SET f.rawContentHash = update.hash
+      RETURN count(f) AS updated
+      `,
+      { updates: hashUpdates, projectId }
+    );
+
+    const updatedCount = result.records[0]?.get('updated')?.toNumber() ?? 0;
+
+    if (verbose && updatedCount > 0) {
+      console.log(`   🔒 Updated ${updatedCount} file hashes (atomicity checkpoint)`);
+    }
+  }
+
+  /**
    * Compute raw content hash for a file (SHA-256)
    * Fast operation - just reads file and hashes it, no parsing
    */
@@ -1070,17 +1112,9 @@ export class IncrementalIngestionManager {
       console.log(`\n✅ Parsed ${countStr} from source`);
     }
 
-    // Add rawContentHash to File nodes (for future incremental checks)
-    if (newHashes) {
-      for (const node of parseResult.graph.nodes) {
-        if (node.labels.includes('File') && node.properties.path) {
-          const hash = newHashes.get(node.properties.path as string);
-          if (hash) {
-            node.properties.rawContentHash = hash;
-          }
-        }
-      }
-    }
+    // NOTE: rawContentHash is updated AFTER ingestion completes to ensure atomicity
+    // If daemon is killed mid-ingestion, the hash won't be updated, so next sync
+    // will correctly detect the file as changed and re-ingest all nodes
 
     // Ingest with projectId
     if (checkContentHashes) {
@@ -1090,6 +1124,11 @@ export class IncrementalIngestionManager {
         dryRun,
         trackChanges
       });
+
+      // Update File hashes AFTER successful ingestion (atomicity fix)
+      if (newHashes && projectId && !dryRun) {
+        await this.updateFileHashes(newHashes, projectId, verbose);
+      }
 
       // Add skipped files to unchanged count
       if (skipFiles) {
@@ -1105,6 +1144,12 @@ export class IncrementalIngestionManager {
         }
       }
       await this.ingestNodes(parseResult.graph.nodes, parseResult.graph.relationships);
+
+      // Update File hashes AFTER successful ingestion (atomicity fix)
+      if (newHashes && projectId) {
+        await this.updateFileHashes(newHashes, projectId, verbose);
+      }
+
       const totalNodes = parseResult.graph.nodes.length;
       return {
         unchanged: 0,

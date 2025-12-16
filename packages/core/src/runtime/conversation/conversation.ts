@@ -90,6 +90,7 @@ export class Conversation {
           maxIterationsPerItem: 5,
           toolExecutor,
           llmProvider,
+          caller: 'Conversation.chat.withTools',
           batchSize: 1
         }
       );
@@ -109,6 +110,7 @@ export class Conversation {
             reasoning: { type: 'string', description: 'Your thinking process' }
           },
           llmProvider,
+          caller: 'Conversation.chat',
           batchSize: 1
         }
       );
@@ -542,6 +544,7 @@ Be factual and preserve critical details.`,
           }
         },
         llmProvider,
+        caller: 'Conversation.generateL1Summary',
         batchSize: 1
       }
     );
@@ -627,6 +630,7 @@ Maintain chronological flow if relevant. Be concise but preserve key information
           }
         },
         llmProvider,
+        caller: 'Conversation.generateL2Summary',
         batchSize: 1
       }
     );

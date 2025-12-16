@@ -277,6 +277,9 @@ class BrainDaemon {
   private startTime: Date;
   private requestCount: number = 0;
   private lastActivity: Date;
+  // Daemon status for health checks
+  private status: 'starting' | 'ready' | 'error' = 'starting';
+  private statusMessage: string = 'Initializing...';
   // Agent conversation state (shared across all agent tool calls)
   private currentConversationId: string | undefined = undefined;
   // Research Agent for chat interface
@@ -424,14 +427,11 @@ class BrainDaemon {
       methods: ['GET', 'POST', 'DELETE'],
     });
 
-    // Setup routes
+    // Setup routes (server can respond to /health immediately)
     this.setupRoutes();
 
     // Setup error handlers
     this.setupErrorHandlers();
-
-    // Initialize BrainManager (this will load ~/.ragforge/.env)
-    await this.initializeBrain();
 
     // Reset idle timer on each request
     this.server.addHook('onRequest', async () => {
@@ -440,7 +440,9 @@ class BrainDaemon {
       this.lastActivity = new Date();
     });
 
-    this.logger.info('Daemon initialized successfully');
+    // NOTE: BrainManager is initialized AFTER server.listen() in start()
+    // This allows /health to respond while brain is initializing
+    this.logger.info('Daemon routes initialized (brain will init after server starts)');
   }
 
   private async initializeBrain(): Promise<void> {
@@ -720,7 +722,8 @@ class BrainDaemon {
 
     for (const project of matchingProjects) {
       try {
-        await this.brain.startWatching(project.path);
+        // Force initial sync to catch any changes since last session
+        await this.brain.startWatching(project.path, { skipInitialSync: false });
         this.logger.info(`  ✓ Started watcher for: ${project.id}`);
       } catch (error: any) {
         this.logger.warn(`  ✗ Failed to start watcher for ${project.id}: ${error.message}`);
@@ -762,8 +765,8 @@ class BrainDaemon {
     // Check if watcher is already running
     if (this.brain.isWatching(project.path)) return;
 
-    // Start watcher (fire-and-forget)
-    this.brain.startWatching(project.path)
+    // Start watcher (fire-and-forget) with initial sync to catch changes
+    this.brain.startWatching(project.path, { skipInitialSync: false })
       .then(() => {
         this.logger.info(`Auto-started watcher for project: ${project.id}`);
       })
@@ -773,9 +776,31 @@ class BrainDaemon {
   }
 
   private setupRoutes(): void {
-    // Health check
-    this.server.get('/health', async () => {
-      return { status: 'ok', timestamp: getLocalTimestamp() };
+    // Health check - returns current daemon status
+    // Allows clients to distinguish between "starting" and "ready"
+    this.server.get('/health', async (request, reply) => {
+      if (this.status === 'starting') {
+        // 503 Service Unavailable - daemon is starting but not ready
+        return reply.status(503).send({
+          status: 'starting',
+          message: this.statusMessage,
+          timestamp: getLocalTimestamp(),
+        });
+      }
+      if (this.status === 'error') {
+        // 500 Internal Server Error - brain initialization failed
+        return reply.status(500).send({
+          status: 'error',
+          message: this.statusMessage,
+          timestamp: getLocalTimestamp(),
+        });
+      }
+      // 200 OK - daemon is ready
+      return {
+        status: 'ready',
+        timestamp: getLocalTimestamp(),
+        uptime: Math.floor((Date.now() - this.startTime.getTime()) / 1000),
+      };
     });
 
     // Daemon status (enriched for DaemonBrainProxy cache)
@@ -1639,6 +1664,7 @@ class BrainDaemon {
     const port = parseInt(process.env.RAGFORGE_DAEMON_PORT || String(DEFAULT_PORT), 10);
 
     try {
+      // Start HTTP server FIRST - allows /health to respond immediately
       await this.server.listen({ port, host: '127.0.0.1' });
 
       // Write PID file
@@ -1654,6 +1680,25 @@ class BrainDaemon {
       console.log(`🧠 Brain Daemon running on http://127.0.0.1:${port}`);
       console.log(`📝 Logs: ${LOG_FILE}`);
       console.log(`⏰ Auto-shutdown after ${IDLE_TIMEOUT_MS / 1000}s of inactivity`);
+
+      // Initialize BrainManager AFTER server is listening
+      // This allows /health to respond with "starting" during init
+      this.statusMessage = 'Initializing BrainManager...';
+      console.log(`⏳ Initializing BrainManager...`);
+
+      this.initializeBrain()
+        .then(() => {
+          this.status = 'ready';
+          this.statusMessage = 'Ready';
+          this.logger.info('BrainManager ready - daemon fully initialized');
+          console.log(`✅ BrainManager ready`);
+        })
+        .catch((error: any) => {
+          this.status = 'error';
+          this.statusMessage = `Brain initialization failed: ${error.message}`;
+          this.logger.error('Failed to initialize BrainManager', { error: error.message });
+          console.error(`❌ BrainManager initialization failed: ${error.message}`);
+        });
     } catch (error: any) {
       this.logger.error('Failed to start server', { error: error.message });
       throw error;

@@ -887,6 +887,7 @@ AMÉLIORATIONS À AJOUTER:
             required: true,
           },
         },
+        caller: 'image-tools.enhanceImagePrompt',
       }
     );
 
@@ -1038,6 +1039,7 @@ Final prompt format:
           },
         },
         outputFormat: 'xml',
+        caller: 'image-tools.generateViewPrompts',
         batchSize: 1,
       }
     );

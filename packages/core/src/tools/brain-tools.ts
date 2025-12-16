@@ -475,6 +475,24 @@ When enabled, each result will include a 'relationships' object showing what the
 This helps understand how search results connect to other parts of the codebase.
 Default: 0 (disabled). Use 1 for direct relationships, 2-3 for deeper exploration.`,
         },
+        summarize: {
+          type: 'boolean',
+          optional: true,
+          description: `Summarize search results using LLM to extract relevant snippets with line numbers.
+When enabled, returns a compact summary instead of full results, with:
+- Relevant code/content snippets with exact line numbers
+- Brief explanation of why each result is relevant
+- Key findings synthesized from results
+
+This reduces context size and focuses attention on the most relevant information.
+Default: false. Requires GEMINI_API_KEY.`,
+        },
+        summarize_context: {
+          type: 'string',
+          optional: true,
+          description: `Additional context for summarization (e.g., the agent's reasoning at the time of search).
+Only used when summarize=true. Helps the LLM understand what information is being sought.`,
+        },
       },
       required: ['query'],
     },
@@ -499,6 +517,8 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
     boost_keywords?: string[];
     boost_weight?: number;
     explore_depth?: number;
+    summarize?: boolean;
+    summarize_context?: string;
   }): Promise<UnifiedSearchResult & {
     waited_for_edits?: boolean;
     watchers_started?: string[];
@@ -506,6 +526,18 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
     reranked?: boolean;
     keyword_boosted?: boolean;
     relationships_explored?: boolean;
+    summarized?: boolean;
+    summary?: {
+      snippets: Array<{
+        uuid: string;
+        file: string;
+        lines: string;
+        content: string;
+        relevance: string;
+      }>;
+      findings: string;
+      suggestions?: Array<{ type: string; target: string; reason: string }>;
+    };
     graph?: {
       nodes: Array<{
         uuid: string;
@@ -1225,8 +1257,59 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
         });
       }
 
+      // Step 7: Summarize results if requested
+      let summarized = false;
+      let summary: {
+        snippets: Array<{ uuid: string; file: string; lines: string; content: string; relevance: string }>;
+        findings: string;
+        suggestions?: Array<{ type: string; target: string; reason: string }>;
+      } | undefined;
+
+      if (params.summarize && result.results && result.results.length > 0) {
+        log.info('Step 7: Summarizing results with LLM');
+        const summarizeStart = Date.now();
+
+        try {
+          summary = await summarizeBrainSearchResults(
+            params.query,
+            result.results,
+            params.summarize_context,
+            ctx.brain.getGeminiKey() || process.env.GEMINI_API_KEY
+          );
+          summarized = true;
+
+          const summarizeDuration = Date.now() - summarizeStart;
+          log.info('Summarization complete', {
+            duration: summarizeDuration,
+            snippetCount: summary.snippets.length,
+            findingsLength: summary.findings.length,
+          });
+        } catch (error: any) {
+          log.error('Summarization failed', error);
+          // Continue without summary if it fails
+        }
+      }
+
       const totalDuration = Date.now() - startTime;
-      log.info('COMPLETE', { totalDuration, reranked, keywordBoosted, relationshipsExplored });
+      log.info('COMPLETE', { totalDuration, reranked, keywordBoosted, relationshipsExplored, summarized });
+
+      // When summarized, return only the summary (not full results) to reduce context size
+      if (summarized && summary) {
+        return {
+          results: [], // Empty to save context - use summary instead
+          totalCount: result.totalCount,
+          searchedProjects: result.searchedProjects,
+          waited_for_edits: waitedForSync || undefined,
+          watchers_started: watchersStarted.length > 0 ? watchersStarted : undefined,
+          flushed_projects: flushedProjects.length > 0 ? flushedProjects : undefined,
+          reranked: reranked || undefined,
+          keyword_boosted: keywordBoosted || undefined,
+          relationships_explored: relationshipsExplored || undefined,
+          summarized: true,
+          summary,
+          graph,
+        };
+      }
 
       return {
         ...result,
@@ -1236,6 +1319,8 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
         reranked: reranked || undefined,
         keyword_boosted: keywordBoosted || undefined,
         relationships_explored: relationshipsExplored || undefined,
+        summarized: summarized || undefined,
+        summary,
         graph,
       };
     } catch (error: any) {
@@ -1243,6 +1328,200 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
       log.error('ERROR', error, { duration: totalDuration });
       throw error;
     }
+  };
+}
+
+/**
+ * Summarize brain_search results using LLM to extract relevant snippets with line numbers.
+ * This reduces context size and focuses attention on the most relevant information.
+ */
+async function summarizeBrainSearchResults(
+  query: string,
+  results: Array<{
+    node?: {
+      uuid?: string;
+      name?: string;
+      type?: string;
+      file?: string;
+      absolutePath?: string;
+      startLine?: number;
+      endLine?: number;
+      content?: string;
+      source?: string;
+      description?: string;
+      docstring?: string;
+    };
+    score?: number;
+    filePath?: string;
+  }>,
+  context?: string,
+  apiKey?: string
+): Promise<{
+  snippets: Array<{ uuid: string; file: string; lines: string; content: string; relevance: string }>;
+  findings: string;
+  suggestions?: Array<{ type: string; target: string; reason: string }>;
+}> {
+  if (!apiKey) {
+    throw new Error('GEMINI_API_KEY required for brain_search summarization');
+  }
+
+  const { StructuredLLMExecutor, GeminiAPIProvider } = await import('../runtime/index.js');
+
+  const llmProvider = new GeminiAPIProvider({
+    apiKey,
+    model: 'gemini-2.0-flash',
+    temperature: 0.3, // Low temperature for factual extraction
+    maxOutputTokens: 32000, // Allow enough room for snippets + findings + suggestions
+  });
+
+  const executor = new StructuredLLMExecutor();
+
+  // Format results for the LLM - use absolute paths
+  const formattedResults = results.map((r, i) => {
+    const node = r.node || {};
+    const absolutePath = node.absolutePath || r.filePath || node.file || 'unknown';
+    const lines = node.startLine && node.endLine
+      ? `${node.startLine}-${node.endLine}`
+      : node.startLine
+        ? `${node.startLine}`
+        : 'N/A';
+    const content = node.source || node.content || '';
+    const description = node.docstring || node.description || '';
+    return `[${i + 1}] ${node.type || 'unknown'}: ${node.name || 'unnamed'}
+uuid: ${node.uuid || 'unknown'}
+file: ${absolutePath}
+lines: ${lines}
+score: ${(r.score || 0).toFixed(3)}
+${description ? `description: ${description}` : ''}
+${content ? `content:\n${content}` : ''}`;
+  }).join('\n\n---\n\n');
+
+  const { createLogger } = await import('../runtime/utils/logger.js');
+  const log = createLogger('brain_search_summarize');
+
+  let result: {
+    snippets: Array<{ uuid: string; file: string; lines: string; content: string; relevance: string }>;
+    findings: string;
+    suggestions?: Array<{ type: string; target: string; reason: string }>;
+  } | undefined;
+
+  try {
+    result = await executor.executeSingle<{
+      snippets: Array<{ uuid: string; file: string; lines: string; content: string; relevance: string }>;
+      findings: string;
+      suggestions?: Array<{ type: string; target: string; reason: string }>;
+    }>({
+      input: { query, results: formattedResults, context: context || '' },
+      inputFields: ['query', 'results', 'context'],
+      llmProvider,
+      outputFormat: 'json', // Use JSON format - Gemini follows this better than XML
+      systemPrompt: `You are an expert code analyst. Your task is to extract the most relevant snippets from code search results and suggest actionable next steps.
+
+GUIDELINES:
+- Focus on code/content that DIRECTLY answers the query
+- Include the UUID from each result for reference (can be used with explore_node tool)
+- For line numbers: calculate ABSOLUTE line numbers from the result's startLine. If a result starts at line 630 and you want to cite lines 10-25 within it, output "640-655"
+- Keep snippets CONCISE: max 20-30 lines per snippet. Include signature + key logic only
+- Use "// ..." to indicate omitted code within a snippet
+- PRIORITIZE findings and suggestions over code length - they are MORE IMPORTANT than full code
+- Explain WHY each snippet is relevant to the query
+- Synthesize findings across all results
+
+FOR SUGGESTIONS - be specific and actionable:
+- Look at function/class names CALLED or IMPORTED in the code and suggest searching for them
+- Identify dependencies (what the code uses) and consumers (what uses this code)
+- Suggest exploring specific UUIDs with explore_node to see relationships
+- Propose searches for related patterns, interfaces, or types mentioned in the code
+- If you see a class method, suggest finding the class definition or other methods
+- Do NOT give generic suggestions like "search for authentication" - be SPECIFIC based on what you see in the results`,
+    userTask: `Analyze these search results and extract the most relevant snippets.
+
+QUERY: {query}
+
+${context ? `CONTEXT (why this search was made): {context}` : ''}
+
+SEARCH RESULTS:
+{results}
+
+Extract:
+1. The most relevant code/content snippets with their UUID, ABSOLUTE file paths and line numbers
+2. A synthesis of key findings
+3. SPECIFIC suggestions based on what you found:
+   - Function/class names to search for (that are called/imported in the results)
+   - UUIDs worth exploring with explore_node to see dependencies/consumers
+   - Related types, interfaces, or patterns mentioned in the code`,
+    outputSchema: {
+      snippets: {
+        type: 'array',
+        description: 'Most relevant snippets from the results',
+        required: true,
+        items: {
+          type: 'object',
+          description: 'A relevant code snippet',
+          properties: {
+            uuid: { type: 'string', description: 'UUID of the node (from the results, for explore_node)' },
+            file: { type: 'string', description: 'Absolute file path (from the results)' },
+            lines: { type: 'string', description: 'ABSOLUTE line numbers in the file (e.g., "640-655"). Calculate from result startLine + offset within snippet.' },
+            content: { type: 'string', description: 'Concise code snippet (max 20-30 lines). Include signature + key logic. Use "// ..." to indicate omitted parts.' },
+            relevance: { type: 'string', description: 'Why this snippet is relevant to the query' },
+          },
+        },
+      },
+      findings: {
+        type: 'string',
+        description: 'Key findings synthesized from all results (2-3 sentences)',
+        required: true,
+      },
+      suggestions: {
+        type: 'array',
+        description: 'Specific actionable suggestions based on the results found',
+        required: false,
+        items: {
+          type: 'object',
+          description: 'A specific suggestion for follow-up',
+          properties: {
+            type: { type: 'string', description: 'Type: "search" (brain_search query), "explore" (explore_node UUID), or "read" (read_file path)' },
+            target: { type: 'string', description: 'The search query, UUID, or file path depending on type' },
+            reason: { type: 'string', description: 'Why this would be useful (be specific)' },
+          },
+        },
+      },
+    },
+    caller: 'brain-tools.summarizeBrainSearchResults',
+    maxIterations: 1, // Single pass, no tool calls
+    });
+  } catch (error: any) {
+    // Log the error with as much detail as possible
+    log.error('executeSingle failed', {
+      error: error.message,
+      query,
+      resultCount: results.length,
+      // If executeSingle throws with raw response info, try to extract it
+      rawResponse: error.rawResponse?.substring?.(0, 2000) || error.response?.substring?.(0, 2000),
+    });
+    throw error;
+  }
+
+  if (!result?.snippets || !result?.findings) {
+    log.error('LLM returned unexpected format', {
+      hasSnippets: !!result?.snippets,
+      hasFindings: !!result?.findings,
+      resultKeys: result ? Object.keys(result) : [],
+      resultPreview: result ? JSON.stringify(result).substring(0, 1000) : 'undefined',
+    });
+    throw new Error('LLM did not return expected output format');
+  }
+
+  log.info('Summarization successful', {
+    snippetCount: result.snippets.length,
+    findingsLength: result.findings.length,
+    suggestionCount: result.suggestions?.length || 0,
+  });
+
+  return {
+    snippets: result.snippets,
+    findings: result.findings,
+    suggestions: result.suggestions,
   };
 }
 
@@ -2126,7 +2405,8 @@ export function generateStartWatcherHandler(ctx: BrainToolsContext) {
     }
 
     try {
-      await ctx.brain.startWatching(absolutePath, { verbose });
+      // Force initial sync to catch any changes since last session
+      await ctx.brain.startWatching(absolutePath, { skipInitialSync: false, verbose });
       const projects = ctx.brain.listProjects();
       const project = projects.find(p => p.path === absolutePath);
 
@@ -2450,6 +2730,8 @@ export function generateBrainReadFileTool(): GeneratedToolDefinition {
     name: 'read_file',
     description: `Read file contents with line numbers.
 
+**IMPORTANT: Use absolute paths from tool results (brain_search, grep_files, glob_files, list_directory), not relative paths.**
+
 Returns file content with line numbers (format: "00001| content").
 Supports pagination with offset and limit for large files.
 
@@ -2460,19 +2742,15 @@ Supports pagination with offset and limit for large files.
 - 3D models (.glb, .gltf): Render and describe
 
 Parameters:
-- path: Absolute or relative file path
+- path: File path (use absolute paths from other tool results)
 - offset: Start line (0-based, optional)
 - limit: Max lines to read (default: 2000)
 - ocr: For images/documents - use OCR text extraction (default: false for images, true for PDFs)
-  When OCR confidence is low, automatically falls back to Gemini Vision.
 
 Long lines (>2000 chars) are truncated with "...".
 
-Example: read_file({ path: "src/index.ts" })
-Example: read_file({ path: "screenshot.png" })  // Visual description
-Example: read_file({ path: "screenshot.png", ocr: true })  // Extract text from image
-Example: read_file({ path: "document.pdf" })  // Extract text (OCR)
-Example: read_file({ path: "document.pdf", ocr: false })  // Visual analysis`,
+Example: read_file({ path: "/home/user/project/src/index.ts" })  // Absolute path from brain_search/grep_files
+Example: read_file({ path: "/home/user/project/screenshot.png" })  // Visual description`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -3794,9 +4072,13 @@ Returns:
 Parameters:
 - question: The question or research task
 - cwd: Optional working directory for file operations
+- max_iterations: Optional max tool call rounds (default: 15, use lower values like 2-3 for debugging)
+- summarize_tool_context: Enable summarization of tool context when it gets large (default: true)
+- tool_context_summarization_threshold: Character threshold to trigger summarization (default: 40000)
 
 Example: call_research_agent({ question: "How does authentication work in this project?" })
-Example: call_research_agent({ question: "Explain the data flow from API to database", cwd: "/path/to/project" })`,
+Example: call_research_agent({ question: "Find auth files", max_iterations: 2 })  // Debug mode
+Example: call_research_agent({ question: "...", summarize_tool_context: false })  // Disable summarization`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -3807,6 +4089,18 @@ Example: call_research_agent({ question: "Explain the data flow from API to data
         cwd: {
           type: 'string',
           description: 'Optional working directory for file operations',
+        },
+        max_iterations: {
+          type: 'number',
+          description: 'Max tool call rounds (default: 15, use 2-3 for debugging)',
+        },
+        summarize_tool_context: {
+          type: 'boolean',
+          description: 'Enable tool context summarization when context gets large (default: true). Set to false to see raw tool results.',
+        },
+        tool_context_summarization_threshold: {
+          type: 'number',
+          description: 'Character threshold to trigger tool context summarization (default: 40000, ~10k tokens)',
         },
       },
       required: ['question'],
@@ -3819,8 +4113,14 @@ Example: call_research_agent({ question: "Explain the data flow from API to data
  * Creates agent directly with logging enabled
  */
 export function generateCallResearchAgentHandler(ctx: BrainToolsContext) {
-  return async (params: { question: string; cwd?: string }): Promise<any> => {
-    const { question, cwd } = params;
+  return async (params: {
+    question: string;
+    cwd?: string;
+    max_iterations?: number;
+    summarize_tool_context?: boolean;
+    tool_context_summarization_threshold?: number;
+  }): Promise<any> => {
+    const { question, cwd, max_iterations, summarize_tool_context, tool_context_summarization_threshold } = params;
     const os = await import('os');
     const fsPromises = await import('fs/promises');
     const pathModule = await import('path');
@@ -3829,18 +4129,26 @@ export function generateCallResearchAgentHandler(ctx: BrainToolsContext) {
     const { createResearchAgent } = await import('../runtime/agents/research-agent.js');
 
     // Setup logging
+    const { getFilenameTimestamp } = await import('../runtime/utils/timestamp.js');
     const logDir = pathModule.default.join(os.default.homedir(), '.ragforge', 'logs', 'agent-sessions');
     await fsPromises.mkdir(logDir, { recursive: true });
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const logPath = pathModule.default.join(logDir, `session-${timestamp}.json`);
+    const timestamp = getFilenameTimestamp();
+    const sessionName = `session-${timestamp}`;
+    const logPath = pathModule.default.join(logDir, `${sessionName}.json`);
     const reportPath = pathModule.default.join(logDir, `report-${timestamp}.md`);
+    const promptsDir = pathModule.default.join(logDir, sessionName, 'prompts');
+    await fsPromises.mkdir(promptsDir, { recursive: true });
 
     const agent = await createResearchAgent({
       brainManager: ctx.brain,
       cwd: cwd || process.cwd(),
       verbose: true,
-      maxIterations: 15,
+      maxIterations: max_iterations ?? 15,
       logPath,
+      promptsDir,
+      // Tool context summarization options (exposed via MCP)
+      summarizeToolContext: summarize_tool_context,
+      toolContextSummarizationThreshold: tool_context_summarization_threshold,
       onReportUpdate: async (report: string) => {
         try {
           await fsPromises.writeFile(reportPath, report, 'utf-8');

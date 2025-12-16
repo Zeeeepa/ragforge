@@ -28,6 +28,7 @@ import { formatLocalDate, getFilenameTimestamp } from '../utils/timestamp.js';
 import { StructuredLLMExecutor, BaseToolExecutor, type ToolCallRequest, type ToolExecutionResult } from '../llm/structured-llm-executor.js';
 import { GeminiAPIProvider } from '../reranking/gemini-api-provider.js';
 import { GeminiNativeToolProvider, type ToolDefinition } from '../llm/native-tool-calling/index.js';
+import { ToolLogger } from '../utils/tool-logger.js';
 import * as yaml from 'js-yaml';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -629,6 +630,13 @@ export class GeneratedToolExecutor extends BaseToolExecutor {
 
       this.logger?.logToolResult(toolCall.tool_name, result, durationMs);
 
+      // Log to file (if RAGFORGE_LOG_TOOL_CALLS=true)
+      await ToolLogger.logToolCall(toolCall.tool_name, toolCall.arguments, result, {
+        duration: durationMs,
+        success: true,
+        source: 'agent',
+      });
+
       // Call real-time callback
       this.onToolResult?.(toolCall.tool_name, result, true, durationMs);
 
@@ -642,6 +650,14 @@ export class GeneratedToolExecutor extends BaseToolExecutor {
       }
 
       this.logger?.logToolError(toolCall.tool_name, errorMsg, durationMs);
+
+      // Log to file (if RAGFORGE_LOG_TOOL_CALLS=true)
+      await ToolLogger.logToolCall(toolCall.tool_name, toolCall.arguments, { error: errorMsg }, {
+        duration: durationMs,
+        success: false,
+        error: errorMsg,
+        source: 'agent',
+      });
 
       // Call real-time callback for errors
       this.onToolResult?.(toolCall.tool_name, errorMsg, false, durationMs);
@@ -972,6 +988,7 @@ Example: After getting search results, use this to analyze each result with a cu
         userTask: task,
         outputSchema,
         llmProvider: this.llmProvider,
+        caller: 'RagAgent.analyze',
         batchSize: 5,
       });
 
@@ -1103,6 +1120,7 @@ Example: After getting search results, use this to analyze each result with a cu
             nativeToolProvider: this.nativeToolProvider,
             toolExecutor,
             llmProvider: this.llmProvider,
+            caller: 'RagAgent.ask.native',
           }
         );
 
@@ -1134,6 +1152,7 @@ Example: After getting search results, use this to analyze each result with a cu
           maxIterations: this.maxIterations,
           toolExecutor,
           llmProvider: this.llmProvider,
+          caller: 'RagAgent.ask.structured',
           // Log prompts/responses when verbose
           logPrompts: this.verbose,
           logResponses: this.verbose,
@@ -1236,6 +1255,7 @@ Example: After getting search results, use this to analyze each result with a cu
         nativeToolProvider: this.nativeToolProvider,
         toolExecutor,
         llmProvider: this.llmProvider,
+        caller: 'RagAgent.askMultiple',
         batchSize: 10,
       }
     );

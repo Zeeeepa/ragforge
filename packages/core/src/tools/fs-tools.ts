@@ -1474,15 +1474,14 @@ export interface FsToolsResult {
  * Generate all file system tools with handlers
  */
 export function generateFsTools(ctx: FsToolsContext): FsToolsResult {
+  // NOTE: delete_path, move_file, copy_file moved to brain-tools.ts
+  // Use generateBrainTools() for those - they have better handling for projects
   return {
     tools: [
       generateListDirectoryTool(),
       generateGlobFilesTool(),
       generateFileExistsTool(),
       generateGetFileInfoTool(),
-      generateDeletePathTool(),
-      generateMoveFileTool(),
-      generateCopyFileTool(),
       generateCreateDirectoryTool(),
       generateChangeDirectoryTool(),
       generateGrepFilesTool(),
@@ -1493,9 +1492,6 @@ export function generateFsTools(ctx: FsToolsContext): FsToolsResult {
       glob_files: generateGlobFilesHandler(ctx),
       file_exists: generateFileExistsHandler(ctx),
       get_file_info: generateGetFileInfoHandler(ctx),
-      delete_path: generateDeletePathHandler(ctx),
-      move_file: generateMoveFileHandler(ctx),
-      copy_file: generateCopyFileHandler(ctx),
       create_directory: generateCreateDirectoryHandler(ctx),
       change_directory: generateChangeDirectoryHandler(ctx),
       grep_files: generateGrepFilesHandler(ctx),

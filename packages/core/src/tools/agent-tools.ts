@@ -12,10 +12,74 @@ import { createRagAgent, type RagAgentOptions } from '../runtime/agents/rag-agen
 import { StructuredLLMExecutor } from '../runtime/llm/structured-llm-executor.js';
 import type { LLMProvider } from '../runtime/reranking/llm-provider.js';
 import type { ToolCallRequest, ToolExecutionResult } from '../runtime/llm/structured-llm-executor.js';
-import { normalizeTimestamp } from '../runtime/utils/timestamp.js';
+import { normalizeTimestamp, getFilenameTimestamp } from '../runtime/utils/timestamp.js';
+import { GeminiAPIProvider } from '../runtime/reranking/gemini-api-provider.js';
+import { createLogger } from '../runtime/utils/logger.js';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
+
+const logger = createLogger('AgentTools');
+
+// ============================================
+// Session Analysis Types
+// ============================================
+
+export interface SessionAnalysisResult {
+  /** Overall quality score 0-10 */
+  overall_score: number;
+  /** Efficiency score 0-10 (redundancy, waste) */
+  efficiency_score: number;
+
+  /** Tool call analysis */
+  tool_analysis: {
+    total_calls: number;
+    redundant_calls: number;
+    useful_calls: number;
+    wasted_time_ms: number;
+    missed_opportunities: string[];
+  };
+
+  /** Reasoning quality */
+  reasoning_quality: {
+    clear_plan: boolean;
+    exploits_results: boolean;
+    adapts_strategy: boolean;
+    avoids_repetition: boolean;
+  };
+
+  /** Issues detected */
+  issues: Array<{
+    type: 'redundancy' | 'inefficiency' | 'missed_info' | 'wrong_tool' | 'loop' | 'other';
+    description: string;
+    severity: 'low' | 'medium' | 'high';
+    iteration?: number;
+    tool_name?: string;
+  }>;
+
+  /** Suggestions for improvement */
+  suggestions: string[];
+
+  /** System prompt corrections */
+  prompt_corrections: Array<{
+    issue: string;
+    current_behavior: string;
+    suggested_addition: string;
+    priority: 'low' | 'medium' | 'high';
+  }>;
+
+  /** Human-readable summary */
+  summary: string;
+
+  /** CRITICAL: The improved system prompt incorporating all corrections */
+  improved_system_prompt: string;
+
+  /** Output file paths (added by the tool) */
+  _output_files?: {
+    analysis_json: string;
+    improved_prompt_md?: string;
+  };
+}
 
 // ============================================
 // Types
@@ -185,6 +249,41 @@ export function generateAgentTools(): GeneratedToolDefinition[] {
           },
         },
         required: ['conversation_id'],
+      },
+    },
+    {
+      name: 'analyze_agent_session',
+      description: `Analyze an agent session log file and provide detailed feedback on the agent's behavior.
+
+Evaluates:
+- Overall quality and efficiency scores (0-10)
+- Tool call analysis (redundancy, usefulness, wasted time)
+- Reasoning quality (clear plan, exploits results, adapts strategy)
+- Issues detected with severity levels
+- Suggestions for improvement
+- **System prompt corrections** to prevent detected issues
+
+Use this to debug and improve agent behavior by analyzing session logs from ~/.ragforge/logs/agent-sessions/
+
+If no session_log_path is provided, automatically finds and analyzes the most recent session.`,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          session_log_path: {
+            type: 'string',
+            description: 'Path to the session folder or JSON file. If not provided, uses the most recent session from ~/.ragforge/logs/agent-sessions/',
+          },
+          focus_areas: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Optional areas to focus analysis on: "redundancy", "efficiency", "tool_choice", "reasoning", "prompt_corrections"',
+          },
+          max_iterations: {
+            type: 'number',
+            description: 'Maximum number of iterations to include in analysis (default: 5). Use lower values to limit context size.',
+          },
+        },
+        required: [],
       },
     },
   ];
@@ -449,7 +548,8 @@ export function generateAgentToolHandlers(
           };
 
           // Create output directory for files
-          const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+          const { getFilenameTimestamp } = await import('../runtime/utils/timestamp.js');
+          const timestamp = getFilenameTimestamp();
           const debugDir = path.join(os.homedir(), '.ragforge', 'debug', `extract_${timestamp}`);
           await fs.mkdir(debugDir, { recursive: true });
 
@@ -786,5 +886,446 @@ export function generateAgentToolHandlers(
         message: 'Conversation switched successfully. Future calls to extract_agent_prompt or call_agent will use enriched context from this conversation.',
       };
     },
+
+    analyze_agent_session: async (args: {
+      session_log_path?: string;
+      focus_areas?: string[];
+      max_iterations?: number;
+    }): Promise<SessionAnalysisResult> => {
+      const { focus_areas = [], max_iterations = 5 } = args;
+      let { session_log_path } = args;
+
+      const sessionsDir = path.join(os.homedir(), '.ragforge', 'logs', 'agent-sessions');
+
+      // If no path provided, find the most recent session directory
+      if (!session_log_path) {
+        logger.info('No session_log_path provided, finding most recent session...');
+        try {
+          const entries = await fs.readdir(sessionsDir, { withFileTypes: true });
+          const sessionDirs = entries
+            .filter(e => e.isDirectory() && e.name.startsWith('session-'))
+            .map(e => ({ name: e.name, path: path.join(sessionsDir, e.name) }))
+            .sort((a, b) => b.name.localeCompare(a.name)); // Sort descending by name (timestamp)
+
+          if (sessionDirs.length === 0) {
+            throw new Error(`No session directories found in ${sessionsDir}`);
+          }
+
+          session_log_path = sessionDirs[0].path;
+          logger.info(`Using most recent session: ${session_log_path}`);
+        } catch (error: any) {
+          throw new Error(`Failed to find session directories: ${error.message}`);
+        }
+      }
+
+      logger.info('analyze_agent_session called', { session_log_path, focus_areas, max_iterations });
+
+      // Resolve path (handle ~ for home directory)
+      let resolvedPath = session_log_path.startsWith('~')
+        ? path.join(os.homedir(), session_log_path.slice(1))
+        : session_log_path;
+
+      // If it's a .json file, check if corresponding directory exists and use that instead
+      if (resolvedPath.endsWith('.json')) {
+        const dirPath = resolvedPath.replace(/\.json$/, '');
+        try {
+          const dirStats = await fs.stat(dirPath);
+          if (dirStats.isDirectory()) {
+            logger.info(`Redirecting from JSON to directory: ${dirPath}`);
+            resolvedPath = dirPath;
+          }
+        } catch {
+          // Directory doesn't exist, continue with JSON file
+        }
+      }
+
+      // Check if it's a directory (session folder) or a JSON file
+      const stats = await fs.stat(resolvedPath);
+      const isDirectory = stats.isDirectory();
+
+      let sessionData: any = {};
+      let rawPromptsAndResponses: string[] = [];
+
+      if (isDirectory) {
+        // Read from session folder - get raw prompts and responses
+        // OPTIMIZATION: Send ALL responses but only the LAST prompt
+        // This provides enough context for analysis while reducing input size
+        const promptsDir = path.join(resolvedPath, 'prompts');
+
+        try {
+          const files = await fs.readdir(promptsDir);
+
+          // Parse and sort files by iteration and round
+          const parsedFiles = files.map(f => {
+            const match = f.match(/(prompt|response)-iter(\d+)-round(\d+)\.txt/);
+            if (!match) return null;
+            return {
+              filename: f,
+              type: match[1] as 'prompt' | 'response',
+              iter: parseInt(match[2]),
+              round: parseInt(match[3])
+            };
+          }).filter(Boolean) as Array<{ filename: string; type: 'prompt' | 'response'; iter: number; round: number }>;
+
+          // Sort by iteration, then round, then type (prompt before response)
+          parsedFiles.sort((a, b) => {
+            if (a.iter !== b.iter) return a.iter - b.iter;
+            if (a.round !== b.round) return a.round - b.round;
+            return a.type === 'prompt' ? -1 : 1;
+          });
+
+          // Filter to max_iterations
+          const filteredFiles = parsedFiles.filter(f => f.iter <= max_iterations);
+
+          // Find the last prompt file
+          const lastPromptFile = filteredFiles.filter(f => f.type === 'prompt').pop();
+
+          // Collect: all responses + only last prompt
+          for (const file of filteredFiles) {
+            // Skip prompts except the last one
+            if (file.type === 'prompt' && file !== lastPromptFile) {
+              continue;
+            }
+
+            const content = await fs.readFile(path.join(promptsDir, file.filename), 'utf-8');
+            const fileType = file.type.toUpperCase();
+            const isLastPrompt = file === lastPromptFile;
+            const header = `\n${'='.repeat(60)}\n${fileType} - Iteration ${file.iter}, Round ${file.round}${isLastPrompt ? ' (LAST PROMPT - CURRENT STATE)' : ''}\n${'='.repeat(60)}\n`;
+            rawPromptsAndResponses.push(header + content);
+          }
+
+          // Also try to read the session JSON for metadata
+          const jsonPath = resolvedPath + '.json';
+          try {
+            const jsonContent = await fs.readFile(jsonPath, 'utf-8');
+            sessionData = JSON.parse(jsonContent);
+          } catch {
+            // JSON file might not exist, that's ok
+          }
+        } catch (error: any) {
+          throw new Error(`Failed to read session folder: ${error.message}`);
+        }
+      } else {
+        // Read from JSON file (legacy mode)
+        try {
+          const content = await fs.readFile(resolvedPath, 'utf-8');
+          sessionData = JSON.parse(content);
+        } catch (error: any) {
+          throw new Error(`Failed to read session log: ${error.message}`);
+        }
+      }
+
+      // Create LLM provider and executor
+      const geminiApiKey = process.env.GEMINI_API_KEY;
+      if (!geminiApiKey) {
+        throw new Error('GEMINI_API_KEY environment variable is required for session analysis');
+      }
+
+      const llmProvider = new GeminiAPIProvider({
+        apiKey: geminiApiKey,
+        model: 'gemini-2.0-flash',
+        maxOutputTokens: 20000, // Allow long responses for detailed analysis + improved prompt
+      });
+
+      const executor = new StructuredLLMExecutor();
+
+      // Build analysis prompt with session data
+      const sessionSummary = buildSessionSummary(sessionData);
+      const focusInstructions = focus_areas.length > 0
+        ? `\n\nFocus your analysis particularly on these areas: ${focus_areas.join(', ')}`
+        : '';
+
+      const systemPrompt = `You are an expert in **prompt engineering** and **AI agent behavior analysis**. You have deep expertise in:
+- Crafting effective system prompts that guide LLM behavior
+- Analyzing agent traces to identify inefficiencies and anti-patterns
+- Optimizing tool-calling agents for better performance
+- Writing clear, actionable instructions that prevent common agent mistakes
+
+Your job is to analyze agent session logs and provide detailed, actionable feedback with a focus on **improving the system prompt**.
+
+You will be given a session log containing:
+- The original question/task
+- Each iteration with tool calls and results
+- Timing information
+- The final report/answer
+
+Analyze the session thoroughly and provide:
+1. **Scores** (0-10): overall quality and efficiency
+2. **Tool Analysis**: identify redundant calls, useful calls, wasted time, missed opportunities
+3. **Reasoning Quality**: evaluate if the agent had a clear plan, exploited results well, adapted strategy
+4. **Issues**: list specific problems with severity levels
+5. **Suggestions**: concrete improvements for the agent
+6. **Prompt Corrections**: For each issue, provide a specific correction
+
+7. **MOST IMPORTANT - Improved System Prompt**: Write a COMPLETE, IMPROVED system prompt that incorporates ALL the corrections. This should be:
+   - A full, ready-to-use system prompt (not fragments)
+   - Long and detailed (several paragraphs)
+   - Include specific instructions to prevent each detected issue
+   - Include examples of good vs bad behavior where relevant
+   - Be written in a clear, directive style that LLMs respond well to
+   - This is the PRIMARY deliverable of your analysis${focusInstructions}`;
+
+      // Build the session content to analyze
+      let sessionContent: string;
+      if (rawPromptsAndResponses.length > 0) {
+        // Use raw prompts and responses (more detailed)
+        sessionContent = `=== SESSION ANALYSIS ===
+
+QUESTION: ${sessionData.question || 'Unknown'}
+CONFIG: max_iterations=${sessionData.config?.maxIterations ?? 'N/A'}, summarize_tool_context=${sessionData.config?.summarizeToolContext ?? 'N/A'}
+
+=== RAW PROMPTS AND RESPONSES ===
+${rawPromptsAndResponses.join('\n')}
+
+=== FINAL RESULT ===
+Report length: ${sessionData.result?.report?.length ?? 0} chars
+Confidence: ${sessionData.result?.confidence ?? 'N/A'}
+Tools used: ${sessionData.result?.toolsUsed?.join(', ') ?? 'N/A'}
+Iterations: ${sessionData.result?.iterations ?? 'N/A'}`;
+      } else {
+        // Fallback to JSON summary
+        sessionContent = sessionSummary;
+      }
+
+      const userTask = `Analyze this agent session and provide detailed feedback:
+
+${sessionContent}`;
+
+      // Define output schema matching SessionAnalysisResult
+      const outputSchema = {
+        overall_score: {
+          type: 'number' as const,
+          description: 'Overall quality score 0-10',
+          required: true,
+        },
+        efficiency_score: {
+          type: 'number' as const,
+          description: 'Efficiency score 0-10 (higher = less waste)',
+          required: true,
+        },
+        tool_analysis: {
+          type: 'object' as const,
+          description: 'Analysis of tool calls',
+          required: true,
+          properties: {
+            total_calls: { type: 'number' as const, description: 'Total number of tool calls' },
+            redundant_calls: { type: 'number' as const, description: 'Number of redundant/duplicate calls' },
+            useful_calls: { type: 'number' as const, description: 'Number of useful calls that contributed to the answer' },
+            wasted_time_ms: { type: 'number' as const, description: 'Estimated wasted time in milliseconds' },
+            missed_opportunities: {
+              type: 'array' as const,
+              items: { type: 'string' as const, description: 'A missed opportunity' },
+              description: 'Tools or approaches the agent should have used but didn\'t',
+            },
+          },
+        },
+        reasoning_quality: {
+          type: 'object' as const,
+          description: 'Quality of agent reasoning',
+          required: true,
+          properties: {
+            clear_plan: { type: 'boolean' as const, description: 'Did the agent have a clear plan?' },
+            exploits_results: { type: 'boolean' as const, description: 'Did the agent use tool results effectively?' },
+            adapts_strategy: { type: 'boolean' as const, description: 'Did the agent adapt when needed?' },
+            avoids_repetition: { type: 'boolean' as const, description: 'Did the agent avoid repeating actions?' },
+          },
+        },
+        issues: {
+          type: 'array' as const,
+          description: 'List of issues detected',
+          required: true,
+          items: {
+            type: 'object' as const,
+            description: 'An issue detected in the session',
+            properties: {
+              type: {
+                type: 'string' as const,
+                enum: ['redundancy', 'inefficiency', 'missed_info', 'wrong_tool', 'loop', 'other'],
+                description: 'Type of issue',
+              },
+              description: { type: 'string' as const, description: 'Detailed description of the issue' },
+              severity: {
+                type: 'string' as const,
+                enum: ['low', 'medium', 'high'],
+                description: 'Severity level',
+              },
+              iteration: { type: 'number' as const, description: 'Iteration where the issue occurred (optional)' },
+              tool_name: { type: 'string' as const, description: 'Tool involved (optional)' },
+            },
+          },
+        },
+        suggestions: {
+          type: 'array' as const,
+          items: { type: 'string' as const, description: 'A suggestion for improvement' },
+          description: 'Concrete suggestions for improvement',
+          required: true,
+        },
+        prompt_corrections: {
+          type: 'array' as const,
+          description: 'System prompt corrections to prevent detected issues',
+          required: true,
+          items: {
+            type: 'object' as const,
+            description: 'A system prompt correction',
+            properties: {
+              issue: { type: 'string' as const, description: 'The issue this correction addresses' },
+              current_behavior: { type: 'string' as const, description: 'What the agent currently does wrong' },
+              suggested_addition: {
+                type: 'string' as const,
+                description: 'Exact text to add to the system prompt (be specific and actionable)',
+              },
+              priority: {
+                type: 'string' as const,
+                enum: ['low', 'medium', 'high'],
+                description: 'Priority of this correction',
+              },
+            },
+          },
+        },
+        summary: {
+          type: 'string' as const,
+          description: 'Human-readable summary of the analysis',
+          required: true,
+        },
+        improved_system_prompt: {
+          type: 'string' as const,
+          description: 'COMPLETE improved system prompt incorporating all corrections. This should be a full, ready-to-use prompt with detailed instructions to prevent all detected issues.',
+          required: true,
+        },
+      };
+
+      // Execute analysis with structured output
+      const requestId = `analyze-session-${Date.now()}`;
+
+      logger.info('Calling executeSingle for session analysis', { requestId });
+
+      const result = await executor.executeSingle<SessionAnalysisResult>({
+        input: { session_data: sessionSummary },
+        inputFields: [{ name: 'session_data', prompt: 'The session log data to analyze' }],
+        systemPrompt,
+        userTask,
+        outputSchema,
+        llmProvider,
+        requestId,
+        caller: 'agent-tools.analyze_agent_session',
+        outputFormat: 'xml',
+      });
+
+      logger.info('Session analysis complete', {
+        overall_score: result.overall_score,
+        efficiency_score: result.efficiency_score,
+        issues_count: result.issues?.length ?? 0,
+        prompt_corrections_count: result.prompt_corrections?.length ?? 0,
+      });
+
+      // Save analysis result to file for later reference
+      const outputDir = path.join(os.homedir(), '.ragforge', 'logs', 'session-analyses');
+      await fs.mkdir(outputDir, { recursive: true });
+
+      const timestamp = getFilenameTimestamp();
+      const outputPath = path.join(outputDir, `analysis-${timestamp}.json`);
+      await fs.writeFile(outputPath, JSON.stringify(result, null, 2), 'utf-8');
+
+      // Also save the improved_system_prompt as a separate .md file for easy reading
+      if (result.improved_system_prompt) {
+        const promptPath = path.join(outputDir, `improved-prompt-${timestamp}.md`);
+        await fs.writeFile(promptPath, `# Improved System Prompt\n\nGenerated: ${timestamp}\n\n---\n\n${result.improved_system_prompt}`, 'utf-8');
+      }
+
+      logger.info('Analysis saved to files', { outputPath });
+
+      // Add output paths to result
+      return {
+        ...result,
+        _output_files: {
+          analysis_json: outputPath,
+          improved_prompt_md: result.improved_system_prompt ? path.join(outputDir, `improved-prompt-${timestamp}.md`) : undefined,
+        },
+      };
+    },
   };
+}
+
+// ============================================
+// Helper Functions
+// ============================================
+
+/**
+ * Build a human-readable summary of a session log for analysis
+ */
+function buildSessionSummary(sessionData: any): string {
+  const lines: string[] = [];
+
+  // Header
+  lines.push('=== SESSION LOG ANALYSIS ===\n');
+
+  // Question
+  if (sessionData.question) {
+    lines.push(`QUESTION: ${sessionData.question}\n`);
+  }
+
+  // Config
+  if (sessionData.config) {
+    lines.push(`CONFIG: max_iterations=${sessionData.config.maxIterations}, summarize_tool_context=${sessionData.config.summarizeToolContext}\n`);
+  }
+
+  // Iterations
+  if (sessionData.iterations && Array.isArray(sessionData.iterations)) {
+    lines.push(`\n=== ITERATIONS (${sessionData.iterations.length} total) ===\n`);
+
+    for (const iter of sessionData.iterations) {
+      lines.push(`\n--- Iteration ${iter.iteration} ---`);
+
+      if (iter.tool_calls && Array.isArray(iter.tool_calls)) {
+        lines.push(`Tool calls: ${iter.tool_calls.length}`);
+
+        for (const tc of iter.tool_calls) {
+          const duration = tc.duration_ms ? ` (${tc.duration_ms}ms)` : '';
+          const success = tc.success ? '✓' : '✗';
+          lines.push(`  ${success} ${tc.tool_name}${duration}`);
+
+          // Arguments summary
+          if (tc.arguments) {
+            const argsStr = JSON.stringify(tc.arguments);
+            lines.push(`    Args: ${argsStr.substring(0, 200)}${argsStr.length > 200 ? '...' : ''}`);
+          }
+
+          // Result summary
+          if (tc.result) {
+            const resultStr = typeof tc.result === 'string' ? tc.result : JSON.stringify(tc.result);
+            lines.push(`    Result: ${resultStr.substring(0, 300)}${resultStr.length > 300 ? '...' : ''}`);
+          }
+
+          if (tc.error) {
+            lines.push(`    Error: ${tc.error}`);
+          }
+        }
+      }
+
+      if (iter.reasoning) {
+        lines.push(`  Reasoning: ${iter.reasoning.substring(0, 200)}...`);
+      }
+    }
+  }
+
+  // Final result
+  if (sessionData.result) {
+    lines.push('\n=== FINAL RESULT ===');
+    lines.push(`Report length: ${sessionData.result.report?.length ?? 0} chars`);
+    lines.push(`Confidence: ${sessionData.result.confidence ?? 'N/A'}`);
+    lines.push(`Tools used: ${sessionData.result.toolsUsed?.join(', ') ?? 'N/A'}`);
+    lines.push(`Iterations: ${sessionData.result.iterations ?? 'N/A'}`);
+
+    if (sessionData.result.report) {
+      lines.push(`\nReport preview:\n${sessionData.result.report.substring(0, 500)}...`);
+    }
+  }
+
+  // Timing
+  if (sessionData.timing) {
+    lines.push('\n=== TIMING ===');
+    lines.push(`Total duration: ${sessionData.timing.total_ms ?? 'N/A'}ms`);
+  }
+
+  return lines.join('\n');
 }

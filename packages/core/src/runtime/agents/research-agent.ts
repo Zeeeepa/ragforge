@@ -19,10 +19,10 @@ import { StructuredLLMExecutor, BaseToolExecutor, LLMParseError, type ToolCallRe
 import { GeminiAPIProvider } from '../reranking/gemini-api-provider.js';
 import { type ToolDefinition } from '../llm/native-tool-calling/index.js';
 import { AgentLogger } from './rag-agent.js';
-import {
-  generateFileTools,
-  type FileToolsContext,
-} from '../../tools/file-tools.js';
+import { createLogger } from '../utils/logger.js';
+
+const logger = createLogger('ResearchAgent');
+// NOTE: read_file, write_file, etc. are now in brain-tools.ts only
 import {
   generateFsTools,
   type FsToolsContext,
@@ -56,6 +56,9 @@ import {
   isFinalizeTool,
   type ReportToolHandlers,
 } from '../utils/report-tools.js';
+
+// Session analysis
+import { runSessionAnalysis, type SessionAnalysisResult } from './session-analyzer.js';
 
 // ============================================
 // Types
@@ -104,6 +107,9 @@ export interface ResearchAgentOptions {
   /** Path to write detailed JSON logs (uses AgentLogger) */
   logPath?: string;
 
+  /** Directory to write individual prompt/response files (for debugging) */
+  promptsDir?: string;
+
   /** Include web tools (fetch_web_page) for web research */
   includeWebTools?: boolean;
 
@@ -124,6 +130,12 @@ export interface ResearchAgentOptions {
 
   /** Called when the report is updated (for streaming incremental updates) */
   onReportUpdate?: (report: string, confidence: 'high' | 'medium' | 'low', missingInfo: string[]) => void;
+
+  /** Enable tool context summarization when context gets too large (default: false) */
+  summarizeToolContext?: boolean;
+
+  /** Threshold in chars to trigger tool context summarization (default: 40000) */
+  toolContextSummarizationThreshold?: number;
 }
 
 export interface ToolCallDetail {
@@ -555,25 +567,33 @@ class ResearchToolExecutor extends BaseToolExecutor {
       const result = handler(args as any);
       const durationMs = Date.now() - startTime;
 
-      // Handle finalize_report specially
-      if (isFinalizeTool(tool_name)) {
+      // Check if the tool's result indicates success
+      // Report tools return { success: boolean, ... }
+      const toolSuccess = result?.success !== false;
+
+      // Handle finalize_report specially (only if successful)
+      if (isFinalizeTool(tool_name) && toolSuccess) {
         this.isReportFinalized = true;
         this.reportConfidence = args.confidence || 'medium';
       }
 
-      // Log successful result
-      this.logger?.logToolResult(tool_name, result, durationMs);
+      // Log result
+      if (toolSuccess) {
+        this.logger?.logToolResult(tool_name, result, durationMs);
+      } else {
+        this.logger?.logToolError(tool_name, result?.error || 'Tool returned failure', durationMs);
+      }
 
       this.toolCallDetails.push({
         tool_name,
         arguments: args,
         result,
-        success: true,
+        success: toolSuccess,
         duration_ms: durationMs,
       });
 
       if (this.onToolResult) {
-        this.onToolResult(tool_name, result, true, durationMs);
+        this.onToolResult(tool_name, result, toolSuccess, durationMs);
       }
 
       // Notify report update callback (for UI streaming)
@@ -619,6 +639,7 @@ export class ResearchAgent {
   private maxResearchRounds: number;
   private verbose: boolean;
   private logger?: AgentLogger;
+  private promptsDir?: string;
 
   // Conversation memory
   private conversationStorage?: ConversationStorage;
@@ -634,6 +655,8 @@ export class ResearchAgent {
   private onToolResult?: (toolName: string, result: any, success: boolean, durationMs: number) => void;
   private onThinking?: (reasoning: string) => void;
   private onReportUpdate?: (report: string, confidence: 'high' | 'medium' | 'low', missingInfo: string[]) => void;
+  private summarizeToolContext: boolean;
+  private toolContextSummarizationThreshold: number;
 
   constructor(
     executor: StructuredLLMExecutor,
@@ -645,6 +668,7 @@ export class ResearchAgent {
       maxResearchRounds?: number;
       verbose?: boolean;
       logPath?: string;
+      promptsDir?: string;
       conversationStorage?: ConversationStorage;
       conversationSummarizer?: ConversationSummarizer;
       embeddingProvider?: GeminiEmbeddingProvider;
@@ -656,6 +680,8 @@ export class ResearchAgent {
       onToolResult?: (toolName: string, result: any, success: boolean, durationMs: number) => void;
       onThinking?: (reasoning: string) => void;
       onReportUpdate?: (report: string, confidence: 'high' | 'medium' | 'low', missingInfo: string[]) => void;
+      summarizeToolContext?: boolean;
+      toolContextSummarizationThreshold?: number;
     }
   ) {
     this.executor = executor;
@@ -665,6 +691,7 @@ export class ResearchAgent {
     this.maxIterations = options.maxIterations ?? 10;
     this.maxResearchRounds = options.maxResearchRounds ?? 5;
     this.verbose = options.verbose ?? false;
+    this.promptsDir = options.promptsDir;
 
     // Create logger if logPath provided
     if (options.logPath) {
@@ -700,6 +727,10 @@ export class ResearchAgent {
     this.onToolResult = options.onToolResult;
     this.onThinking = options.onThinking;
     this.onReportUpdate = options.onReportUpdate;
+
+    // Tool context summarization (disabled by default for full observability)
+    this.summarizeToolContext = options.summarizeToolContext ?? false;
+    this.toolContextSummarizationThreshold = options.toolContextSummarizationThreshold ?? 40000;
   }
 
   /**
@@ -813,21 +844,49 @@ export class ResearchAgent {
     needsDeepHistory: boolean;
     canAnswerDirectly: boolean;
   }> {
+    logger.debug('decideContextNeeds called', {
+      question: question?.substring(0, 100) || '(no question)',
+      recentTurnsCount: recentContext?.recentTurns?.length ?? 0,
+      recentL1SummariesCount: recentContext?.recentL1Summaries?.length ?? 0,
+    });
+
     // Format recent turns with tool calls for the decision prompt
-    const turnsText = recentContext.recentTurns.length > 0
-      ? recentContext.recentTurns.map(turn => {
-          let text = `User: ${turn.userMessage.substring(0, 300)}`;
-          if (turn.toolResults.length > 0) {
-            text += `\nTools used: ${turn.toolResults.map(t => `${t.toolName}(${t.success ? '✓' : '✗'})`).join(', ')}`;
+    const turnsText = recentContext?.recentTurns?.length > 0
+      ? recentContext.recentTurns.map((turn, idx) => {
+          // Defensive checks with logging
+          if (!turn) {
+            logger.warn(`decideContextNeeds: turn at index ${idx} is undefined`);
+            return '(invalid turn)';
           }
-          text += `\nAssistant: ${turn.assistantMessage.substring(0, 300)}`;
+          if (turn.userMessage === undefined || turn.userMessage === null) {
+            logger.warn(`decideContextNeeds: turn.userMessage at index ${idx} is undefined`, { turn });
+          }
+          if (turn.assistantMessage === undefined || turn.assistantMessage === null) {
+            logger.warn(`decideContextNeeds: turn.assistantMessage at index ${idx} is undefined`, { turn });
+          }
+
+          const userMsg = turn.userMessage ?? '';
+          const assistantMsg = turn.assistantMessage ?? '';
+
+          let text = `User: ${userMsg.substring(0, 300)}`;
+          if (turn.toolResults?.length > 0) {
+            text += `\nTools used: ${turn.toolResults.map(t => `${t?.toolName || 'unknown'}(${t?.success ? '✓' : '✗'})`).join(', ')}`;
+          }
+          text += `\nAssistant: ${assistantMsg.substring(0, 300)}`;
           return text;
         }).join('\n---\n')
       : '(no previous messages)';
 
     // Add L1 summaries if available
-    const l1Text = recentContext.recentL1Summaries.length > 0
-      ? `\n\nOlder conversation summaries:\n${recentContext.recentL1Summaries.map(s => `- ${s.content.conversation_summary.substring(0, 200)}`).join('\n')}`
+    const l1Text = recentContext?.recentL1Summaries?.length > 0
+      ? `\n\nOlder conversation summaries:\n${recentContext.recentL1Summaries.map((s, idx) => {
+          // Defensive checks with logging
+          if (!s?.content?.conversation_summary) {
+            logger.warn(`decideContextNeeds: L1 summary at index ${idx} missing conversation_summary`, { summary: s });
+            return '- (invalid summary)';
+          }
+          return `- ${s.content.conversation_summary.substring(0, 200)}`;
+        }).join('\n')}`
       : '';
 
     const decisionPrompt = `You are a routing assistant. Analyze the user's message and decide what context is needed.
@@ -877,6 +936,7 @@ Examples:
         },
         maxIterations: 1, // No tools, just decision
         llmProvider: this.llmProvider,
+        caller: 'ResearchAgent.decideContext',
         logPrompts: false,
         logResponses: false,
       });
@@ -1041,6 +1101,17 @@ Examples:
    * Perform research on a question
    */
   async research(question: string, history?: ChatMessage[]): Promise<ResearchResult> {
+    if (!question) {
+      logger.error('research() called with undefined/null question');
+      throw new Error('ResearchAgent.research() requires a question');
+    }
+
+    logger.info('research() started', {
+      questionPreview: question.substring(0, 100),
+      questionLength: question.length,
+      historyLength: history?.length ?? 0,
+    });
+
     if (this.verbose) {
       console.log(`\n[ResearchAgent] Research: "${question}"`);
     }
@@ -1104,24 +1175,36 @@ Examples:
     let systemPrompt = RESEARCH_SYSTEM_PROMPT.replace('{CWD_PLACEHOLDER}', cwdInfo);
 
     // Add recent conversation context with tool calls (always included, fast)
-    if (recentContext.recentTurns.length > 0) {
+    if (recentContext?.recentTurns?.length > 0) {
       let contextText = '## Recent Conversation\n';
       for (const turn of recentContext.recentTurns) {
-        contextText += `**User:** ${turn.userMessage}\n`;
-        if (turn.toolResults.length > 0) {
-          contextText += `**Tools used:** ${turn.toolResults.map(t =>
-            `${t.toolName}(${t.success ? 'success' : 'failed'})`
+        if (!turn) {
+          logger.warn('research(): skipping undefined turn in recentTurns');
+          continue;
+        }
+        const userMsg = turn.userMessage ?? '(no message)';
+        const assistantMsg = turn.assistantMessage ?? '(no response)';
+        const toolResults = turn.toolResults ?? [];
+
+        contextText += `**User:** ${userMsg}\n`;
+        if (toolResults.length > 0) {
+          contextText += `**Tools used:** ${toolResults.map(t =>
+            `${t?.toolName || 'unknown'}(${t?.success ? 'success' : 'failed'})`
           ).join(', ')}\n`;
         }
-        contextText += `**Assistant:** ${turn.assistantMessage}\n\n`;
+        contextText += `**Assistant:** ${assistantMsg}\n\n`;
       }
       systemPrompt = `${systemPrompt}\n\n${contextText}`;
     }
 
     // Add L1 summaries if available
-    if (recentContext.recentL1Summaries.length > 0) {
+    if (recentContext?.recentL1Summaries?.length > 0) {
       let summaryText = '## Earlier Conversation Summaries\n';
       for (const summary of recentContext.recentL1Summaries) {
+        if (!summary?.content?.conversation_summary) {
+          logger.warn('research(): skipping invalid L1 summary', { summary });
+          continue;
+        }
         summaryText += `- ${summary.content.conversation_summary}\n`;
         if (summary.content.actions_summary) {
           summaryText += `  Actions: ${summary.content.actions_summary}\n`;
@@ -1171,8 +1254,15 @@ Examples:
         maxIterations: this.maxIterations,
         toolExecutor,
         llmProvider: this.llmProvider,
-        logPrompts: this.verbose,
-        logResponses: this.verbose,
+        // Provide current report content for display in prompt
+        getCurrentReport: () => toolExecutor.getReportContent() || null,
+        // Enable tool context summarization when context gets too large (prevents repetition)
+        summarizeToolContext: this.summarizeToolContext,
+        toolContextSummarizationThreshold: this.toolContextSummarizationThreshold,
+        caller: 'ResearchAgent.iterate',
+        // Log to promptsDir if set (for full observability), otherwise use verbose flag
+        logPrompts: this.promptsDir ? this.promptsDir + '/' : this.verbose,
+        logResponses: this.promptsDir ? this.promptsDir + '/' : this.verbose,
         onLLMResponse: (response) => {
           turns++; // Count each LLM call
           outerIteration = response.iteration;
@@ -1254,17 +1344,47 @@ Examples:
         iterations: outerIteration,
       });
 
+      // Auto-analyze session if promptsDir is set
+      if (this.promptsDir) {
+        // Run analysis in background (don't block return)
+        runSessionAnalysis(this.promptsDir, question, this.maxIterations)
+          .then(analysis => {
+            if (analysis) {
+              logger.info('Auto-analysis completed', {
+                overall_score: analysis.overall_score,
+                efficiency_score: analysis.efficiency_score,
+                issues: analysis.issues?.length ?? 0,
+              });
+            }
+          })
+          .catch(err => {
+            logger.warn('Auto-analysis failed', { error: err.message });
+          });
+      }
+
       return result_final;
     } catch (error: any) {
       // Check if this is an LLM parse error with raw response
       const isParseError = error instanceof LLMParseError;
-      const rawResponse = isParseError ? error.responsePreview : undefined;
+      // Use full rawResponse for debugging, not the truncated responsePreview
+      const rawResponse = isParseError ? error.rawResponse : undefined;
+
+      logger.error('research() failed', {
+        message: error.message,
+        name: error.name,
+        stack: error.stack,
+        isParseError,
+        rawResponse, // Full raw response for debugging - do not truncate
+        toolsUsed: toolExecutor?.toolsUsed ?? [],
+        turns,
+        outerIteration,
+      });
 
       console.error(`[ResearchAgent] Research failed:`, {
         message: error.message,
         name: error.name,
-        stack: error.stack?.split('\n').slice(0, 3).join('\n'),
-        ...(rawResponse && { rawResponse }),
+        stack: error.stack?.split('\n').slice(0, 5).join('\n'),
+        rawResponse, // Full raw response for debugging
       });
 
       // Log error to AgentLogger with raw response if available
@@ -1297,7 +1417,11 @@ Examples:
    * Simple chat method for conversational interaction
    */
   async chat(message: string, history?: ChatMessage[]): Promise<ChatResponse> {
-    console.log(`[ResearchAgent] chat() called with message: "${message.substring(0, 50)}..."`);
+    if (!message) {
+      logger.error('chat() called with undefined/null message');
+      throw new Error('ResearchAgent.chat() requires a message');
+    }
+    logger.info('chat() called', { messagePreview: message.substring(0, 50), historyLength: history?.length ?? 0 });
 
     const result = await this.research(message, history);
 
@@ -1380,27 +1504,16 @@ export async function createResearchAgent(options: ResearchAgentOptions): Promis
   const tools: GeneratedToolDefinition[] = [];
   const handlers: Record<string, (args: Record<string, any>) => Promise<any>> = {};
 
-  // 1. File tools - use brain-aware read_file if brainManager available
-  if (options.brainManager) {
-    // Use brain-aware read_file (same as MCP tools)
-    const brainCtx: BrainToolsContext = {
-      brain: options.brainManager,
-    };
-    const readFileTool = generateBrainReadFileTool();
-    tools.push(readFileTool);
-    handlers['read_file'] = generateBrainReadFileHandler(brainCtx);
-  } else {
-    // Fallback to file-tools read_file (less features but works without brain)
-    const fileCtx: FileToolsContext = {
-      projectRoot: options.projectRoot || options.cwd || process.cwd(),
-    };
-    const fileTools = generateFileTools(fileCtx);
-    const readFileTool = fileTools.tools.find((t) => t.name === 'read_file');
-    if (readFileTool) {
-      tools.push(readFileTool);
-      handlers['read_file'] = fileTools.handlers['read_file'];
-    }
+  // 1. File tools - brain-aware (requires brainManager)
+  if (!options.brainManager) {
+    throw new Error('ResearchAgent requires brainManager option');
   }
+  const brainCtx: BrainToolsContext = {
+    brain: options.brainManager,
+  };
+  const readFileTool = generateBrainReadFileTool();
+  tools.push(readFileTool);
+  handlers['read_file'] = (args) => generateBrainReadFileHandler(brainCtx)(args as any);
 
   // 2. FS tools (exploration only)
   const fsCtx: FsToolsContext = {
@@ -1417,46 +1530,42 @@ export async function createResearchAgent(options: ResearchAgentOptions): Promis
     }
   }
 
-  // 3. Brain tools (if brainManager provided)
-  if (options.brainManager) {
-    const brainCtx: BrainToolsContext = {
-      brain: options.brainManager,
-    };
+  // 3. Brain tools (brainCtx already defined above)
+  // brain_search - wrapped to force glob filter on cwd
+  const brainSearchTool = generateBrainSearchTool();
+  tools.push(brainSearchTool);
+  const brainSearchHandler = generateBrainSearchHandler(brainCtx);
 
-    // brain_search - wrapped to force glob filter on cwd
-    const brainSearchTool = generateBrainSearchTool();
-    tools.push(brainSearchTool);
-    const brainSearchHandler = generateBrainSearchHandler(brainCtx);
+  // Wrap handler to auto-add base_path filter for cwd (filtered in Cypher, more efficient than glob)
+  const cwd = options.cwd;
+  handlers['brain_search'] = async (args) => {
+    // If cwd is set and no base_path is specified, add base_path filter
+    if (cwd && !args.base_path) {
+      // Normalize: ensure cwd ends without slash
+      args.base_path = cwd.endsWith('/') ? cwd.slice(0, -1) : cwd;
+    }
+    // Force summarization to reduce context size and focus on relevant info
+    args.summarize = true;
+    return brainSearchHandler(args as any);
+  };
 
-    // Wrap handler to auto-add base_path filter for cwd (filtered in Cypher, more efficient than glob)
-    const cwd = options.cwd;
-    handlers['brain_search'] = async (args) => {
-      // If cwd is set and no base_path is specified, add base_path filter
-      if (cwd && !args.base_path) {
-        // Normalize: ensure cwd ends without slash
-        args.base_path = cwd.endsWith('/') ? cwd.slice(0, -1) : cwd;
-      }
-      return brainSearchHandler(args as any);
-    };
+  // ingest_directory
+  const ingestTool = generateIngestDirectoryTool();
+  tools.push(ingestTool);
+  const ingestHandler = generateIngestDirectoryHandler(brainCtx);
+  handlers['ingest_directory'] = (args) => ingestHandler(args as any);
 
-    // ingest_directory
-    const ingestTool = generateIngestDirectoryTool();
-    tools.push(ingestTool);
-    const ingestHandler = generateIngestDirectoryHandler(brainCtx);
-    handlers['ingest_directory'] = (args) => ingestHandler(args as any);
+  // explore_node - explore relationships of any node by UUID
+  const exploreNodeTool = generateExploreNodeTool();
+  tools.push(exploreNodeTool);
+  const exploreNodeHandler = generateExploreNodeHandler(brainCtx);
+  handlers['explore_node'] = (args) => exploreNodeHandler(args as any);
 
-    // explore_node - explore relationships of any node by UUID
-    const exploreNodeTool = generateExploreNodeTool();
-    tools.push(exploreNodeTool);
-    const exploreNodeHandler = generateExploreNodeHandler(brainCtx);
-    handlers['explore_node'] = (args) => exploreNodeHandler(args as any);
-
-    // read_files - batch read multiple files at once
-    const readFilesTool = generateBrainReadFilesTool();
-    tools.push(readFilesTool);
-    const readFilesHandler = generateBrainReadFilesHandler(brainCtx);
-    handlers['read_files'] = (args) => readFilesHandler(args as any);
-  }
+  // read_files - batch read multiple files at once
+  const readFilesTool = generateBrainReadFilesTool();
+  tools.push(readFilesTool);
+  const readFilesHandler = generateBrainReadFilesHandler(brainCtx);
+  handlers['read_files'] = (args) => readFilesHandler(args as any);
 
   // 4. Web tools (optional)
   if (options.includeWebTools) {
@@ -1470,6 +1579,7 @@ export async function createResearchAgent(options: ResearchAgentOptions): Promis
     maxIterations: options.maxIterations ?? 15,
     verbose: options.verbose ?? false,
     logPath: options.logPath,
+    promptsDir: options.promptsDir,
     conversationStorage: options.conversationStorage,
     conversationSummarizer: options.conversationSummarizer,
     embeddingProvider: options.embeddingProvider,

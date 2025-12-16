@@ -3236,6 +3236,7 @@ This directory is ${cwdStats.dominantType === 'code' ? 'primarily code files' : 
 - brain_search returns absolute file paths in the 'filePath' field
 - grep_files returns relative paths from projectRoot
 - This is for initial context gathering - maximize results coverage!`,
+        caller: 'ConversationStorage.searchCodeFuzzyWithLLM',
         userTask: `Search files for: "${userMessage.substring(0, 200)}". Use MULTIPLE file system tool calls to find relevant content. Make all tool calls in parallel.`
       });
 
