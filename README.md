@@ -109,6 +109,36 @@ Compatible with local models and cloud APIs:
 | **Recursive sub-agents** | Spawn agents for complex tasks |
 | **MCP exposure** | Full tool access for advanced models |
 
+### ResearchAgent
+
+The **ResearchAgent** is an autonomous agent optimized for codebase exploration and documentation:
+
+```bash
+# Via CLI
+ragforge agent --ask "How does authentication work in this project?"
+
+# Via MCP (from Claude or other clients)
+call_research_agent({ question: "Explain the database schema" })
+```
+
+**What it does:**
+- Searches the knowledge graph with `brain_search`
+- Reads relevant files automatically
+- Explores code relationships with `explore_node`
+- Builds a comprehensive markdown report with citations
+- Returns confidence level (high/medium/low)
+
+**Example output:**
+```
+{
+  "report": "# Authentication System\n\n## Overview\n...",
+  "confidence": "high",
+  "sourcesUsed": ["src/auth.ts", "src/middleware/jwt.ts"],
+  "toolsUsed": ["brain_search", "read_file", "explore_node"],
+  "iterations": 3
+}
+```
+
 ---
 
 ## Media Generation
@@ -127,24 +157,44 @@ Compatible with local models and cloud APIs:
 
 ## Quick Start
 
+### Prerequisites
+
+- **Docker** - Required for Neo4j database
+  - [Install Docker Desktop](https://www.docker.com/products/docker-desktop/) (Windows/macOS)
+  - Or `sudo apt install docker.io` (Linux)
+
 ### 1. Install
 
 ```bash
 npm install -g @luciformresearch/ragforge-cli
 ```
 
-### 2. Setup credentials
+### 2. Setup (Docker + Neo4j)
 
 ```bash
-# ~/.ragforge/.env (global) or project/.ragforge/.env
-NEO4J_URI=bolt://localhost:7687
-NEO4J_USERNAME=neo4j
-NEO4J_PASSWORD=your-password
-GEMINI_API_KEY=your-gemini-key        # For embeddings & image gen
-REPLICATE_API_TOKEN=your-token        # For 3D generation (optional)
+ragforge setup
 ```
 
-### 3. Talk to the agent
+This will:
+- ✅ Check Docker is installed and running
+- ✅ Create a Neo4j container (`ragforge-neo4j`)
+- ✅ Configure `~/.ragforge/.env` automatically
+
+**Options:**
+```bash
+ragforge setup --password myPassword  # Custom Neo4j password
+ragforge setup --force                # Recreate container
+```
+
+### 3. Add your API key
+
+```bash
+# Add to ~/.ragforge/.env
+GEMINI_API_KEY=your-gemini-key        # Required for embeddings & search
+REPLICATE_API_TOKEN=your-token        # Optional, for 3D generation
+```
+
+### 4. Talk to the agent
 
 ```bash
 # Ask a question about your codebase
@@ -164,7 +214,38 @@ ragforge agent --ask "Generate a 3D model of a rubber duck"
 
 ## MCP Server
 
-RagForge exposes all tools via **Model Context Protocol** for use with Claude, GPT, and other MCP-compatible clients:
+RagForge exposes all tools via **Model Context Protocol** for use with Claude, GPT, and other MCP-compatible clients.
+
+### Setup for Claude Code (CLI)
+
+1. **Build RagForge** (if from source):
+```bash
+cd ragforge && npm install && npm run build
+```
+
+2. **Add to Claude Code config** (`~/.claude/claude_desktop_config.json`):
+```json
+{
+  "mcpServers": {
+    "ragforge": {
+      "command": "node",
+      "args": ["/path/to/ragforge/packages/cli/dist/mcp.js"],
+      "env": {
+        "GEMINI_API_KEY": "your-key"
+      }
+    }
+  }
+}
+```
+
+3. **Restart Claude Code** and verify tools are available:
+```
+/mcp
+```
+
+### Setup for Claude Desktop
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or equivalent:
 
 ```json
 {
@@ -177,13 +258,28 @@ RagForge exposes all tools via **Model Context Protocol** for use with Claude, G
 }
 ```
 
-Available tools via MCP:
-- `brain_search`, `ingest_directory`, `ingest_web_page`
-- `read_file`, `write_file`, `edit_file`, `delete_path`
-- `run_command`, `git_status`, `git_diff`
-- `generate_image`, `generate_3d_from_text`, `render_3d_asset`
-- `fetch_web_page`, `search_web`
-- `exclude_project`, `include_project` (filter brain search)
+### Using RagForge from Claude
+
+Once connected, you can ask Claude to use RagForge tools:
+
+```
+"Use brain_search to find authentication code in my project"
+"Ingest the ./src directory and search for API endpoints"
+"Call the research agent to explain how the database layer works"
+```
+
+**Key tools available via MCP:**
+
+| Category | Tools |
+|----------|-------|
+| **Search** | `brain_search`, `grep_files`, `search_files` |
+| **Files** | `read_file`, `write_file`, `edit_file`, `delete_path` |
+| **Ingestion** | `ingest_directory`, `ingest_web_page`, `forget_path` |
+| **Agent** | `call_research_agent` (autonomous research) |
+| **Git** | `run_command`, `git_status`, `git_diff` |
+| **Media** | `generate_image`, `generate_3d_from_text`, `render_3d_asset` |
+| **Web** | `fetch_web_page`, `search_web` |
+| **Admin** | `exclude_project`, `include_project`, `list_brain_projects` |
 
 ---
 
@@ -220,6 +316,7 @@ ragforge/
 - [x] Image & 3D generation
 - [x] MCP server integration
 - [x] Project exclusion from search
+- [ ] Local model support (Ollama)
 - [ ] API crawler (Swagger/OpenAPI)
 - [ ] Database crawler (schema extraction)
 - [ ] Terminal UI with Ink (React)
