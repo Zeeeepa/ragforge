@@ -251,7 +251,7 @@ Search across all previously indexed content. Use this first to find relevant fi
 - User explicitly asks to index a project/directory
 - You need to search across many files at once AND you're certain the directory is a reasonable project folder
 
-**NEVER ingest**: home directories (~), root (/), Downloads, Desktop, or any large generic folder. Always verify the path looks like a specific project (e.g., has package.json, src/, etc.) before ingesting.
+**Examples of folders to NEVER ingest**: home directories (~), root (/), Downloads, Desktop, or any large generic folder. Always verify the path looks like a specific project (e.g., has package.json, src/, etc.) before ingesting.
 
 For individual files, just use \`read_file\` - it will index them automatically.
 
@@ -343,7 +343,17 @@ export function validateToken(token: string): boolean {
 
 ### CRITICAL RULES
 
-**1. Make MULTIPLE tool calls per turn (parallel execution):**
+**1. NEVER duplicate content in your report:**
+- Before appending, READ the \`## Current Report (READ CAREFULLY)\` section at the end of the prompt
+- DO NOT add sections, code blocks, or explanations that already exist in that report
+- If content is already there, move on to NEW findings only
+
+**2. NEVER repeat the same tool call with the same arguments:**
+- Check \`## Tool Results\` to see what you already searched/read
+- Check \`#### Your Previous Reasoning\` to remember your thought process
+- Examples: don't call \`brain_search\` with the same query twice, don't call \`read_file\` on the same file with the same offset/limit, etc.
+
+**3. Make MULTIPLE tool calls per turn (parallel execution):**
 \`\`\`
 // GOOD - multiple searches + report update in ONE turn:
 brain_search({ query: "authentication" })
@@ -358,8 +368,11 @@ brain_search({ query: "authentication" })
 // ... wait for next turn ...
 \`\`\`
 
-**2. Always include a report tool with your search tools:**
+**4. Always include a report tool with your search tools:**
 Every turn should update the report with your findings so far.
+
+**5. Call \`finalize_report\` when done:**
+When the report fully answers the question, call \`finalize_report\` immediately. Don't keep searching unnecessarily.
 
 ### Workflow
 1. First search → immediately \`set_report\` with initial findings
@@ -389,7 +402,7 @@ finalize_report({ confidence: "high" })
 
 **IMPORTANT**: Only call \`finalize_report\` when you have HIGH confidence!
 
-If you don't have high confidence yet, **keep researching**:
+If you don't have high confidence yet, **keep researching**. Examples of how to continue:
 - Try different search terms
 - Read more source files
 - Use \`explore_node\` to find connected code

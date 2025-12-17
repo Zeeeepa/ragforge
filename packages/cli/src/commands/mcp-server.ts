@@ -227,16 +227,28 @@ async function prepareToolsForMcp(
     brainProxy: null,
   };
 
-  // Initialize Brain Proxy (connects to daemon for all brain operations)
-  // This ensures single point of access to Neo4j and file watchers
-  try {
-    log('info', 'Initializing Brain Proxy (daemon mode)...');
-    ctx.brainProxy = await getDaemonBrainProxy();
-    log('info', 'Brain Proxy initialized (connected to daemon)');
-  } catch (error: any) {
-    log('debug', `Brain Proxy init failed: ${error.message}`);
-    log('debug', 'Brain tools will be disabled');
-  }
+  // Start daemon in background (don't block MCP server startup)
+  // Tools will connect to daemon lazily via callToolViaDaemon() which has its own ensureDaemonRunning()
+  // This prevents MCP timeout when daemon takes time to initialize (Neo4j, watchers, etc.)
+  log('info', 'Starting daemon in background (non-blocking)...');
+  ensureDaemonRunning(false).then(ready => {
+    if (ready) {
+      log('info', 'Daemon ready');
+      // Pre-warm brain proxy for faster first tool call
+      getDaemonBrainProxy()
+        .then(proxy => {
+          ctx.brainProxy = proxy;
+          log('debug', 'Brain proxy pre-warmed');
+        })
+        .catch(() => {
+          // Ignore - will be initialized lazily on first tool call
+        });
+    } else {
+      log('debug', 'Daemon startup returned false (will retry on first tool call)');
+    }
+  }).catch(err => {
+    log('debug', `Daemon background start failed: ${err.message} (will retry on first tool call)`);
+  });
 
   // Cached config for dynamic context
   let cachedConfig: RagForgeConfig | null = null;

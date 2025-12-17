@@ -427,12 +427,12 @@ export type PromptSection =
 export const DEFAULT_PROMPT_SEQUENCE: PromptSection[] = [
   'system_prompt',
   'tool_descriptions',
-  'current_report',
   'user_task',
   'context_data',
   'input_fields',
-  'tool_results',
-  'previous_output',
+  'previous_output',   // Your previous reasoning, which led to...
+  'tool_results',      // ...these tool results
+  'current_report',    // Current report state (read carefully before appending!)
   'output_format',
   'instructions',
 ];
@@ -1170,8 +1170,15 @@ Sois concis et actionnable.`;
     if (!currentReport || currentReport.trim().length === 0) return null;
 
     const lines: string[] = [
-      '## Current Report',
-      'This is your report in progress. Update it with new findings using set_report or append_to_report:',
+      '## Current Report (READ CAREFULLY)',
+      '',
+      '**IMPORTANT RULES:**',
+      '- DO NOT add content that already exists in the report below',
+      '- DO NOT repeat sections, code blocks, or explanations already present',
+      '- ONLY append NEW information not already covered',
+      '- When the report is COMPLETE and answers the question fully, call `finalize_report` immediately',
+      '',
+      'Your report in progress:',
       '```markdown',
       currentReport,
       '```',
