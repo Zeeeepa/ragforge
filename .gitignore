@@ -26,6 +26,10 @@ dist/
 
 # Build outputs
 *.tsbuildinfo
+out/
+
+# Tesseract OCR data
+*.traineddata
 
 # IDE
 .vscode/
