@@ -12,7 +12,7 @@
  * may be deprecated entirely.
  */
 
-import { globby } from 'globby';
+import fg from 'fast-glob';
 import { createHash } from 'crypto';
 import * as path from 'path';
 import * as fs from 'fs/promises';
@@ -83,6 +83,7 @@ import {
   type PDFInfo,
   type DOCXInfo,
 } from './document-file-parser.js';
+import { DEFAULT_EXCLUDE_PATTERNS } from '../../ingestion/constants.js';
 
 const execAsync = promisify(exec);
 
@@ -430,7 +431,8 @@ export class CodeSourceAdapter extends SourceAdapter {
       packageJsonFiles,
       dataFiles,
       mediaFiles,
-      documentFiles
+      documentFiles,
+      fileMetadata
     } = await this.parseFiles(files, config, (current) => {
       options.onProgress?.({
         phase: 'parsing',
@@ -449,6 +451,10 @@ export class CodeSourceAdapter extends SourceAdapter {
       percentComplete: 100
     });
 
+    console.log(`✅ Parsing complete. Starting buildGraph...`);
+    console.log(`   Code: ${codeFiles.size}, HTML: ${htmlFiles.size}, CSS: ${cssFiles.size}, SCSS: ${scssFiles.size}`);
+    console.log(`   Vue: ${vueFiles.size}, Svelte: ${svelteFiles.size}, Markdown: ${markdownFiles.size}, Generic: ${genericFiles.size}`);
+
     // Build graph structure
     // Use provided projectId if available, otherwise fall back to project:name format
     const generatedProjectId = options.projectId || `project:${projectInfo.name}`;
@@ -464,8 +470,9 @@ export class CodeSourceAdapter extends SourceAdapter {
       packageJsonFiles,
       dataFiles,
       mediaFiles,
-      documentFiles
-    }, config, resolver, projectInfo, generatedProjectId);
+      documentFiles,
+      fileMetadata
+    }, config, resolver, projectInfo, generatedProjectId, options.existingUUIDMapping);
 
     // Export XML if requested
     if (config.options?.exportXml) {
@@ -491,20 +498,16 @@ export class CodeSourceAdapter extends SourceAdapter {
    */
   private async discoverFiles(config: CodeSourceConfig): Promise<string[]> {
     const patterns = config.include || ['**/*.ts', '**/*.tsx', '**/*.py', 'package.json'];
-    const ignore = config.exclude || [
-      '**/node_modules/**',
-      '**/dist/**',
-      '**/.git/**',
-      '**/.ragforge/**',
-      '**/__pycache__/**',
-      '**/target/**',
-      '**/*.test.ts',
-      '**/*.spec.ts'
-    ];
+    const ignore = config.exclude || DEFAULT_EXCLUDE_PATTERNS;
 
     const cwd = config.root || process.cwd();
 
-    const files = await globby(patterns, {
+    console.log(`🔍 discoverFiles:`);
+    console.log(`   cwd: ${cwd}`);
+    console.log(`   include: ${patterns.slice(0, 5).join(', ')}${patterns.length > 5 ? ` (+${patterns.length - 5} more)` : ''}`);
+    console.log(`   exclude: ${ignore.slice(0, 5).join(', ')}${ignore.length > 5 ? ` (+${ignore.length - 5} more)` : ''}`);
+
+    const files = await fg(patterns, {
       cwd,
       ignore,
       absolute: true
@@ -578,6 +581,7 @@ export class CodeSourceAdapter extends SourceAdapter {
     dataFiles: Map<string, DataFileInfo>;
     mediaFiles: Map<string, MediaFileInfo>;
     documentFiles: Map<string, DocumentFileInfo>;
+    fileMetadata: Map<string, { rawContentHash: string; mtime: string }>;
   }> {
     const codeFiles = new Map<string, ScopeFileAnalysis>();
     const htmlFiles = new Map<string, HTMLParseResult>();
@@ -591,6 +595,8 @@ export class CodeSourceAdapter extends SourceAdapter {
     const dataFiles = new Map<string, DataFileInfo>();
     const mediaFiles = new Map<string, MediaFileInfo>();
     const documentFiles = new Map<string, DocumentFileInfo>();
+    // Pre-computed file metadata (hash + mtime) to avoid re-reading files in buildGraph
+    const fileMetadata = new Map<string, { rawContentHash: string; mtime: string }>();
 
     // Use p-limit for parallel processing (10 concurrent files)
     const limit = pLimit(10);
@@ -608,6 +614,7 @@ export class CodeSourceAdapter extends SourceAdapter {
     const needsMd = files.some(f => /\.mdx?$/i.test(f));
 
     // Initialize parsers in parallel
+    console.log(`🔧 Initializing parsers: TS=${needsTs}, Py=${needsPy}, Vue=${needsVue}, Svelte=${needsSvelte}, HTML=${needsHtml}, CSS=${needsCss}, SCSS=${needsScss}, MD=${needsMd}`);
     await Promise.all([
       needsTs && this.registry.initializeParser('typescript').catch(() => {}),
       needsPy && this.registry.initializeParser('python').catch(() => {}),
@@ -618,9 +625,11 @@ export class CodeSourceAdapter extends SourceAdapter {
       needsScss && this.getScssParser().catch(() => {}),
       needsMd && this.getMarkdownParser().catch(() => {}),
     ].filter(Boolean));
+    console.log(`✅ All parsers initialized`);
 
     // Parse single file and return typed result
     const parseFile = async (file: string): Promise<void> => {
+      console.log(`📄 [${filesProcessed + 1}/${files.length}] ${file}`);
       try {
         // Handle document files first (PDF, DOCX, XLSX - binary with full text extraction)
         if (isDocumentFile(file)) {
@@ -648,7 +657,19 @@ export class CodeSourceAdapter extends SourceAdapter {
           return;
         }
 
-        const content = await import('fs').then(fs => fs.promises.readFile(file, 'utf-8'));
+        const fsModule = await import('fs');
+        const [content, stat] = await Promise.all([
+          fsModule.promises.readFile(file, 'utf-8'),
+          fsModule.promises.stat(file)
+        ]);
+        console.log(`   📖 Read ${file} (${content.length} chars)`);
+
+        // Pre-compute file metadata (hash + mtime) in parallel with parsing
+        const rawContentHash = createHash('sha256').update(content).digest('hex');
+        fileMetadata.set(file, {
+          rawContentHash,
+          mtime: formatLocalDate(stat.mtime)
+        });
 
         // Handle package.json files
         if (this.isPackageJson(file)) {
@@ -656,6 +677,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           if (pkgInfo) {
             packageJsonFiles.set(file, pkgInfo);
           }
+          console.log(`   ✅ Done: ${file} (package.json)`);
           return;
         }
 
@@ -701,8 +723,11 @@ export class CodeSourceAdapter extends SourceAdapter {
 
         // Handle Markdown files
         if (this.isMarkdownFile(file)) {
+          console.log(`   🔹 MD: getting parser for ${file}`);
           const mdParser = await this.getMarkdownParser();
-          const result = await mdParser.parseFile(file, content, { parseCodeBlocks: true });
+          console.log(`   🔹 MD: parser obtained, parsing ${file}`);
+          const result = await mdParser.parseFile(file, content, { parseCodeBlocks: false }); // Disabled for now - causes parallel deadlock
+          console.log(`   🔹 MD: done ${file}`);
           markdownFiles.set(file, result);
           return;
         }
@@ -712,8 +737,10 @@ export class CodeSourceAdapter extends SourceAdapter {
           try {
             const dataInfo = parseDataFile(file, content);
             dataFiles.set(file, dataInfo);
+            console.log(`   ✅ Done: ${file} (data file)`);
           } catch (err) {
             console.warn(`Failed to parse data file ${file}:`, err);
+            console.log(`   ⚠️ Done with error: ${file} (data file)`);
           }
           return;
         }
@@ -794,11 +821,13 @@ export class CodeSourceAdapter extends SourceAdapter {
     };
 
     // Process all files in parallel with concurrency limit
+    console.log(`🚀 Starting parallel parsing of ${files.length} files (concurrency: 10)...`);
     await Promise.all(
       files.map(file => limit(() => parseFile(file)))
     );
+    console.log(`✅ Parallel parsing complete. Files processed: ${filesProcessed}/${files.length}`);
 
-    return { codeFiles, htmlFiles, cssFiles, scssFiles, vueFiles, svelteFiles, markdownFiles, genericFiles, packageJsonFiles, dataFiles, mediaFiles, documentFiles };
+    return { codeFiles, htmlFiles, cssFiles, scssFiles, vueFiles, svelteFiles, markdownFiles, genericFiles, packageJsonFiles, dataFiles, mediaFiles, documentFiles, fileMetadata };
   }
 
   /**
@@ -851,11 +880,13 @@ export class CodeSourceAdapter extends SourceAdapter {
       dataFiles: Map<string, DataFileInfo>;
       mediaFiles: Map<string, MediaFileInfo>;
       documentFiles: Map<string, DocumentFileInfo>;
+      fileMetadata: Map<string, { rawContentHash: string; mtime: string }>;
     },
     config: CodeSourceConfig,
     resolver: ImportResolver,
     projectInfo: { name: string; gitRemote: string | null; rootPath: string },
-    generatedProjectId: string
+    generatedProjectId: string,
+    existingUUIDMapping?: Map<string, Array<{ uuid: string; file: string; type: string }>>
   ): Promise<ParsedGraph> {
     const {
       codeFiles,
@@ -869,11 +900,18 @@ export class CodeSourceAdapter extends SourceAdapter {
       packageJsonFiles,
       dataFiles,
       mediaFiles,
-      documentFiles
+      documentFiles,
+      fileMetadata
     } = parsedFiles;
     const nodes: ParsedNode[] = [];
     const relationships: ParsedRelationship[] = [];
     const scopeMap = new Map<string, ScopeInfo>(); // uuid -> ScopeInfo
+
+    // Log progress: building graph
+    const totalFiles = codeFiles.size + htmlFiles.size + cssFiles.size + scssFiles.size +
+      vueFiles.size + svelteFiles.size + markdownFiles.size + genericFiles.size +
+      dataFiles.size + mediaFiles.size + documentFiles.size;
+    console.log(`🔨 Building graph for ${totalFiles} files...`);
 
     // Create Project node using the generated projectId
     // This ensures consistency: Project node uuid = projectId used by all other nodes
@@ -928,12 +966,73 @@ export class CodeSourceAdapter extends SourceAdapter {
         to: projectId,
         properties: {}
       });
+
+      // Create File node for package.json (needed for incremental hash tracking)
+      const fileName = path.basename(filePath);
+      const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
+      const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
+      const { rawContentHash, mtime } = fileMetadata.get(filePath) || {};
+
+      nodes.push({
+        labels: ['File'],
+        id: fileUuid,
+        properties: {
+          uuid: fileUuid,
+          path: relPath,
+          absolutePath: filePath,
+          name: fileName,
+          directory,
+          extension: '.json',
+          ...(rawContentHash && { rawContentHash }),
+          ...(mtime && { mtime }),
+        }
+      });
+
+      // Create BELONGS_TO relationship (File -> Project)
+      relationships.push({
+        type: 'BELONGS_TO',
+        from: fileUuid,
+        to: projectId
+      });
+
+      // Create DEFINED_IN relationship (PackageJson -> File)
+      relationships.push({
+        type: 'DEFINED_IN',
+        from: pkgId,
+        to: fileUuid
+      });
     }
+
+    // Store existingUUIDMapping for UUID preservation during re-ingestion
+    // This MUST be set BEFORE buildGlobalUUIDMapping to ensure generateUUID uses it
+    this.existingUUIDMapping = existingUUIDMapping;
 
     // Build global UUID mapping first (needed for parentUUID)
     const globalUUIDMapping = this.buildGlobalUUIDMapping(codeFiles);
 
+    // Merge with existingUUIDMapping from database (for cross-file import resolution)
+    if (existingUUIDMapping) {
+      for (const [name, candidates] of existingUUIDMapping) {
+        const existing = globalUUIDMapping.get(name) || [];
+        // Add existing DB candidates that aren't already in the mapping
+        for (const candidate of candidates) {
+          const isDuplicate = existing.some(e => e.uuid === candidate.uuid);
+          if (!isDuplicate) {
+            existing.push(candidate);
+          }
+        }
+        if (existing.length > 0) {
+          globalUUIDMapping.set(name, existing);
+        }
+      }
+    }
+
     // First pass: Create all scope nodes from code files
+    if (codeFiles.size > 0) {
+      const totalScopes = Array.from(codeFiles.values()).reduce((sum, a) => sum + a.scopes.length, 0);
+      console.log(`   📝 Processing ${codeFiles.size} code files (${totalScopes} scopes)...`);
+    }
+    let codeFilesProcessed = 0;
     for (const [filePath, analysis] of codeFiles) {
       // Calculate relative path from project root
       const relPath = path.relative(projectRoot, filePath);
@@ -1044,8 +1143,8 @@ export class CodeSourceAdapter extends SourceAdapter {
       // Calculate content hash (SHA-256 of parsed scopes - for detecting semantic changes)
       const contentHash = createHash('sha256').update(analysis.scopes.map(s => s.content || '').join('')).digest('hex');
 
-      // Compute file metadata for incremental ingestion
-      const { rawContentHash, mtime } = await this.computeFileMetadata(filePath);
+      // Use pre-computed file metadata (computed during parallel parsing)
+      const { rawContentHash, mtime } = fileMetadata.get(filePath) || {};
 
       const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
       nodes.push({
@@ -1079,6 +1178,12 @@ export class CodeSourceAdapter extends SourceAdapter {
           from: uuid,
           to: UniqueIDHelper.GenerateFileUUID(filePath)
         });
+      }
+
+      // Log progress every 500 files
+      codeFilesProcessed++;
+      if (codeFilesProcessed % 500 === 0) {
+        console.log(`   ⏳ Processed ${codeFilesProcessed}/${codeFiles.size} code files...`);
       }
     }
 
@@ -1142,6 +1247,8 @@ export class CodeSourceAdapter extends SourceAdapter {
     }
 
     // Second pass: Create scope relationships (CONSUMES, etc.)
+    console.log(`   🔗 Building scope relationships...`);
+    let relFilesProcessed = 0;
     for (const [filePath, analysis] of codeFiles) {
       for (const scope of analysis.scopes) {
         const sourceUuid = this.generateUUID(scope, filePath);
@@ -1208,6 +1315,7 @@ export class CodeSourceAdapter extends SourceAdapter {
 
     // Phase 3: Create INHERITS_FROM and IMPLEMENTS relationships from heritage clauses
     // This is more reliable than the heuristic-based detection above
+    console.log(`   🧬 Processing heritage clauses (extends/implements)...`);
     for (const [filePath, analysis] of codeFiles) {
       for (const scope of analysis.scopes) {
         const tsMetadata = (scope as any).languageSpecific?.typescript;
@@ -1263,6 +1371,7 @@ export class CodeSourceAdapter extends SourceAdapter {
     }
 
     // Create ExternalLibrary nodes and USES_LIBRARY relationships
+    console.log(`   📦 Processing external library references...`);
     const externalLibs = new Map<string, Set<string>>(); // library name -> symbols
 
     for (const [filePath, analysis] of codeFiles) {
@@ -1307,6 +1416,10 @@ export class CodeSourceAdapter extends SourceAdapter {
 
     // Create WebDocument nodes for HTML/Vue/Svelte files
     // (Document is reserved for Tika, MarkdownDocument for Markdown)
+    const webFileCount = htmlFiles.size + vueFiles.size + svelteFiles.size;
+    if (webFileCount > 0) {
+      console.log(`   🌐 Processing ${webFileCount} web documents (HTML/Vue/Svelte)...`);
+    }
     for (const [filePath, htmlResult] of htmlFiles) {
       const relPath = path.relative(projectRoot, filePath);
       const doc = htmlResult.document;
@@ -1345,12 +1458,14 @@ export class CodeSourceAdapter extends SourceAdapter {
       const fileName = getLastSegment(relPath);
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = fileName.includes('.') ? fileName.substring(fileName.lastIndexOf('.')) : '';
-      const { rawContentHash, mtime } = await this.computeFileMetadata(filePath);
+      const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
+      const { rawContentHash, mtime } = fileMetadata.get(filePath) || {};
 
       nodes.push({
         labels: ['File'],
-        id: UniqueIDHelper.GenerateFileUUID(filePath),
+        id: fileUuid,
         properties: {
+          uuid: fileUuid,
           path: relPath,
           absolutePath: filePath,
           name: fileName,
@@ -1365,7 +1480,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       // Create BELONGS_TO relationship (File -> Project)
       relationships.push({
         type: 'BELONGS_TO',
-        from: UniqueIDHelper.GenerateFileUUID(filePath),
+        from: fileUuid,
         to: projectId
       });
 
@@ -1373,7 +1488,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       relationships.push({
         type: 'DEFINED_IN',
         from: docId,
-        to: UniqueIDHelper.GenerateFileUUID(filePath)
+        to: fileUuid
       });
 
       // Create Image nodes and relationships
@@ -1475,7 +1590,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           relationships.push({
             type: 'DEFINED_IN',
             from: scopeUuid,
-            to: UniqueIDHelper.GenerateFileUUID(filePath)
+            to: fileUuid
           });
 
           // Create SCRIPT_OF relationship (Scope -> WebDocument)
@@ -1528,7 +1643,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = fileName.includes('.') ? fileName.substring(fileName.lastIndexOf('.')) : '';
       const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
-      const { rawContentHash, mtime } = await this.computeFileMetadata(filePath);
+      const { rawContentHash, mtime } = fileMetadata.get(filePath) || {};
 
       nodes.push({
         labels: ['File'],
@@ -1669,7 +1784,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = fileName.includes('.') ? fileName.substring(fileName.lastIndexOf('.')) : '';
       const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
-      const { rawContentHash: scssRawHash, mtime: scssMtime } = await this.computeFileMetadata(filePath);
+      const { rawContentHash: scssRawHash, mtime: scssMtime } = fileMetadata.get(filePath) || {};
 
       nodes.push({
         labels: ['File'],
@@ -1743,7 +1858,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = '.vue';
       const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
-      const { rawContentHash: vueRawHash, mtime: vueMtime } = await this.computeFileMetadata(filePath);
+      const { rawContentHash: vueRawHash, mtime: vueMtime } = fileMetadata.get(filePath) || {};
 
       nodes.push({
         labels: ['File'],
@@ -1816,7 +1931,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = '.svelte';
       const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
-      const { rawContentHash: svelteRawHash, mtime: svelteMtime } = await this.computeFileMetadata(filePath);
+      const { rawContentHash: svelteRawHash, mtime: svelteMtime } = fileMetadata.get(filePath) || {};
 
       nodes.push({
         labels: ['File'],
@@ -1853,6 +1968,9 @@ export class CodeSourceAdapter extends SourceAdapter {
     }
 
     // Create MarkdownDocument nodes for Markdown files
+    if (markdownFiles.size > 0) {
+      console.log(`   📝 Processing ${markdownFiles.size} markdown documents...`);
+    }
     for (const [filePath, mdResult] of markdownFiles) {
       const relPath = path.relative(projectRoot, filePath);
       const doc = mdResult.document;
@@ -1890,7 +2008,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = fileName.includes('.') ? fileName.substring(fileName.lastIndexOf('.')) : '';
       const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
-      const { rawContentHash: mdRawHash, mtime: mdMtime } = await this.computeFileMetadata(filePath);
+      const { rawContentHash: mdRawHash, mtime: mdMtime } = fileMetadata.get(filePath) || {};
 
       nodes.push({
         labels: ['File'],
@@ -2042,7 +2160,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = fileName.includes('.') ? fileName.substring(fileName.lastIndexOf('.')) : '';
       const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
-      const { rawContentHash: genericRawHash, mtime: genericMtime } = await this.computeFileMetadata(filePath);
+      const { rawContentHash: genericRawHash, mtime: genericMtime } = fileMetadata.get(filePath) || {};
 
       nodes.push({
         labels: ['File'],
@@ -2124,7 +2242,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = fileName.includes('.') ? fileName.substring(fileName.lastIndexOf('.')) : '';
       const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
-      const { rawContentHash: dataRawHash, mtime: dataMtime } = await this.computeFileMetadata(filePath);
+      const { rawContentHash: dataRawHash, mtime: dataMtime } = fileMetadata.get(filePath) || {};
 
       nodes.push({
         labels: ['File'],
@@ -2326,7 +2444,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = path.extname(relPath);
       const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
-      const { rawContentHash: mediaRawHash, mtime: mediaMtime } = await this.computeFileMetadata(filePath);
+      const { rawContentHash: mediaRawHash, mtime: mediaMtime } = fileMetadata.get(filePath) || {};
 
       nodes.push({
         labels: ['File'],
@@ -2422,7 +2540,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = path.extname(relPath);
       const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
-      const { rawContentHash: docRawHash, mtime: docMtime } = await this.computeFileMetadata(filePath);
+      const { rawContentHash: docRawHash, mtime: docMtime } = fileMetadata.get(filePath) || {};
 
       nodes.push({
         labels: ['File'],
@@ -2455,11 +2573,24 @@ export class CodeSourceAdapter extends SourceAdapter {
       this.ensureDirectoryNodes(relPath, directories, nodes, relationships, fileUuid, projectRoot);
     }
 
+    // Log final summary
+    const totalFilesProcessed = codeFiles.size + htmlFiles.size + cssFiles.size + scssFiles.size + vueFiles.size + svelteFiles.size + markdownFiles.size + genericFiles.size + dataFiles.size + mediaFiles.size + documentFiles.size;
+
+    // Count cross-file CONSUMES (where target node is NOT in parsed nodes)
+    const consumesRels = relationships.filter(r => r.type === 'CONSUMES');
+    const nodeIds = new Set(nodes.map(n => n.id));
+    const crossFileConsumes = consumesRels.filter(r => !nodeIds.has(r.to));
+    if (crossFileConsumes.length > 0) {
+      console.log(`   🔗 ${crossFileConsumes.length} cross-file CONSUMES (target in other files)`);
+    }
+
+    console.log(`   ✅ Graph built: ${nodes.length} nodes, ${relationships.length} relationships`);
+
     return {
       nodes,
       relationships,
       metadata: {
-        filesProcessed: codeFiles.size + htmlFiles.size + cssFiles.size + scssFiles.size + vueFiles.size + svelteFiles.size + markdownFiles.size + genericFiles.size + dataFiles.size + mediaFiles.size + documentFiles.size,
+        filesProcessed: totalFilesProcessed,
         nodesGenerated: nodes.length,
         relationshipsGenerated: relationships.length,
         parseTimeMs: 0 // Will be set by caller
@@ -2632,10 +2763,16 @@ export class CodeSourceAdapter extends SourceAdapter {
       .substring(0, 8); // 8-char hash like original
   }
 
+  // Store existing UUIDs from database for re-ingestion (set by buildGraph)
+  private existingUUIDMapping?: Map<string, Array<{ uuid: string; file: string; type: string }>>;
+
   /**
    * Get or generate UUID for a scope
    * Uses signature hash to create stable UUIDs that survive refactoring
    * Cache key format: "name:type:signatureHash"
+   *
+   * IMPORTANT: During re-ingestion, first checks existingUUIDMapping to preserve
+   * existing UUIDs. This ensures MERGE matches existing nodes instead of creating new ones.
    */
   private generateUUID(scope: ScopeInfo, filePath: string): string {
     // Get or create cache for this file
@@ -2653,9 +2790,29 @@ export class CodeSourceAdapter extends SourceAdapter {
       return fileCache.get(cacheKey)!;
     }
 
-    // Generate deterministic UUID based on file path + scope signature
-    // This ensures the same scope always gets the same UUID across ingestions
-    const deterministicInput = `${filePath}:${scope.name}:${scope.type}:${scope.startLine}`;
+    // PRIORITY: Check existingUUIDMapping for re-ingestion scenarios
+    // This preserves UUIDs from the database, ensuring MERGE matches existing nodes
+    if (this.existingUUIDMapping) {
+      const candidates = this.existingUUIDMapping.get(scope.name);
+      if (candidates) {
+        // Find exact match by file and type
+        const exactMatch = candidates.find(c =>
+          filePath.endsWith(c.file) && c.type === scope.type
+        );
+        if (exactMatch) {
+          console.log(`[UUID] Reusing existing UUID for ${scope.name}: ${exactMatch.uuid} (file: ${exactMatch.file})`);
+          fileCache.set(cacheKey, exactMatch.uuid);
+          return exactMatch.uuid;
+        } else {
+          // Debug: log why no match found
+          console.log(`[UUID] No match for ${scope.name} (type=${scope.type}, file=${filePath}). Candidates: ${JSON.stringify(candidates.map(cd => ({ file: cd.file, type: cd.type })))}`);
+        }
+      }
+    }
+
+    // Generate deterministic UUID based on file path + scope signature (NOT line number!)
+    // Using signatureHash ensures the same scope gets the same UUID even if it moves lines
+    const deterministicInput = `${filePath}:${scope.name}:${scope.type}:${signatureHash}`;
     const uuid = UniqueIDHelper.GenerateDeterministicUUID(deterministicInput);
 
     fileCache.set(cacheKey, uuid);
@@ -2862,6 +3019,7 @@ export class CodeSourceAdapter extends SourceAdapter {
     globalUUIDMapping: Map<string, Array<{ uuid: string; file: string; type: string }>>
   ): Promise<string[]> {
     const imports: string[] = [];
+    const DEBUG_SYMBOL = process.env.DEBUG_IMPORT_SYMBOL; // e.g., 'formatAsMarkdown'
 
     // Handle scopes without detailed references
     if (!scope.importReferences || !Array.isArray(scope.importReferences)) {
@@ -2875,23 +3033,50 @@ export class CodeSourceAdapter extends SourceAdapter {
     for (const imp of scope.importReferences.filter(i => i.isLocal)) {
       for (const ref of scope.identifierReferences) {
         if (ref.kind === 'import' && ref.source === imp.source && ref.identifier === imp.imported) {
+          // Debug logging for specific symbol
+          const isDebugSymbol = DEBUG_SYMBOL && imp.imported === DEBUG_SYMBOL;
+          if (isDebugSymbol) {
+            console.log(`\n[DEBUG buildImportReferences] Matched import: ${imp.imported}`);
+            console.log(`  scope: ${scope.name} (${scope.type}) in ${currentFile}`);
+            console.log(`  import source: ${imp.source}`);
+          }
+
           // Resolve the import to actual source file
           let resolvedPath = await resolver.resolveImport(imp.source, currentFile);
+          if (isDebugSymbol) {
+            console.log(`  resolveImport result: ${resolvedPath || 'null'}`);
+          }
 
           // Follow re-exports to find the actual source file where the symbol is defined
           if (resolvedPath) {
+            const beforeFollow = resolvedPath;
             resolvedPath = await resolver.followReExports(resolvedPath, imp.imported);
+            if (isDebugSymbol) {
+              console.log(`  followReExports: ${beforeFollow} -> ${resolvedPath}`);
+            }
           }
 
           const resolvedFile = resolvedPath ? resolver.getRelativePath(resolvedPath) : undefined;
+          if (isDebugSymbol) {
+            console.log(`  resolvedFile (relative): ${resolvedFile || 'null'}`);
+          }
 
           // Try to find UUID for the imported symbol
           let symbolUUID: string | undefined;
           const candidates = globalUUIDMapping.get(imp.imported) || [];
+          if (isDebugSymbol) {
+            console.log(`  candidates for "${imp.imported}": ${candidates.length}`);
+            for (const c of candidates) {
+              console.log(`    - ${c.uuid} (${c.type}) in ${c.file}`);
+            }
+          }
 
           if (resolvedFile && candidates.length > 0) {
             // Filter candidates by file
             const fileCandidates = candidates.filter(c => c.file === resolvedFile);
+            if (isDebugSymbol) {
+              console.log(`  fileCandidates (matching ${resolvedFile}): ${fileCandidates.length}`);
+            }
 
             if (fileCandidates.length === 1) {
               // Only one match, use it
@@ -2906,8 +3091,15 @@ export class CodeSourceAdapter extends SourceAdapter {
           } else if (candidates.length === 1) {
             // Only one scope with this name, use it
             symbolUUID = candidates[0].uuid;
+            if (isDebugSymbol) {
+              console.log(`  Using single candidate (no file match): ${symbolUUID}`);
+            }
           }
           // If multiple candidates and no resolved file, we can't determine which one
+
+          if (isDebugSymbol) {
+            console.log(`  RESULT: symbolUUID = ${symbolUUID || 'null'}`);
+          }
 
           if (symbolUUID && !imports.includes(symbolUUID)) {
             imports.push(symbolUUID);

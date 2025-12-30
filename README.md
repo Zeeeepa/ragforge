@@ -59,9 +59,9 @@ RagForge is an **AI agent framework** with a **local persistent brain** (`~/.rag
 ### Documents
 | Format | Method |
 |--------|--------|
-| PDF | Tika + Gemini Vision fallback |
-| DOCX | Native parsing |
-| XLSX | Sheet/cell extraction |
+| PDF | pdfjs-dist (Mozilla PDF.js) + Gemini Vision for scans |
+| DOCX | Native parsing (mammoth) |
+| XLSX | Sheet/cell extraction (xlsx) |
 | Markdown | Section/heading parsing |
 | JSON, YAML | Structure extraction |
 | CSV | Row/column parsing |

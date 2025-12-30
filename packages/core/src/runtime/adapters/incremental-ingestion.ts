@@ -12,7 +12,7 @@ import { ChangeTracker } from './change-tracker.js';
 import { isStructuralNode } from '../../utils/node-schema.js';
 import { addSchemaVersion } from '../../utils/schema-version.js';
 import { createHash } from 'crypto';
-import { globby } from 'globby';
+import fg from 'fast-glob';
 import * as pathModule from 'path';
 import * as fs from 'fs/promises';
 import {
@@ -51,6 +51,8 @@ export interface IngestionOptions {
   trackChanges?: boolean;
   /** Clean up orphaned relationships */
   cleanupRelationships?: boolean;
+  /** Pre-queried UUID mapping for UUID preservation during re-ingestion */
+  existingUUIDMapping?: Map<string, Array<{ uuid: string; file: string; type: string }>>;
 }
 
 // Singleton adapter instance (reused across calls)
@@ -354,7 +356,7 @@ export class IncrementalIngestionManager {
     ];
 
     // 1. Discover all files matching patterns
-    const allFiles = await globby(patterns, {
+    const allFiles = await fg(patterns, {
       cwd: rootPath,
       ignore,
       absolute: true,
@@ -646,12 +648,47 @@ export class IncrementalIngestionManager {
               n.embedding_name = COALESCE(n.embedding_name, null),
               n.embedding_description = COALESCE(n.embedding_description, null),
               n.embedding_content = COALESCE(n.embedding_content, null),
+              n.embedding_name_hash = COALESCE(n.embedding_name_hash, null),
+              n.embedding_description_hash = COALESCE(n.embedding_description_hash, null),
+              n.embedding_content_hash = COALESCE(n.embedding_content_hash, null),
               n.embeddingsDirty = COALESCE(n.embeddingsDirty, null)
           REMOVE n.schemaDirty
           `,
           { nodes: nodeData }
         );
       } else {
+        // Preserve embedding vectors and hashes during re-ingestion
+        // Step 1: Query existing embeddings BEFORE merge
+        const uuids = nodeData.map((n: any) => n.uuid);
+        const existingEmbeddings = await this.client.run(
+          `
+          MATCH (n:${labels})
+          WHERE n.uuid IN $uuids
+          RETURN n.uuid AS uuid,
+                 n.embedding_name AS emb_name, n.embedding_content AS emb_content, n.embedding_description AS emb_desc,
+                 n.embedding_name_hash AS hash_name, n.embedding_content_hash AS hash_content, n.embedding_description_hash AS hash_desc,
+                 n.embedding_provider AS emb_provider, n.embedding_model AS emb_model
+          `,
+          { uuids }
+        );
+
+        // Build map of existing embeddings
+        const embeddingMap = new Map<string, any>();
+        for (const record of existingEmbeddings.records) {
+          embeddingMap.set(record.get('uuid'), {
+            emb_name: record.get('emb_name'),
+            emb_content: record.get('emb_content'),
+            emb_desc: record.get('emb_desc'),
+            hash_name: record.get('hash_name'),
+            hash_content: record.get('hash_content'),
+            hash_desc: record.get('hash_desc'),
+            emb_provider: record.get('emb_provider'),
+            emb_model: record.get('emb_model'),
+          });
+        }
+        console.log(`   🔒 Captured ${embeddingMap.size} existing embeddings for ${labels} (${uuids.length} uuids queried)`);
+
+        // Step 2: MERGE nodes with props
         await this.client.run(
           `
           UNWIND $nodes AS nodeData
@@ -661,6 +698,42 @@ export class IncrementalIngestionManager {
           `,
           { nodes: nodeData }
         );
+
+        // Step 3: Restore embeddings for existing nodes
+        const restoreData = [];
+        for (const node of nodeData) {
+          const existing = embeddingMap.get(node.uuid);
+          // Restore if we have any embedding data (vectors, hashes, or provider/model info)
+          if (existing && (existing.emb_name || existing.emb_content || existing.emb_desc ||
+              existing.hash_name || existing.hash_content || existing.hash_desc ||
+              existing.emb_provider || existing.emb_model)) {
+            restoreData.push({
+              uuid: node.uuid,
+              ...existing,
+            });
+          }
+        }
+
+        if (restoreData.length > 0) {
+          console.log(`   🔄 Restoring embeddings for ${restoreData.length} ${labels} nodes`);
+          await this.client.run(
+            `
+            UNWIND $data AS d
+            MATCH (n:${labels} {uuid: d.uuid})
+            SET n.embedding_name = COALESCE(n.embedding_name, d.emb_name),
+                n.embedding_content = COALESCE(n.embedding_content, d.emb_content),
+                n.embedding_description = COALESCE(n.embedding_description, d.emb_desc),
+                n.embedding_name_hash = COALESCE(n.embedding_name_hash, d.hash_name),
+                n.embedding_content_hash = COALESCE(n.embedding_content_hash, d.hash_content),
+                n.embedding_description_hash = COALESCE(n.embedding_description_hash, d.hash_desc),
+                n.embedding_provider = COALESCE(n.embedding_provider, d.emb_provider),
+                n.embedding_model = COALESCE(n.embedding_model, d.emb_model)
+            `,
+            { data: restoreData }
+          );
+        } else {
+          console.log(`   ⚠️ No embeddings to restore for ${labels} (${nodeData.length} nodes)`);
+        }
       }
 
       processedNodes += nodeData.length;
@@ -685,10 +758,10 @@ export class IncrementalIngestionManager {
       const relsByTypeAndLabels = new Map<string, Array<{ from: string; to: string; props: any }>>();
 
       for (const rel of relationships) {
-        const fromLabel = uuidToLabel.get(rel.from) || 'Node';
-        const toLabel = uuidToLabel.get(rel.to) || 'Node';
+        const fromLabel = uuidToLabel.get(rel.from) || null; // null = cross-file, use unlabeled match
+        const toLabel = uuidToLabel.get(rel.to) || null;     // null = cross-file, use unlabeled match
         // Key includes rel type + labels for specific queries
-        const key = `${rel.type}|${fromLabel}|${toLabel}`;
+        const key = `${rel.type}|${fromLabel || '_'}|${toLabel || '_'}`;
 
         if (!relsByTypeAndLabels.has(key)) {
           relsByTypeAndLabels.set(key, []);
@@ -703,17 +776,24 @@ export class IncrementalIngestionManager {
       // Process each relationship type+label combination in batches
       let processedRels = 0;
       for (const [key, rels] of relsByTypeAndLabels) {
-        const [relType, fromLabel, toLabel] = key.split('|');
+        const [relType, fromLabelKey, toLabelKey] = key.split('|');
+        // '_' means cross-file (unknown label), use unlabeled MATCH (slower but works)
+        const fromLabel = fromLabelKey === '_' ? null : fromLabelKey;
+        const toLabel = toLabelKey === '_' ? null : toLabelKey;
 
         for (let i = 0; i < rels.length; i += batchSize) {
           const batch = rels.slice(i, i + batchSize);
 
-          // Use labeled MATCH for indexed lookups (100x faster!)
+          // Use labeled MATCH for indexed lookups when possible (100x faster!)
+          // For cross-file refs, use unlabeled MATCH (slower but necessary)
+          const fromMatch = fromLabel ? `(from:${fromLabel} {uuid: relData.from})` : `(from {uuid: relData.from})`;
+          const toMatch = toLabel ? `(to:${toLabel} {uuid: relData.to})` : `(to {uuid: relData.to})`;
+
           await this.client.run(
             `
             UNWIND $rels AS relData
-            MATCH (from:${fromLabel} {uuid: relData.from})
-            MATCH (to:${toLabel} {uuid: relData.to})
+            MATCH ${fromMatch}
+            MATCH ${toMatch}
             MERGE (from)-[r:${relType}]->(to)
             SET r += relData.props
             `,
@@ -722,7 +802,9 @@ export class IncrementalIngestionManager {
 
           processedRels += batch.length;
         }
-        console.log(`   🔗 ${rels.length} ${relType} (${fromLabel}→${toLabel}) [${processedRels}/${relationships.length}]`);
+        const fromDisplay = fromLabel || 'Node';
+        const toDisplay = toLabel || 'Node';
+        console.log(`   🔗 ${rels.length} ${relType} (${fromDisplay}→${toDisplay}) [${processedRels}/${relationships.length}]`);
       }
     }
 
@@ -1044,6 +1126,78 @@ export class IncrementalIngestionManager {
       }
     }
 
+    // When incremental='content', the watcher already knows files changed
+    // We need to delete existing nodes BEFORE re-parsing to prevent duplicates
+    // config.include contains the list of changed files (relative paths)
+    // IMPORTANT: Capture UUIDs and embeddings BEFORE deletion to preserve them
+    let watcherEmbeddingCapture: Map<string, Array<{
+      uuid: string; file: string; type: string;
+      nameHash?: string; contentHash?: string; descHash?: string;
+      embeddingName?: number[]; embeddingContent?: number[]; embeddingDescription?: number[];
+      embeddingProvider?: string; embeddingModel?: string;
+    }>> | undefined;
+
+    if (incrementalOpt === 'content' && config.include && config.include.length > 0 && projectId) {
+      const root = config.root || '.';
+      const relativePaths = config.include;
+      const absolutePaths = relativePaths.map(f => pathModule.resolve(root, f));
+
+      // Capture existing scopes with UUIDs and embeddings BEFORE deletion
+      const existingScopesResult = await this.client.run(
+        `
+        MATCH (s:Scope)
+        WHERE s.projectId = $projectId
+          AND s.file IN $relativePaths
+        RETURN s.uuid AS uuid, s.name AS name, s.file AS file, s.type AS type,
+               s.embedding_name_hash AS nameHash, s.embedding_content_hash AS contentHash,
+               s.embedding_description_hash AS descHash,
+               s.embedding_name AS embeddingName, s.embedding_content AS embeddingContent,
+               s.embedding_description AS embeddingDescription,
+               s.embedding_provider AS embeddingProvider, s.embedding_model AS embeddingModel
+        `,
+        { projectId, relativePaths }
+      );
+
+      watcherEmbeddingCapture = new Map();
+      for (const record of existingScopesResult.records) {
+        const name = record.get('name');
+        const entry = {
+          uuid: record.get('uuid'),
+          file: record.get('file'),
+          type: record.get('type'),
+          nameHash: record.get('nameHash'),
+          contentHash: record.get('contentHash'),
+          descHash: record.get('descHash'),
+          embeddingName: record.get('embeddingName'),
+          embeddingContent: record.get('embeddingContent'),
+          embeddingDescription: record.get('embeddingDescription'),
+          embeddingProvider: record.get('embeddingProvider'),
+          embeddingModel: record.get('embeddingModel'),
+        };
+        const existing = watcherEmbeddingCapture.get(name) || [];
+        existing.push(entry);
+        watcherEmbeddingCapture.set(name, existing);
+      }
+
+      if (verbose && watcherEmbeddingCapture.size > 0) {
+        console.log(`   🔒 Captured ${watcherEmbeddingCapture.size} symbols for UUID/embedding preservation`);
+      }
+
+      // Now delete existing nodes
+      const deletedCount = await this.deleteNodesForFiles(absolutePaths);
+      if (verbose && deletedCount > 0) {
+        console.log(`   🗑️ Deleted ${deletedCount} nodes from ${absolutePaths.length} changed files`);
+      }
+    } else if (incrementalOpt === 'content' && config.include && config.include.length > 0) {
+      // No projectId - just delete without preservation
+      const root = config.root || '.';
+      const absolutePaths = config.include.map(f => pathModule.resolve(root, f));
+      const deletedCount = await this.deleteNodesForFiles(absolutePaths);
+      if (verbose && deletedCount > 0) {
+        console.log(`   🗑️ Deleted ${deletedCount} nodes from ${absolutePaths.length} changed files`);
+      }
+    }
+
     // ===== PRE-PARSING OPTIMIZATION =====
     // Check file hashes BEFORE parsing to skip unchanged files entirely
     // This is the key optimization that makes re-ingestion fast
@@ -1077,23 +1231,91 @@ export class IncrementalIngestionManager {
 
       // Delete existing nodes for changed files BEFORE re-parsing
       // This prevents orphan nodes when function signatures change (different UUIDs)
+      // NOTE: We pass absolute paths because nodes store absolutePath with full paths
       if (filterResult.changedFiles.length > 0) {
-        const relPaths = filterResult.changedFiles.map(f =>
-          pathModule.relative(filterResult.rootPath, f)
-        );
-        const deletedCount = await this.deleteNodesForFiles(relPaths);
+        const deletedCount = await this.deleteNodesForFiles(filterResult.changedFiles);
         if (verbose && deletedCount > 0) {
-          console.log(`   🗑️ Deleted ${deletedCount} nodes from ${relPaths.length} changed files`);
+          console.log(`   🗑️ Deleted ${deletedCount} nodes from ${filterResult.changedFiles.length} changed files`);
         }
       }
     }
 
     // Create adapter and parse (only changed files if incremental)
     const adapter = getAdapter();
+
+    // Query existing project scopes for cross-file import resolution
+    // This is needed for cross-file CONSUMES edges when doing single-file or partial ingestion
+    // Also merge with any pre-queried mapping from options (for UUID preservation in reIngestFiles)
+    let existingUUIDMapping: Map<string, Array<{ uuid: string; file: string; type: string }>> | undefined;
+
+    // Start with pre-queried mapping if provided (from reIngestFiles for UUID preservation)
+    if (options.existingUUIDMapping) {
+      existingUUIDMapping = new Map(options.existingUUIDMapping);
+      if (verbose) {
+        console.log(`   Using ${existingUUIDMapping.size} pre-queried symbols for UUID preservation`);
+      }
+    }
+
+    // Merge watcher embedding capture (from incremental='content') for UUID preservation
+    // This is needed because we deleted the nodes before re-parsing
+    if (watcherEmbeddingCapture && watcherEmbeddingCapture.size > 0) {
+      if (!existingUUIDMapping) {
+        existingUUIDMapping = new Map();
+      }
+      for (const [name, entries] of watcherEmbeddingCapture) {
+        const existing = existingUUIDMapping.get(name) || [];
+        for (const entry of entries) {
+          const isDuplicate = existing.some(e => e.uuid === entry.uuid);
+          if (!isDuplicate) {
+            existing.push(entry);
+          }
+        }
+        existingUUIDMapping.set(name, existing);
+      }
+      if (verbose) {
+        console.log(`   Merged ${watcherEmbeddingCapture.size} symbols from watcher for UUID preservation`);
+      }
+    }
+
+    if (projectId) {
+      if (!existingUUIDMapping) {
+        existingUUIDMapping = new Map();
+      }
+      const projectScopesResult = await this.client.run(
+        `
+        MATCH (s:Scope)
+        WHERE s.projectId = $projectId
+        RETURN s.uuid AS uuid, s.name AS name, s.file AS file, s.type AS type
+        `,
+        { projectId }
+      );
+      let addedFromDb = 0;
+      for (const record of projectScopesResult.records) {
+        const name = record.get('name');
+        const entry = {
+          uuid: record.get('uuid'),
+          file: record.get('file'),
+          type: record.get('type')
+        };
+        const existing = existingUUIDMapping.get(name) || [];
+        // Only add if not already present (pre-queried has priority)
+        const isDuplicate = existing.some(e => e.uuid === entry.uuid);
+        if (!isDuplicate) {
+          existing.push(entry);
+          existingUUIDMapping.set(name, existing);
+          addedFromDb++;
+        }
+      }
+      if (verbose) {
+        console.log(`   Loaded ${addedFromDb} additional symbols from project for cross-file resolution (total: ${existingUUIDMapping.size})`);
+      }
+    }
+
     const parseResult = await adapter.parse({
       source: config,
       skipFiles, // Pass unchanged files to skip
       projectId, // Pass generated projectId so Project node uses it as uuid
+      existingUUIDMapping, // Pass existing project scopes for cross-file import resolution
       onProgress: undefined
     });
 
@@ -1133,6 +1355,63 @@ export class IncrementalIngestionManager {
       // Add skipped files to unchanged count
       if (skipFiles) {
         stats.unchanged += skipFiles.size;
+      }
+
+      // Restore embeddings from watcher capture (after nodes are created with same UUIDs)
+      if (watcherEmbeddingCapture && watcherEmbeddingCapture.size > 0) {
+        const embeddingUpdates: Array<{
+          uuid: string;
+          nameHash: string | null;
+          contentHash: string | null;
+          descHash: string | null;
+          embeddingName: number[] | null;
+          embeddingContent: number[] | null;
+          embeddingDescription: number[] | null;
+          embeddingProvider: string | null;
+          embeddingModel: string | null;
+        }> = [];
+
+        for (const [, entries] of watcherEmbeddingCapture) {
+          for (const entry of entries) {
+            if (entry.nameHash || entry.contentHash || entry.descHash ||
+                entry.embeddingName || entry.embeddingContent || entry.embeddingDescription ||
+                entry.embeddingProvider || entry.embeddingModel) {
+              embeddingUpdates.push({
+                uuid: entry.uuid,
+                nameHash: entry.nameHash || null,
+                contentHash: entry.contentHash || null,
+                descHash: entry.descHash || null,
+                embeddingName: entry.embeddingName || null,
+                embeddingContent: entry.embeddingContent || null,
+                embeddingDescription: entry.embeddingDescription || null,
+                embeddingProvider: entry.embeddingProvider || null,
+                embeddingModel: entry.embeddingModel || null,
+              });
+            }
+          }
+        }
+
+        if (embeddingUpdates.length > 0) {
+          await this.client.run(
+            `
+            UNWIND $updates AS u
+            MATCH (n {uuid: u.uuid})
+            SET n.embedding_name_hash = u.nameHash,
+                n.embedding_content_hash = u.contentHash,
+                n.embedding_description_hash = u.descHash,
+                n.embedding_name = u.embeddingName,
+                n.embedding_content = u.embeddingContent,
+                n.embedding_description = u.embeddingDescription,
+                n.embedding_provider = u.embeddingProvider,
+                n.embedding_model = u.embeddingModel
+            `,
+            { updates: embeddingUpdates }
+          );
+
+          if (verbose) {
+            console.log(`   🔄 Restored embeddings for ${embeddingUpdates.length} nodes from watcher capture`);
+          }
+        }
       }
 
       return stats;
@@ -1291,28 +1570,78 @@ export class IncrementalIngestionManager {
     if (upserts.length > 0) {
       const relPaths = upserts.map(u => path.relative(rootPath, u.path));
 
-      // For updates, delete existing nodes first
+      // For updates, query existing UUIDs BEFORE deleting (for UUID preservation)
       const updates = upserts.filter(u => u.changeType === 'updated');
-      if (updates.length > 0) {
+      let existingUUIDMapping: Map<string, Array<{ uuid: string; file: string; type: string }>> | undefined;
+
+      if (updates.length > 0 && projectId) {
         const updatePaths = updates.map(u => path.relative(rootPath, u.path));
 
-        const deleteQuery = projectId
-          ? `
+        // Query existing scopes for these files BEFORE deletion
+        // This allows us to preserve UUIDs and embeddings during re-ingestion
+        existingUUIDMapping = new Map();
+        const existingScopesResult = await this.client.run(
+          `
+          MATCH (s:Scope)
+          WHERE s.projectId = $projectId
+            AND s.file IN $updatePaths
+          RETURN s.uuid AS uuid, s.name AS name, s.file AS file, s.type AS type,
+                 s.embedding_name_hash AS nameHash, s.embedding_content_hash AS contentHash,
+                 s.embedding_description_hash AS descHash,
+                 s.embedding_name AS embeddingName, s.embedding_content AS embeddingContent,
+                 s.embedding_description AS embeddingDescription,
+                 s.embedding_provider AS embeddingProvider, s.embedding_model AS embeddingModel
+          `,
+          { projectId, updatePaths }
+        );
+
+        for (const record of existingScopesResult.records) {
+          const name = record.get('name');
+          const entry = {
+            uuid: record.get('uuid'),
+            file: record.get('file'),
+            type: record.get('type'),
+            // Also capture embedding hashes and vectors for preservation
+            nameHash: record.get('nameHash'),
+            contentHash: record.get('contentHash'),
+            descHash: record.get('descHash'),
+            embeddingName: record.get('embeddingName'),
+            embeddingContent: record.get('embeddingContent'),
+            embeddingDescription: record.get('embeddingDescription'),
+            embeddingProvider: record.get('embeddingProvider'),
+            embeddingModel: record.get('embeddingModel'),
+          };
+          const existing = existingUUIDMapping.get(name) || [];
+          existing.push(entry);
+          existingUUIDMapping.set(name, existing);
+        }
+
+        if (verbose) {
+          console.log(`   Captured ${existingUUIDMapping.size} unique symbols from ${updates.length} files for UUID preservation`);
+        }
+
+        // Now delete existing nodes
+        const deleteQuery = `
             MATCH (n)
             WHERE n.projectId = $projectId
               AND (n.absolutePath IN $updatePaths OR n.path IN $updatePaths OR n.filePath IN $updatePaths OR n.file IN $updatePaths)
             DETACH DELETE n
-            `
-          : `
+            `;
+
+        await this.client.run(deleteQuery, { projectId, updatePaths });
+      } else if (updates.length > 0) {
+        // No projectId, just delete without UUID preservation
+        const updatePaths = updates.map(u => path.relative(rootPath, u.path));
+        const deleteQuery = `
             MATCH (n)
             WHERE n.absolutePath IN $updatePaths OR n.path IN $updatePaths OR n.filePath IN $updatePaths OR n.file IN $updatePaths
             DETACH DELETE n
             `;
 
-        await this.client.run(deleteQuery, { projectId, updatePaths });
+        await this.client.run(deleteQuery, { updatePaths });
       }
 
-      // Parse and ingest the files
+      // Parse and ingest the files, passing existingUUIDMapping for UUID preservation
       const ingestStats = await this.ingestFromPaths(
         {
           type: 'files',
@@ -1324,8 +1653,68 @@ export class IncrementalIngestionManager {
           verbose,
           trackChanges,
           incremental: false, // We already handled incremental logic above
+          existingUUIDMapping, // Pass pre-queried UUIDs for preservation
         }
       );
+
+      // Restore embedding hashes and vectors from pre-queried data
+      // This is necessary because we deleted the nodes before re-ingestion
+      if (existingUUIDMapping && existingUUIDMapping.size > 0) {
+        const embeddingUpdates: Array<{
+          uuid: string;
+          nameHash: string | null;
+          contentHash: string | null;
+          descHash: string | null;
+          embeddingName: number[] | null;
+          embeddingContent: number[] | null;
+          embeddingDescription: number[] | null;
+          embeddingProvider: string | null;
+          embeddingModel: string | null;
+        }> = [];
+
+        for (const [, entries] of existingUUIDMapping) {
+          for (const entry of entries) {
+            const e = entry as any; // Access additional embedding properties
+            // Only restore if there's at least one embedding, hash, or provider info
+            if (e.nameHash || e.contentHash || e.descHash || e.embeddingName || e.embeddingContent || e.embeddingDescription || e.embeddingProvider || e.embeddingModel) {
+              embeddingUpdates.push({
+                uuid: e.uuid,
+                nameHash: e.nameHash || null,
+                contentHash: e.contentHash || null,
+                descHash: e.descHash || null,
+                embeddingName: e.embeddingName || null,
+                embeddingContent: e.embeddingContent || null,
+                embeddingDescription: e.embeddingDescription || null,
+                embeddingProvider: e.embeddingProvider || null,
+                embeddingModel: e.embeddingModel || null,
+              });
+            }
+          }
+        }
+
+        if (embeddingUpdates.length > 0) {
+          // Batch update embedding hashes and vectors
+          await this.client.run(
+            `
+            UNWIND $updates AS u
+            MATCH (n {uuid: u.uuid})
+            SET n.embedding_name_hash = u.nameHash,
+                n.embedding_content_hash = u.contentHash,
+                n.embedding_description_hash = u.descHash,
+                n.embedding_name = u.embeddingName,
+                n.embedding_content = u.embeddingContent,
+                n.embedding_description = u.embeddingDescription,
+                n.embedding_provider = u.embeddingProvider,
+                n.embedding_model = u.embeddingModel
+            `,
+            { updates: embeddingUpdates }
+          );
+
+          if (verbose) {
+            console.log(`   Restored embeddings for ${embeddingUpdates.length} nodes`);
+          }
+        }
+      }
 
       stats.created = ingestStats.created;
       stats.updated = updates.length; // Files we deleted then re-created
@@ -1421,6 +1810,33 @@ export class IncrementalIngestionManager {
     // Read file content
     const content = await fs.readFile(filePath, 'utf-8');
 
+    // Query all existing project scopes for cross-file import resolution
+    const existingUUIDMapping = new Map<string, Array<{ uuid: string; file: string; type: string }>>();
+    if (options.projectId) {
+      const projectScopesResult = await this.client.run(
+        `
+        MATCH (s:Scope)
+        WHERE s.projectId = $projectId
+        RETURN s.uuid AS uuid, s.name AS name, s.file AS file, s.type AS type
+        `,
+        { projectId: options.projectId }
+      );
+      for (const record of projectScopesResult.records) {
+        const name = record.get('name');
+        const entry = {
+          uuid: record.get('uuid'),
+          file: record.get('file'),
+          type: record.get('type')
+        };
+        const existing = existingUUIDMapping.get(name) || [];
+        existing.push(entry);
+        existingUUIDMapping.set(name, existing);
+      }
+      if (verbose) {
+        console.log(`   Loaded ${existingUUIDMapping.size} unique symbols from project for cross-file resolution`);
+      }
+    }
+
     // Create a mini source config for just this file
     const singleFileConfig: SourceConfig = {
       ...sourceConfig,
@@ -1431,6 +1847,7 @@ export class IncrementalIngestionManager {
     const parseResult = await adapter.parse({
       source: singleFileConfig,
       projectId: options.projectId, // Pass projectId for consistency
+      existingUUIDMapping, // Pass existing project scopes for cross-file import resolution
       onProgress: undefined
     });
 

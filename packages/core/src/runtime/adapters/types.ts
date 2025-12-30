@@ -189,6 +189,13 @@ export interface ParseOptions {
    * Used for incremental ingestion - skip files that haven't changed.
    */
   skipFiles?: Set<string>;
+
+  /**
+   * Pre-existing UUID mapping from database.
+   * Used for cross-file import resolution when doing incremental ingestion.
+   * Maps symbol name -> array of candidates with uuid, file, and type.
+   */
+  existingUUIDMapping?: Map<string, Array<{ uuid: string; file: string; type: string }>>;
 }
 
 /**

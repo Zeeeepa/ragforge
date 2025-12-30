@@ -77,8 +77,10 @@ export function addSchemaVersion(
   properties: Record<string, unknown>
 ): Record<string, unknown> {
   if (shouldHaveSchemaVersion(labels)) {
-    // Use the first content label for the hash
-    const contentLabel = labels.find(l => CONTENT_NODE_LABELS.has(l)) || labels[0];
+    // Use the LAST content label (most specific) for the hash
+    // e.g., for [MediaFile, ImageFile], use ImageFile not MediaFile
+    const contentLabels = labels.filter(l => CONTENT_NODE_LABELS.has(l));
+    const contentLabel = contentLabels[contentLabels.length - 1] || labels[0];
     properties.schemaVersion = computeSchemaHash(contentLabel, properties);
   }
   return properties;

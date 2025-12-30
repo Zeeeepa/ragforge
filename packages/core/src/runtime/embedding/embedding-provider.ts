@@ -1,11 +1,23 @@
 /**
- * Embedding Provider - Native Gemini implementation
+ * Embedding Providers
  *
- * Uses @google/genai directly instead of LlamaIndex for simpler dependencies.
+ * Supports multiple embedding providers:
+ * - Gemini (cloud, requires API key)
+ * - Ollama (local, free)
  */
 
 import { GoogleGenAI } from '@google/genai';
 import pLimit from 'p-limit';
+
+/**
+ * Common interface for all embedding providers
+ */
+export interface EmbeddingProviderInterface {
+  getProviderName(): string;
+  getModelName(): string;
+  embed(texts: string[], overrides?: { model?: string; dimension?: number }): Promise<number[][]>;
+  embedSingle(text: string, overrides?: { model?: string; dimension?: number }): Promise<number[]>;
+}
 
 /**
  * Gemini embedding provider options

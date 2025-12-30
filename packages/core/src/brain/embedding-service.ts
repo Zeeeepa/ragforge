@@ -18,8 +18,10 @@
 import * as crypto from 'crypto';
 import neo4j from 'neo4j-driver';
 import type { Neo4jClient } from '../runtime/client/neo4j-client.js';
-import { GeminiEmbeddingProvider } from '../runtime/embedding/embedding-provider.js';
+import { GeminiEmbeddingProvider, type EmbeddingProviderInterface } from '../runtime/embedding/embedding-provider.js';
+import { OllamaEmbeddingProvider } from '../runtime/embedding/ollama-embedding-provider.js';
 import { chunkText, needsChunking, type TextChunk } from '../runtime/embedding/text-chunker.js';
+import { getRecordEmbeddingExtractors } from '../utils/node-schema.js';
 
 /**
  * Threshold for chunking large content (in characters)
@@ -207,12 +209,47 @@ export function hashContent(text: string): string {
 }
 
 /**
+ * Build embedding field configs using FIELD_MAPPING from node-schema.ts
+ * This ensures a single source of truth for field extraction logic.
+ */
+function buildEmbeddingConfigs(label: string, hasDescription: boolean = true): EmbeddingFieldConfig[] {
+  const extractors = getRecordEmbeddingExtractors(label);
+  const configs: EmbeddingFieldConfig[] = [
+    {
+      propertyName: 'embedding_name',
+      hashProperty: 'embedding_name_hash',
+      textExtractor: extractors.name,
+    },
+  ];
+
+  // Only add content embedding if the mapping returns non-null content
+  // (some types like MarkdownDocument, ThreeDFile don't have distinct content)
+  configs.push({
+    propertyName: 'embedding_content',
+    hashProperty: 'embedding_content_hash',
+    textExtractor: extractors.content,
+  });
+
+  if (hasDescription) {
+    configs.push({
+      propertyName: 'embedding_description',
+      hashProperty: 'embedding_description_hash',
+      textExtractor: extractors.description,
+    });
+  }
+
+  return configs;
+}
+
+/**
  * Multi-embedding configurations for all node types
  *
  * Each node type has up to 3 embeddings:
  * - embedding_name: file names, function names, signatures (for "find X")
  * - embedding_content: actual source code, text content (for "code that does X")
  * - embedding_description: docstrings, descriptions, metadata (for "documented as X")
+ *
+ * Uses FIELD_MAPPING from node-schema.ts as the source of truth for field extraction.
  */
 export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
   {
@@ -223,76 +260,36 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
                    s.embedding_name_hash AS embedding_name_hash,
                    s.embedding_content_hash AS embedding_content_hash,
                    s.embedding_description_hash AS embedding_description_hash,
+                   s.embedding_provider AS embedding_provider,
+                   s.embedding_model AS embedding_model,
                    s.embeddingsDirty AS embeddingsDirty
             ORDER BY s.file, s.startLine`,
-    embeddings: [
-      {
-        propertyName: 'embedding_name',
-        hashProperty: 'embedding_name_hash',
-        textExtractor: (r) => {
-          const name = r.get('name') || '';
-          const sig = r.get('signature') || '';
-          return sig || name;
-        },
-      },
-      {
-        propertyName: 'embedding_content',
-        hashProperty: 'embedding_content_hash',
-        textExtractor: (r) => r.get('source') || '',
-      },
-      {
-        propertyName: 'embedding_description',
-        hashProperty: 'embedding_description_hash',
-        textExtractor: (r) => r.get('docstring') || '',
-      },
-    ],
-    // No limit - process all scopes (including global file_scope modules)
-    // Memory is managed by batch processing in embedNodeTypeMulti
+    embeddings: buildEmbeddingConfigs('Scope', true),
   },
   {
     label: 'File',
     query: `MATCH (f:File {projectId: $projectId})
             WHERE f.source IS NOT NULL
-            RETURN f.uuid AS uuid, f.path AS path, f.source AS source,
+            RETURN f.uuid AS uuid, f.path AS path, f.name AS name, f.source AS source,
                    f.embedding_name_hash AS embedding_name_hash,
                    f.embedding_content_hash AS embedding_content_hash,
+                   f.embedding_provider AS embedding_provider,
+                   f.embedding_model AS embedding_model,
                    f.embeddingsDirty AS embeddingsDirty`,
-    embeddings: [
-      {
-        propertyName: 'embedding_name',
-        hashProperty: 'embedding_name_hash',
-        textExtractor: (r) => r.get('path') || '',
-      },
-      {
-        propertyName: 'embedding_content',
-        hashProperty: 'embedding_content_hash',
-        textExtractor: (r) => r.get('source') || '',
-      },
-    ],
+    embeddings: buildEmbeddingConfigs('File', false),
   },
   {
     label: 'MarkdownDocument',
     query: `MATCH (m:MarkdownDocument {projectId: $projectId})
-            RETURN m.uuid AS uuid, m.file AS path, m.title AS title,
+            RETURN m.uuid AS uuid, m.file AS file, m.title AS title,
+                   m.frontMatter AS frontMatter,
                    m.embedding_name_hash AS embedding_name_hash,
+                   m.embedding_content_hash AS embedding_content_hash,
                    m.embedding_description_hash AS embedding_description_hash,
+                   m.embedding_provider AS embedding_provider,
+                   m.embedding_model AS embedding_model,
                    m.embeddingsDirty AS embeddingsDirty`,
-    embeddings: [
-      {
-        propertyName: 'embedding_name',
-        hashProperty: 'embedding_name_hash',
-        textExtractor: (r) => {
-          const title = r.get('title') || '';
-          const path = r.get('path') || '';
-          return title || path;
-        },
-      },
-      {
-        propertyName: 'embedding_description',
-        hashProperty: 'embedding_description_hash',
-        textExtractor: (r) => r.get('title') || '',
-      },
-    ],
+    embeddings: buildEmbeddingConfigs('MarkdownDocument', true),
   },
   {
     label: 'MarkdownSection',
@@ -300,19 +297,10 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
             RETURN s.uuid AS uuid, s.title AS title, s.content AS content, s.ownContent AS ownContent,
                    s.embedding_name_hash AS embedding_name_hash,
                    s.embedding_content_hash AS embedding_content_hash,
+                   s.embedding_provider AS embedding_provider,
+                   s.embedding_model AS embedding_model,
                    s.embeddingsDirty AS embeddingsDirty`,
-    embeddings: [
-      {
-        propertyName: 'embedding_name',
-        hashProperty: 'embedding_name_hash',
-        textExtractor: (r) => r.get('title') || '',
-      },
-      {
-        propertyName: 'embedding_content',
-        hashProperty: 'embedding_content_hash',
-        textExtractor: (r) => r.get('ownContent') || r.get('content') || '',
-      },
-    ],
+    embeddings: buildEmbeddingConfigs('MarkdownSection', false),
   },
   {
     label: 'CodeBlock',
@@ -321,151 +309,77 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
             RETURN c.uuid AS uuid, c.language AS language, c.code AS code,
                    c.embedding_name_hash AS embedding_name_hash,
                    c.embedding_content_hash AS embedding_content_hash,
+                   c.embedding_provider AS embedding_provider,
+                   c.embedding_model AS embedding_model,
                    c.embeddingsDirty AS embeddingsDirty`,
-    embeddings: [
-      {
-        propertyName: 'embedding_name',
-        hashProperty: 'embedding_name_hash',
-        textExtractor: (r) => {
-          const lang = r.get('language') || 'code';
-          return `${lang} code block`;
-        },
-      },
-      {
-        propertyName: 'embedding_content',
-        hashProperty: 'embedding_content_hash',
-        textExtractor: (r) => r.get('code') || '',
-      },
-    ],
+    embeddings: buildEmbeddingConfigs('CodeBlock', false),
   },
   {
     label: 'DataFile',
     query: `MATCH (d:DataFile {projectId: $projectId})
-            RETURN d.uuid AS uuid, d.path AS path, d.rawContent AS rawContent,
+            RETURN d.uuid AS uuid, d.path AS path, d.file AS file,
+                   d.rawContent AS rawContent, d.preview AS preview, d.structure AS structure,
                    d.embedding_name_hash AS embedding_name_hash,
                    d.embedding_content_hash AS embedding_content_hash,
+                   d.embedding_provider AS embedding_provider,
+                   d.embedding_model AS embedding_model,
                    d.embeddingsDirty AS embeddingsDirty`,
-    embeddings: [
-      {
-        propertyName: 'embedding_name',
-        hashProperty: 'embedding_name_hash',
-        textExtractor: (r) => r.get('path') || '',
-      },
-      {
-        propertyName: 'embedding_content',
-        hashProperty: 'embedding_content_hash',
-        textExtractor: (r) => r.get('rawContent') || '',
-      },
-    ],
+    embeddings: buildEmbeddingConfigs('DataFile', false),
   },
   {
     label: 'WebPage',
     query: `MATCH (w:WebPage {projectId: $projectId})
             RETURN w.uuid AS uuid, w.url AS url, w.title AS title, w.textContent AS textContent,
-                   w.metaDescription AS metaDescription,
+                   w.metaDescription AS metaDescription, w.description AS description,
                    w.embedding_name_hash AS embedding_name_hash,
                    w.embedding_content_hash AS embedding_content_hash,
                    w.embedding_description_hash AS embedding_description_hash,
+                   w.embedding_provider AS embedding_provider,
+                   w.embedding_model AS embedding_model,
                    w.embeddingsDirty AS embeddingsDirty`,
-    embeddings: [
-      {
-        propertyName: 'embedding_name',
-        hashProperty: 'embedding_name_hash',
-        textExtractor: (r) => {
-          const title = r.get('title') || '';
-          const url = r.get('url') || '';
-          return `${title} ${url}`;
-        },
-      },
-      {
-        propertyName: 'embedding_content',
-        hashProperty: 'embedding_content_hash',
-        textExtractor: (r) => r.get('textContent') || '',
-      },
-      {
-        propertyName: 'embedding_description',
-        hashProperty: 'embedding_description_hash',
-        textExtractor: (r) => r.get('metaDescription') || r.get('title') || '',
-      },
-    ],
+    embeddings: buildEmbeddingConfigs('WebPage', true),
   },
   {
     label: 'MediaFile',
     query: `MATCH (m:MediaFile {projectId: $projectId})
             WHERE m.textContent IS NOT NULL OR m.description IS NOT NULL
-            RETURN m.uuid AS uuid, m.path AS path,
-                   COALESCE(m.textContent, m.description) AS description,
-                   m.extractionMethod AS extractionMethod,
+            RETURN m.uuid AS uuid, m.path AS path, m.file AS file,
+                   m.textContent AS textContent, m.ocrText AS ocrText, m.description AS description,
                    m.embedding_name_hash AS embedding_name_hash,
                    m.embedding_content_hash AS embedding_content_hash,
                    m.embedding_description_hash AS embedding_description_hash,
+                   m.embedding_provider AS embedding_provider,
+                   m.embedding_model AS embedding_model,
                    m.embeddingsDirty AS embeddingsDirty`,
-    embeddings: [
-      {
-        propertyName: 'embedding_name',
-        hashProperty: 'embedding_name_hash',
-        textExtractor: (r) => r.get('path') || '',
-      },
-      {
-        propertyName: 'embedding_description',
-        hashProperty: 'embedding_description_hash',
-        textExtractor: (r) => r.get('description') || '',
-      },
-    ],
+    embeddings: buildEmbeddingConfigs('MediaFile', true),
   },
   {
     label: 'ThreeDFile',
     query: `MATCH (t:ThreeDFile {projectId: $projectId})
             WHERE t.textContent IS NOT NULL OR t.description IS NOT NULL
-            RETURN t.uuid AS uuid, t.path AS path,
-                   COALESCE(t.textContent, t.description) AS description,
+            RETURN t.uuid AS uuid, t.path AS path, t.file AS file,
+                   t.textContent AS textContent, t.description AS description,
                    t.embedding_name_hash AS embedding_name_hash,
+                   t.embedding_content_hash AS embedding_content_hash,
                    t.embedding_description_hash AS embedding_description_hash,
+                   t.embedding_provider AS embedding_provider,
+                   t.embedding_model AS embedding_model,
                    t.embeddingsDirty AS embeddingsDirty`,
-    embeddings: [
-      {
-        propertyName: 'embedding_name',
-        hashProperty: 'embedding_name_hash',
-        textExtractor: (r) => r.get('path') || '',
-      },
-      {
-        propertyName: 'embedding_description',
-        hashProperty: 'embedding_description_hash',
-        textExtractor: (r) => r.get('description') || '',
-      },
-    ],
+    embeddings: buildEmbeddingConfigs('ThreeDFile', true),
   },
   {
     label: 'DocumentFile',
     query: `MATCH (d:DocumentFile {projectId: $projectId})
             WHERE d.textContent IS NOT NULL
             RETURN d.uuid AS uuid, d.file AS file, d.path AS path, d.format AS format,
-                   d.textContent AS textContent, d.title AS title,
+                   d.textContent AS textContent, d.extractedText AS extractedText, d.title AS title,
                    d.embedding_name_hash AS embedding_name_hash,
                    d.embedding_content_hash AS embedding_content_hash,
                    d.embedding_description_hash AS embedding_description_hash,
+                   d.embedding_provider AS embedding_provider,
+                   d.embedding_model AS embedding_model,
                    d.embeddingsDirty AS embeddingsDirty`,
-    embeddings: [
-      {
-        propertyName: 'embedding_name',
-        hashProperty: 'embedding_name_hash',
-        textExtractor: (r) => {
-          const file = r.get('file') || '';
-          const title = r.get('title') || '';
-          return title || file;
-        },
-      },
-      {
-        propertyName: 'embedding_content',
-        hashProperty: 'embedding_content_hash',
-        textExtractor: (r) => r.get('textContent') || '',
-      },
-      {
-        propertyName: 'embedding_description',
-        hashProperty: 'embedding_description_hash',
-        textExtractor: (r) => r.get('title') || '',
-      },
-    ],
+    embeddings: buildEmbeddingConfigs('DocumentFile', true),
   },
 ];
 
@@ -590,22 +504,76 @@ export const DEFAULT_EMBED_CONFIGS: EmbedNodeTypeConfig[] = [
 ];
 
 /**
+ * Embedding provider configuration
+ */
+export type EmbeddingProviderConfig =
+  | { type: 'gemini'; apiKey: string; dimension?: number }
+  | { type: 'ollama'; baseUrl?: string; model?: string; batchSize?: number; timeout?: number };
+
+/**
  * Embedding Service - generates and caches embeddings for Neo4j nodes
+ *
+ * Supports multiple embedding providers:
+ * - Gemini (cloud, requires API key, best quality)
+ * - Ollama (local, free, private)
  */
 export class EmbeddingService {
-  private embeddingProvider: GeminiEmbeddingProvider | null = null;
+  private embeddingProvider: EmbeddingProviderInterface | null = null;
 
+  /**
+   * Create an EmbeddingService
+   *
+   * @param neo4jClient - Neo4j client for database operations
+   * @param config - Provider configuration (gemini or ollama)
+   *
+   * Legacy signature still supported:
+   * @param neo4jClient - Neo4j client
+   * @param geminiApiKey - Gemini API key (creates Gemini provider)
+   */
   constructor(
     private neo4jClient: Neo4jClient,
-    private geminiApiKey?: string
+    configOrApiKey?: EmbeddingProviderConfig | string
   ) {
-    if (geminiApiKey) {
+    if (typeof configOrApiKey === 'string') {
+      // Legacy: string = Gemini API key
       this.embeddingProvider = new GeminiEmbeddingProvider({
-        apiKey: geminiApiKey,
+        apiKey: configOrApiKey,
         dimension: 3072,
-        // Use native 3072 dimensions for best quality
       });
+    } else if (configOrApiKey) {
+      // New: provider config object
+      if (configOrApiKey.type === 'gemini') {
+        this.embeddingProvider = new GeminiEmbeddingProvider({
+          apiKey: configOrApiKey.apiKey,
+          dimension: configOrApiKey.dimension ?? 3072,
+        });
+      } else if (configOrApiKey.type === 'ollama') {
+        this.embeddingProvider = new OllamaEmbeddingProvider({
+          baseUrl: configOrApiKey.baseUrl,
+          model: configOrApiKey.model,
+          batchSize: configOrApiKey.batchSize,
+          timeout: configOrApiKey.timeout,
+        });
+      }
     }
+  }
+
+  /**
+   * Set a new embedding provider
+   */
+  setProvider(provider: EmbeddingProviderInterface): void {
+    this.embeddingProvider = provider;
+  }
+
+  /**
+   * Get the current provider info
+   */
+  getProviderInfo(): { name: string; model: string } | null {
+    if (!this.embeddingProvider) return null;
+    return {
+      name: this.embeddingProvider.getProviderName(),
+      model: this.embeddingProvider.getModelName(),
+    };
   }
 
   /**
@@ -949,12 +917,17 @@ export class EmbeddingService {
       }
 
       // Save small node embeddings
+      const providerName = this.embeddingProvider!.getProviderName();
+      const modelName = this.embeddingProvider!.getModelName();
+
       for (const [key, tasks] of smallTasksByKey) {
         const [label, embeddingProp] = key.split(':');
         const saveData = tasks.map(t => ({
           uuid: t.uuid,
           embedding: t.embedding,
           hash: t.hash,
+          provider: providerName,
+          model: modelName,
         }));
 
         const cypher = this.buildEmbeddingSaveCypher(embeddingProp, label);
@@ -979,6 +952,8 @@ export class EmbeddingService {
           endLine: t.endLine,
           embedding: t.embedding,
           hash: t.hash,
+          provider: providerName,
+          model: modelName,
         }));
 
         await this.neo4jClient.run(
@@ -997,6 +972,8 @@ export class EmbeddingService {
              endLine: chunk.endLine,
              embedding_content: chunk.embedding,
              embedding_content_hash: chunk.hash,
+             embedding_provider: chunk.provider,
+             embedding_model: chunk.model,
              embeddingsDirty: false
            })
            CREATE (parent)-[:HAS_EMBEDDING_CHUNK]->(c)`,
@@ -1144,17 +1121,30 @@ export class EmbeddingService {
 
       const isContentEmbedding = embeddingType === 'content';
 
+      // Get current provider info for comparison
+      const currentProvider = this.embeddingProvider?.getProviderName() || null;
+      const currentModel = this.embeddingProvider?.getModelName() || null;
+
       // Process each record
       for (const record of result.records) {
         const uuid = record.get('uuid');
         const rawText = embeddingConfig.textExtractor(record);
         const existingHash = incrementalOnly ? (record.get(embeddingConfig.hashProperty) || null) : null;
+        const existingProvider = record.get('embedding_provider') || null;
+        const existingModel = record.get('embedding_model') || null;
         const embeddingsDirty = record.get('embeddingsDirty') === true;
 
         // Skip empty/tiny texts
         if (!rawText || rawText.length < 5) {
           continue;
         }
+
+        // Check if provider/model changed (requires regeneration even if hash matches)
+        // If existingProvider is null but we have an existing hash, it means old embeddings without metadata
+        // In that case, we should regenerate to ensure compatibility with current provider
+        const hasExistingEmbedding = existingHash !== null;
+        const providerMismatch = hasExistingEmbedding && existingProvider !== currentProvider;
+        const modelMismatch = hasExistingEmbedding && existingModel !== currentModel;
 
         // For content: check if needs chunking
         if (isContentEmbedding && needsChunking(rawText, CHUNKING_THRESHOLD)) {
@@ -1163,14 +1153,28 @@ export class EmbeddingService {
           const hash = hashContent(text);
 
           // Check if needs embedding
+          // - No hash = new node
+          // - Hash mismatch = content changed
+          // - Provider/model mismatch = config changed, need to regenerate
           const needsEmbed = incrementalOnly
-            ? (embeddingsDirty || existingHash === null || existingHash !== hash)
+            ? (existingHash === null || existingHash !== hash || providerMismatch || modelMismatch)
             : true;
 
           if (!needsEmbed) {
             skippedCount++;
             continue;
           }
+
+          // Log why embedding is needed (for debugging)
+          let reason = 'unknown';
+          if (existingHash === null) reason = 'no_hash';
+          else if (existingHash !== hash) reason = 'hash_mismatch';
+          else if (providerMismatch) reason = `provider_changed:${existingProvider}->${currentProvider}`;
+          else if (modelMismatch) reason = `model_changed:${existingModel}->${currentModel}`;
+          // Safely get node name (some types use 'name', others 'title', others 'path')
+          const getField = (field: string) => record.keys?.includes(field) ? record.get(field) : null;
+          const nodeName = getField('name') || getField('title') || getField('path') || uuid.substring(0, 8);
+          console.log(`[EmbeddingService] Need embed (chunked): ${label}.${embeddingType} "${nodeName}" (${reason})`);
 
           // Create chunks
           const chunks = chunkText(rawText, {
@@ -1209,14 +1213,28 @@ export class EmbeddingService {
           const hash = hashContent(text);
 
           // Check if needs embedding
+          // - No hash = new node
+          // - Hash mismatch = content changed
+          // - Provider/model mismatch = config changed, need to regenerate
           const needsEmbed = incrementalOnly
-            ? (embeddingsDirty || existingHash === null || existingHash !== hash)
+            ? (existingHash === null || existingHash !== hash || providerMismatch || modelMismatch)
             : true;
 
           if (!needsEmbed) {
             skippedCount++;
             continue;
           }
+
+          // Log why embedding is needed (for debugging)
+          let reason = 'unknown';
+          if (existingHash === null) reason = 'no_hash';
+          else if (existingHash !== hash) reason = 'hash_mismatch';
+          else if (providerMismatch) reason = `provider_changed:${existingProvider}->${currentProvider}`;
+          else if (modelMismatch) reason = `model_changed:${existingModel}->${currentModel}`;
+          // Safely get node name (some types use 'name', others 'title', others 'path')
+          const getField = (field: string) => record.keys?.includes(field) ? record.get(field) : null;
+          const nodeName = getField('name') || getField('title') || getField('path') || uuid.substring(0, 8);
+          console.log(`[EmbeddingService] Need embed: ${label}.${embeddingType} "${nodeName}" (${reason})`);
 
           tasks.push({
             type: 'small',
@@ -1262,25 +1280,29 @@ export class EmbeddingService {
   }
   /**
    * Build Cypher query for saving embeddings to a node
+   * Now also stores embedding_provider and embedding_model for compatibility tracking
    */
   private buildEmbeddingSaveCypher(embeddingProp: string, label: string): string {
+    // All save queries now include provider and model metadata
+    const providerProps = `, n.embedding_provider = item.provider, n.embedding_model = item.model`;
+
     if (embeddingProp === 'embedding_name') {
       return `UNWIND $batch AS item
               MATCH (n:${label} {uuid: item.uuid})
-              SET n.embedding_name = item.embedding, n.embedding_name_hash = item.hash, n.embeddingsDirty = false`;
+              SET n.embedding_name = item.embedding, n.embedding_name_hash = item.hash, n.embeddingsDirty = false${providerProps}`;
     } else if (embeddingProp === 'embedding_content') {
       return `UNWIND $batch AS item
               MATCH (n:${label} {uuid: item.uuid})
-              SET n.embedding_content = item.embedding, n.embedding_content_hash = item.hash, n.embeddingsDirty = false`;
+              SET n.embedding_content = item.embedding, n.embedding_content_hash = item.hash, n.embeddingsDirty = false${providerProps}`;
     } else if (embeddingProp === 'embedding_description') {
       return `UNWIND $batch AS item
               MATCH (n:${label} {uuid: item.uuid})
-              SET n.embedding_description = item.embedding, n.embedding_description_hash = item.hash, n.embeddingsDirty = false`;
+              SET n.embedding_description = item.embedding, n.embedding_description_hash = item.hash, n.embeddingsDirty = false${providerProps}`;
     } else {
       // Fallback for legacy 'embedding' property
       return `UNWIND $batch AS item
               MATCH (n:${label} {uuid: item.uuid})
-              SET n.embedding = item.embedding, n.embedding_hash = item.hash, n.embeddingsDirty = false`;
+              SET n.embedding = item.embedding, n.embedding_hash = item.hash, n.embeddingsDirty = false${providerProps}`;
     }
   }
 

@@ -316,5 +316,10 @@ export {
 // ============================================
 export * from './docker/index.js';
 
+// ============================================
+// Daemon Client (HTTP client for Brain Daemon)
+// ============================================
+export * from './daemon/index.js';
+
 // Version
 export const VERSION = '0.3.0';

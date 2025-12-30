@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
-import { chromium } from 'playwright';
+import puppeteer from 'puppeteer-core';
+import chromium from '@sparticuz/chromium';
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
@@ -8,68 +9,35 @@ export async function GET(request: Request) {
   let browser = null;
 
   try {
-    // Launch browser
-    browser = await chromium.launch({
+    // Configure chromium for serverless environment
+    const executablePath = await chromium.executablePath();
+
+    browser = await puppeteer.launch({
+      args: chromium.args,
+      defaultViewport: { width: 794, height: 2000, deviceScaleFactor: 2 },
+      executablePath,
       headless: true,
     });
 
-    // A4 dimensions in pixels at 96 DPI (standard CSS DPI)
-    const A4_WIDTH = 794;  // 210mm
-    const A4_HEIGHT = 1123; // 297mm
-    const MARGIN = 38; // ~1cm in pixels
-    const USABLE_HEIGHT = A4_HEIGHT - (MARGIN * 2); // ~1085px per page
+    const page = await browser.newPage();
 
-    const context = await browser.newContext({
-      viewport: { width: A4_WIDTH, height: 2000 }, // Tall viewport to see full content
-      deviceScaleFactor: 2, // High DPI for crisp text
+    // Set viewport to A4 width
+    await page.setViewport({
+      width: 794,
+      height: 2000,
+      deviceScaleFactor: 2,
     });
-
-    const page = await context.newPage();
 
     // Navigate to CV page with print mode
     await page.goto(`${baseUrl}/cv?print=true`, {
-      waitUntil: 'networkidle',
+      waitUntil: 'networkidle0',
       timeout: 30000,
     });
 
-    // Wait for any animations to settle
-    await page.waitForTimeout(500);
+    // Wait for content to settle
+    await new Promise(resolve => setTimeout(resolve, 500));
 
-    // Find the page break element and measure content
-    const measurements = await page.evaluate(() => {
-      const breakElement = document.querySelector('.cv-page-break');
-      const contentContainer = document.querySelector('.print-content');
-
-      if (!breakElement || !contentContainer) {
-        return { breakTop: 0, totalHeight: 0, page2ContentHeight: 0 };
-      }
-
-      const breakRect = breakElement.getBoundingClientRect();
-      const containerRect = contentContainer.getBoundingClientRect();
-
-      // Find all content after the break point
-      const allSections = contentContainer.querySelectorAll('section');
-      let page2Height = 0;
-      let foundBreak = false;
-
-      allSections.forEach((section) => {
-        if (section.classList.contains('cv-page-break')) {
-          foundBreak = true;
-        }
-        if (foundBreak) {
-          const rect = section.getBoundingClientRect();
-          page2Height += rect.height;
-        }
-      });
-
-      return {
-        breakTop: breakRect.top - containerRect.top,
-        totalHeight: containerRect.height,
-        page2ContentHeight: page2Height,
-      };
-    });
-
-    // Add styles for PDF generation with proper page breaks
+    // Add styles for PDF generation
     await page.addStyleTag({
       content: `
         /* Hide navigation and export button */
@@ -147,8 +115,8 @@ export async function GET(request: Request) {
 
     await browser.close();
 
-    // Return PDF as download - convert Buffer to Uint8Array for NextResponse
-    return new NextResponse(new Uint8Array(pdfBuffer), {
+    // Return PDF as download - convert to Buffer for NextResponse
+    return new NextResponse(Buffer.from(pdfBuffer), {
       headers: {
         'Content-Type': 'application/pdf',
         'Content-Disposition': 'attachment; filename="Lucie_Defraiteur_CV.pdf"',

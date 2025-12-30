@@ -6,6 +6,8 @@
  */
 
 import chokidar from 'chokidar';
+import path from 'path';
+import fg from 'fast-glob';
 import type { CodeSourceConfig } from './code-source-adapter.js';
 import type { IncrementalIngestionManager } from './incremental-ingestion.js';
 import { IngestionQueue, type IngestionQueueConfig } from './ingestion-queue.js';
@@ -204,6 +206,35 @@ export class FileWatcher {
    */
   getQueue(): IngestionQueue {
     return this.queue;
+  }
+
+  /**
+   * Get the root path being watched
+   */
+  getRoot(): string {
+    return this.sourceConfig.root || '.';
+  }
+
+  /**
+   * Queue all files in a directory for re-ingestion
+   * Used when ingest_directory is called on a subdirectory of an already-watched project
+   */
+  async queueDirectory(dirPath: string): Promise<void> {
+    const { include = [], exclude = [] } = this.sourceConfig;
+    const absoluteDir = path.resolve(dirPath);
+
+    // Use fast-glob to find all matching files in the subdirectory
+    const patterns = include.map(pattern => `${absoluteDir}/${pattern}`);
+    const files = await fg(patterns, {
+      ignore: exclude,
+      absolute: true,
+      onlyFiles: true,
+    });
+
+    console.log(`[FileWatcher] Queueing ${files.length} files from ${absoluteDir}`);
+
+    // Queue each file for re-ingestion
+    this.queue.addFiles(files);
   }
 
   /**

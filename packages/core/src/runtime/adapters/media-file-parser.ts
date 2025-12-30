@@ -567,7 +567,7 @@ export interface ThreeDRenderRequest {
 /**
  * Extract text from PDF (called on-demand)
  *
- * Uses Tika for extraction
+ * Uses pdfjs-dist (Mozilla PDF.js) with pdf2json fallback
  */
 export interface PDFExtractionRequest {
   filePath: string;

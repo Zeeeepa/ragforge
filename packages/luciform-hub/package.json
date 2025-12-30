@@ -9,12 +9,13 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@sparticuz/chromium": "^143.0.0",
     "@types/dat.gui": "^0.7.13",
     "@types/three": "^0.182.0",
     "dat.gui": "^0.7.9",
     "highlight.js": "^11.11.1",
     "next": "16.0.10",
-    "playwright": "^1.57.0",
+    "puppeteer-core": "^24.34.0",
     "react": "19.2.1",
     "react-dom": "19.2.1",
     "three": "^0.182.0",

@@ -97,3 +97,11 @@ export {
   type EmbeddingCoordinatorConfig,
   type EmbedProjectOptions,
 } from './embedding-coordinator.js';
+
+// Formatters
+export {
+  formatAsMarkdown,
+  formatAsCompact,
+  type BrainSearchOutput,
+  type FormatOptions,
+} from './formatters/index.js';

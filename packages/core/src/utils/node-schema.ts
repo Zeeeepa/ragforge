@@ -547,3 +547,363 @@ export function getRequiredProperties(nodeType: string): string[] | undefined {
 export function getAdditionalIndexes(label: string): string[] {
   return TYPE_INDEXES[label] || [];
 }
+
+// ============================================================
+// FIELD MAPPING - Unified Access to Node Content
+// ============================================================
+// Mirrors the textExtractor logic from embedding-service.ts MULTI_EMBED_CONFIGS
+// Returns null for fields that are duplicates or not applicable
+// (avoids redundancy in brain_search output formatting)
+
+/**
+ * Field extractor function that takes a node and returns the field value.
+ * Returns null if the field is not applicable or would duplicate another field.
+ */
+export type FieldExtractor = (node: Record<string, any>) => string | null;
+
+/**
+ * Configuration for extracting semantic fields from a node type.
+ * Mirrors the 3-embedding pattern from embedding-service.ts:
+ * - title: corresponds to embedding_name (signature, title, path)
+ * - content: corresponds to embedding_content (source, textContent)
+ * - description: corresponds to embedding_description (docstring, metaDescription)
+ *
+ * Returns null if the field would be a duplicate or doesn't exist for this type.
+ */
+export interface NodeFieldMapping {
+  /** Extract the title/name/signature - what the node IS */
+  title: FieldExtractor;
+  /** Extract the main content - the actual code/text (null if same as title) */
+  content: FieldExtractor;
+  /** Extract the description/documentation (null if same as title/content) */
+  description: FieldExtractor;
+  /** Extract the location (file path, URL, etc.) */
+  location: FieldExtractor;
+}
+
+/**
+ * Field mappings for each node type.
+ * Logic mirrors MULTI_EMBED_CONFIGS textExtractors from embedding-service.ts
+ * Returns null for fields that don't exist or would duplicate another field.
+ */
+export const FIELD_MAPPING: Record<string, NodeFieldMapping> = {
+  // === CODE ===
+  Scope: {
+    title: (n) => n.signature || n.name || null,
+    content: (n) => n.source || null,
+    description: (n) => n.docstring || null,
+    location: (n) => n.file || null,
+  },
+
+  File: {
+    title: (n) => n.name || n.path || null,
+    content: (n) => n.source || null,
+    description: (n) => null, // Would duplicate title
+    location: (n) => n.path || null,
+  },
+
+  CodeBlock: {
+    title: (n) => n.language ? `${n.language} code block` : 'code block',
+    content: (n) => n.code || null,
+    description: (n) => null, // Language already in title
+    location: (n) => n.file || null,
+  },
+
+  // === MARKDOWN ===
+  MarkdownDocument: {
+    title: (n) => n.title || n.file || null,
+    content: (n) => null, // No distinct content for document node
+    description: (n) => n.frontMatter || null,
+    location: (n) => n.file || null,
+  },
+
+  MarkdownSection: {
+    title: (n) => n.title || null,
+    content: (n) => n.ownContent || n.content || null,
+    description: (n) => null, // rawText would duplicate content
+    location: (n) => n.file || null,
+  },
+
+  // === WEB ===
+  WebPage: {
+    title: (n) => n.title || null,
+    content: (n) => n.textContent || null,
+    description: (n) => n.metaDescription || n.description || null,
+    location: (n) => n.url || null,
+  },
+
+  // === MEDIA ===
+  MediaFile: {
+    title: (n) => n.file || null,
+    content: (n) => n.textContent || n.ocrText || null,
+    description: (n) => n.description || null, // AI visual description
+    location: (n) => n.path || null,
+  },
+
+  ImageFile: {
+    title: (n) => n.file || null,
+    content: (n) => n.textContent || n.ocrText || null,
+    description: (n) => n.description || null,
+    location: (n) => n.path || null,
+  },
+
+  ThreeDFile: {
+    title: (n) => n.file || null,
+    content: (n) => null, // No distinct content, only description
+    description: (n) => n.description || null,
+    location: (n) => n.path || null,
+  },
+
+  // === DOCUMENTS ===
+  DocumentFile: {
+    title: (n) => n.title || n.file || null,
+    content: (n) => n.textContent || n.extractedText || null,
+    description: (n) => null, // Title already used
+    location: (n) => n.path || null,
+  },
+
+  PDFDocument: {
+    title: (n) => n.title || n.file || null,
+    content: (n) => n.textContent || n.extractedText || null,
+    description: (n) => null,
+    location: (n) => n.path || null,
+  },
+
+  WordDocument: {
+    title: (n) => n.title || n.file || null,
+    content: (n) => n.textContent || n.extractedText || null,
+    description: (n) => null,
+    location: (n) => n.path || null,
+  },
+
+  SpreadsheetDocument: {
+    title: (n) => n.file || null,
+    content: (n) => n.extractedText || null,
+    description: (n) => n.sheetNames || null,
+    location: (n) => n.path || null,
+  },
+
+  // === DATA ===
+  DataFile: {
+    title: (n) => n.file || n.path || null,
+    content: (n) => n.rawContent || n.preview || null,
+    description: (n) => n.structure || null,
+    location: (n) => n.path || n.file || null,
+  },
+
+  // === STRUCTURE ===
+  Project: {
+    title: (n) => n.name || null,
+    content: (n) => null, // No content
+    description: (n) => n.gitRemote || null,
+    location: (n) => n.rootPath || null,
+  },
+
+  Directory: {
+    title: (n) => n.path || null,
+    content: (n) => null,
+    description: (n) => null,
+    location: (n) => n.path || null,
+  },
+
+  ExternalLibrary: {
+    title: (n) => n.name || null,
+    content: (n) => null,
+    description: (n) => null,
+    location: (n) => null, // External, no path
+  },
+
+  PackageJson: {
+    title: (n) => n.name || null,
+    content: (n) => null,
+    description: (n) => n.description || null,
+    location: (n) => n.file || null,
+  },
+};
+
+/**
+ * Get the title/signature of a node according to its type.
+ * Returns null if not available.
+ */
+export function getNodeTitle(node: Record<string, any>, nodeType: string): string | null {
+  const mapping = FIELD_MAPPING[nodeType];
+  if (mapping) {
+    return mapping.title(node);
+  }
+  // Fallback: try common fields
+  return node.signature || node.title || node.name || node.file || null;
+}
+
+/**
+ * Get the main content of a node according to its type.
+ * Returns null if not available or would duplicate title.
+ */
+export function getNodeContent(node: Record<string, any>, nodeType: string): string | null {
+  const mapping = FIELD_MAPPING[nodeType];
+  if (mapping) {
+    return mapping.content(node);
+  }
+  // Fallback: try common fields
+  return node.source || node.content || node.textContent || node.code || null;
+}
+
+/**
+ * Get the description/documentation of a node according to its type.
+ * Returns null if not available or would duplicate other fields.
+ */
+export function getNodeDescription(node: Record<string, any>, nodeType: string): string | null {
+  const mapping = FIELD_MAPPING[nodeType];
+  if (mapping) {
+    return mapping.description(node);
+  }
+  // Fallback: try common fields
+  return node.docstring || node.description || node.metaDescription || null;
+}
+
+/**
+ * Get the location (file path, URL) of a node according to its type.
+ */
+export function getNodeLocation(node: Record<string, any>, nodeType: string): string | null {
+  const mapping = FIELD_MAPPING[nodeType];
+  if (mapping) {
+    return mapping.location(node);
+  }
+  // Fallback: try common fields
+  return node.file || node.path || node.url || null;
+}
+
+/**
+ * Get line range for a node if available
+ */
+export function getNodeLineRange(node: Record<string, any>): { start: number; end: number } | null {
+  if (node.startLine != null && node.endLine != null) {
+    return { start: node.startLine, end: node.endLine };
+  }
+  return null;
+}
+
+/**
+ * Format a node location with optional line range for display.
+ * @example "src/utils/node-schema.ts:45-67"
+ */
+export function formatNodeLocation(node: Record<string, any>, nodeType: string): string {
+  const location = getNodeLocation(node, nodeType) || 'unknown';
+  const lines = getNodeLineRange(node);
+  if (lines) {
+    return `${location}:${lines.start}-${lines.end}`;
+  }
+  return location;
+}
+
+/**
+ * Format a node for display in search results.
+ * @example "async function getUser(id: string): Promise<User> (Scope) @ src/users.ts:45-67"
+ */
+export function formatNodeResult(node: Record<string, any>, nodeType: string): string {
+  const title = getNodeTitle(node, nodeType) || 'Untitled';
+  const location = formatNodeLocation(node, nodeType);
+  return `${title} (${nodeType}) @ ${location}`;
+}
+
+// ============================================================
+// EMBEDDING EXTRACTORS - Text extraction for embeddings
+// ============================================================
+// Uses FIELD_MAPPING as source of truth but may combine fields
+// for better embedding search quality.
+// Corresponds to MULTI_EMBED_CONFIGS in embedding-service.ts
+
+/**
+ * Embedding extractor functions for a node type.
+ * Maps to the 3 embedding types:
+ * - name → embedding_name (for "find X")
+ * - content → embedding_content (for "code that does X")
+ * - description → embedding_description (for "documented as X")
+ */
+export interface EmbeddingExtractors {
+  name: (node: Record<string, any>) => string;
+  content: (node: Record<string, any>) => string;
+  description: (node: Record<string, any>) => string;
+}
+
+/**
+ * Special cases where embedding_name needs more context than display title.
+ * For file-like nodes, we use full path for better search.
+ * For web pages, we include URL.
+ */
+const EMBEDDING_NAME_OVERRIDES: Record<string, (n: Record<string, any>) => string> = {
+  // Files: use full path for search (display uses just filename)
+  File: (n) => n.path || '',
+  DataFile: (n) => n.path || '',
+  MediaFile: (n) => n.path || '',
+  ImageFile: (n) => n.path || '',
+  ThreeDFile: (n) => n.path || '',
+  // Web pages: include URL for better search
+  WebPage: (n) => `${n.title || ''} ${n.url || ''}`.trim(),
+};
+
+/**
+ * Get embedding text extractors for a node type.
+ * Uses FIELD_MAPPING as the source of truth but handles special cases
+ * where embeddings need more context than display.
+ *
+ * @param label - The node label (Scope, File, MediaFile, etc.)
+ * @returns Extractors for name, content, and description embeddings
+ */
+export function getEmbeddingExtractors(label: string): EmbeddingExtractors {
+  const mapping = FIELD_MAPPING[label];
+
+  if (!mapping) {
+    // Fallback for unknown types
+    return {
+      name: (n) => n.signature || n.title || n.name || n.path || '',
+      content: (n) => n.source || n.content || n.textContent || '',
+      description: (n) => n.docstring || n.description || '',
+    };
+  }
+
+  // Use override for name if exists, otherwise use FIELD_MAPPING.title
+  const nameExtractor = EMBEDDING_NAME_OVERRIDES[label]
+    || ((n: Record<string, any>) => mapping.title(n) || '');
+
+  return {
+    name: nameExtractor,
+    content: (n) => mapping.content(n) || '',
+    description: (n) => mapping.description(n) || '',
+  };
+}
+
+/**
+ * Convert a Neo4j record to a plain object for use with extractors.
+ * Neo4j records use record.get('field') while extractors expect node.field
+ */
+export function recordToNode(record: any): Record<string, any> {
+  const node: Record<string, any> = {};
+  // Neo4j records have a keys property with all field names
+  if (record.keys) {
+    for (const key of record.keys) {
+      node[key] = record.get(key);
+    }
+  }
+  return node;
+}
+
+/**
+ * Create embedding text extractors that work with Neo4j records.
+ * Wrapper around getEmbeddingExtractors for use in embedding-service.ts
+ *
+ * @param label - The node label
+ * @returns Extractors that take Neo4j records and return text
+ */
+export function getRecordEmbeddingExtractors(label: string): {
+  name: (record: any) => string;
+  content: (record: any) => string;
+  description: (record: any) => string;
+} {
+  const extractors = getEmbeddingExtractors(label);
+
+  return {
+    name: (r) => extractors.name(recordToNode(r)),
+    content: (r) => extractors.content(recordToNode(r)),
+    description: (r) => extractors.description(recordToNode(r)),
+  };
+}

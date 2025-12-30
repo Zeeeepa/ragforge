@@ -283,45 +283,50 @@ export class ImportResolver {
         const content = await fs.readFile(currentFile, 'utf8');
         let foundReExport = false;
 
-        // Simple regex-based detection of re-exports
+        // Regex-based detection of re-exports
+        // Must handle multi-line exports like:
+        //   export {
+        //     foo,
+        //     bar,
+        //   } from './somewhere';
+
         // Pattern 1: export * from '...'
-        // Pattern 2: export { symbol } from '...'
-        // Pattern 3: export { original as symbol } from '...'
-
-        const lines = content.split('\n');
-        for (const line of lines) {
-          const trimmed = line.trim();
-
-          // export * from './somewhere'
-          const starExportMatch = trimmed.match(/^export\s+\*\s+from\s+['"]([^'"]+)['"]/);
-          if (starExportMatch) {
-            const reExportPath = starExportMatch[1];
-            const resolvedReExport = await this.resolveImport(reExportPath, currentFile);
-            if (resolvedReExport && !visited.has(resolvedReExport)) {
-              currentFile = resolvedReExport;
-              foundReExport = true;
-              break; // Continue following this chain
-            }
+        const starExportRegex = /export\s+\*\s+from\s+['"]([^'"]+)['"]/g;
+        let starMatch;
+        while ((starMatch = starExportRegex.exec(content)) !== null) {
+          const reExportPath = starMatch[1];
+          const resolvedReExport = await this.resolveImport(reExportPath, currentFile);
+          if (resolvedReExport && !visited.has(resolvedReExport)) {
+            currentFile = resolvedReExport;
+            foundReExport = true;
+            break; // Continue following this chain
           }
+        }
 
-          // export { foo, bar } from './somewhere'
-          // export { original as alias } from './somewhere'
-          const namedExportMatch = trimmed.match(/^export\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]/);
-          if (namedExportMatch) {
-            const exports = namedExportMatch[1];
-            const reExportPath = namedExportMatch[2];
+        if (!foundReExport) {
+          // Pattern 2: export { foo, bar } from './somewhere' (handles multi-line)
+          // Pattern 3: export { original as alias } from './somewhere'
+          // The [\s\S] matches any character including newlines
+          const namedExportRegex = /export\s+\{([\s\S]*?)\}\s*from\s+['"]([^'"]+)['"]/g;
+          let namedMatch;
+          while ((namedMatch = namedExportRegex.exec(content)) !== null) {
+            const exportsBlock = namedMatch[1];
+            const reExportPath = namedMatch[2];
 
-            // Parse the exports list
-            const exportedSymbols = exports.split(',').map(e => {
-              const parts = e.trim().split(/\s+as\s+/);
+            // Parse the exports list (may contain newlines)
+            const exportedSymbols = exportsBlock.split(',').map(e => {
+              // Remove "type " prefix if present (for type re-exports)
+              const cleaned = e.trim().replace(/^type\s+/, '');
+              if (!cleaned) return null;
+              const parts = cleaned.split(/\s+as\s+/);
               return {
                 original: parts[0].trim(),
                 alias: parts[1]?.trim() || parts[0].trim()
               };
-            });
+            }).filter((s): s is { original: string; alias: string } => s !== null && s.original !== '');
 
             // Check if our symbol is in this re-export
-            if (exportedSymbols.some(e => e.alias === symbol)) {
+            if (exportedSymbols.some(e => e.alias === symbol || e.original === symbol)) {
               const resolvedReExport = await this.resolveImport(reExportPath, currentFile);
               if (resolvedReExport && !visited.has(resolvedReExport)) {
                 currentFile = resolvedReExport;

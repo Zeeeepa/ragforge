@@ -43,6 +43,7 @@ import {
   type RagAgentOptions,
   type ResearchAgent,
 } from '@luciformresearch/ragforge';
+import { authManager, type AuthConfig } from './auth-config.js';
 
 // ============================================================================
 // Configuration
@@ -287,6 +288,40 @@ class BrainDaemon {
   private researchAgentConversationId: string | undefined = undefined;
 
   /**
+   * Get API key from authManager or fallback to environment/brainConfig.
+   * This centralizes API key retrieval and allows LucieCode to configure auth.
+   */
+  private async getApiKey(): Promise<string | null> {
+    // First, try authManager (configured by LucieCode)
+    if (authManager.isConfigured()) {
+      const token = await authManager.getAccessToken();
+      if (token) {
+        return token;
+      }
+      // If authManager is configured but no token, try API key
+      const apiKey = await authManager.getApiKey();
+      if (apiKey) {
+        return apiKey;
+      }
+    }
+
+    // Fallback to environment variable
+    if (process.env.GEMINI_API_KEY) {
+      return process.env.GEMINI_API_KEY;
+    }
+
+    // Fallback to brain config
+    if (this.brain) {
+      const brainConfig = this.brain.getConfig();
+      if (brainConfig.apiKeys?.gemini) {
+        return brainConfig.apiKeys.gemini;
+      }
+    }
+
+    return null;
+  }
+
+  /**
    * Sanitize tool arguments for logging:
    * - Hide sensitive fields (apiKey, password, token, secret, etc.)
    * - Truncate long strings/arrays
@@ -341,6 +376,7 @@ class BrainDaemon {
 
   /**
    * Write brain_search results as raw JSON - exact output the agent receives
+   * Also writes markdown file if format=markdown was used
    */
   private async writeBrainSearchDetails(query: string, args: any, result: any): Promise<string> {
     const timestamp = getFilenameTimestamp();
@@ -355,6 +391,14 @@ class BrainDaemon {
     };
 
     await fs.writeFile(filepath, JSON.stringify(output, null, 2), 'utf-8');
+
+    // Also write markdown if formatted_output is present
+    if (result.formatted_output && typeof result.formatted_output === 'string') {
+      const mdFilename = `brain_search_${timestamp}.md`;
+      const mdFilepath = path.join(LOG_DIR, mdFilename);
+      await fs.writeFile(mdFilepath, result.formatted_output, 'utf-8');
+    }
+
     return filepath;
   }
 
@@ -451,6 +495,23 @@ class BrainDaemon {
       this.brain = await BrainManager.getInstance();
       await this.brain.initialize();
       this.logger.info('BrainManager ready');
+
+      // Sync auth from authManager if configured (LucieCode may have configured it before brain init)
+      if (authManager.isConfigured()) {
+        try {
+          const token = await authManager.getAccessToken();
+          const apiKey = await authManager.getApiKey();
+          const key = token || apiKey;
+
+          if (key) {
+            const brainConfig = this.brain.getConfig();
+            brainConfig.apiKeys.gemini = key;
+            this.logger.info('Synced auth from LucieCode to Brain config');
+          }
+        } catch (error: any) {
+          this.logger.warn('Failed to sync auth to Brain', { error: error.message });
+        }
+      }
 
       // Generate tool handlers
       this.logger.info('Generating tool handlers...');
@@ -800,6 +861,75 @@ class BrainDaemon {
         status: 'ready',
         timestamp: getLocalTimestamp(),
         uptime: Math.floor((Date.now() - this.startTime.getTime()) / 1000),
+      };
+    });
+
+    // Configure authentication (called by LucieCode at startup)
+    // LucieCode passes file paths, daemon reads credentials when needed
+    this.server.post<{
+      Body: AuthConfig;
+    }>('/api/configure', async (request, reply) => {
+      const config = request.body;
+
+      if (!config || !config.type) {
+        reply.status(400);
+        return { success: false, error: 'Invalid auth config: missing type' };
+      }
+
+      // Validate config based on type
+      if (config.type === 'oauth-file') {
+        if (!config.path) {
+          reply.status(400);
+          return { success: false, error: 'oauth-file config requires path' };
+        }
+        // Check if file exists
+        try {
+          await access(config.path);
+        } catch {
+          reply.status(400);
+          return { success: false, error: `OAuth credentials file not found: ${config.path}` };
+        }
+      }
+
+      // Configure the auth manager
+      authManager.configure(config);
+
+      this.logger.info('Auth configured', {
+        type: config.type,
+        path: config.type === 'oauth-file' ? config.path : undefined,
+      });
+
+      // Sync auth to Brain if initialized
+      if (this.brain) {
+        try {
+          const token = await authManager.getAccessToken();
+          const apiKey = await authManager.getApiKey();
+          const key = token || apiKey;
+
+          if (key) {
+            const brainConfig = this.brain.getConfig();
+            brainConfig.apiKeys.gemini = key;
+            this.logger.info('Synced auth to Brain config');
+          }
+        } catch (error: any) {
+          this.logger.warn('Failed to sync auth to Brain', { error: error.message });
+        }
+      }
+
+      return {
+        success: true,
+        authType: config.type,
+        message: 'Authentication configured successfully',
+      };
+    });
+
+    // Get current auth status
+    this.server.get('/api/auth-status', async () => {
+      const config = authManager.getConfig();
+      return {
+        configured: authManager.isConfigured(),
+        type: authManager.getAuthType(),
+        path: config?.type === 'oauth-file' ? config.path : undefined,
       };
     });
 
@@ -1230,12 +1360,11 @@ class BrainDaemon {
 
         // Create or reuse ResearchAgent
         if (!this.researchAgent || (conversationId && conversationId !== this.researchAgentConversationId)) {
-          // Get API key
-          const brainConfig = brain.getConfig();
-          const apiKey = process.env.GEMINI_API_KEY || brainConfig.apiKeys.gemini;
+          // Get API key (uses authManager if configured by LucieCode)
+          const apiKey = await this.getApiKey();
 
           if (!apiKey) {
-            reply.raw.write(`data: ${JSON.stringify({ type: 'error', error: 'GEMINI_API_KEY not configured' })}\n\n`);
+            reply.raw.write(`data: ${JSON.stringify({ type: 'error', error: 'GEMINI_API_KEY not configured. Use /api/configure or set GEMINI_API_KEY env var.' })}\n\n`);
             reply.raw.end();
             return;
           }
@@ -1415,13 +1544,12 @@ class BrainDaemon {
         // Ensure brain is initialized
         const brain = await this.ensureBrain();
 
-        // Get API key
-        const brainConfig = brain.getConfig();
-        const apiKey = process.env.GEMINI_API_KEY || brainConfig.apiKeys.gemini;
+        // Get API key (uses authManager if configured by LucieCode)
+        const apiKey = await this.getApiKey();
 
         if (!apiKey) {
           reply.status(500);
-          return { success: false, error: 'GEMINI_API_KEY not configured' };
+          return { success: false, error: 'GEMINI_API_KEY not configured. Use /api/configure or set GEMINI_API_KEY env var.' };
         }
 
         // Generate log path for agent session
@@ -1499,13 +1627,12 @@ class BrainDaemon {
         // Determine working directory
         const workingDir = cwd || process.cwd();
 
-        // Get API key
-        const brainConfig = await brain.getConfig();
-        const apiKey = process.env.GEMINI_API_KEY || brainConfig.apiKeys.gemini;
+        // Get API key (uses authManager if configured by LucieCode)
+        const apiKey = await this.getApiKey();
 
         if (!apiKey) {
           reply.status(500);
-          return { success: false, error: 'GEMINI_API_KEY not configured' };
+          return { success: false, error: 'GEMINI_API_KEY not configured. Use /api/configure or set GEMINI_API_KEY env var.' };
         }
 
         // Generate log path for agent session

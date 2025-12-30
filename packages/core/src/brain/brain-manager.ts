@@ -28,7 +28,7 @@ import type { RagForgeConfig } from '../types/config.js';
 import { UniversalSourceAdapter } from '../runtime/adapters/universal-source-adapter.js';
 import type { ParseResult } from '../runtime/adapters/types.js';
 import { formatLocalDate } from '../runtime/utils/timestamp.js';
-import { EmbeddingService, MULTI_EMBED_CONFIGS } from './embedding-service.js';
+import { EmbeddingService, MULTI_EMBED_CONFIGS, type EmbeddingProviderConfig } from './embedding-service.js';
 import { TouchedFilesWatcher, type ProcessingStats as TouchedFilesStats } from './touched-files-watcher.js';
 import type { FileState } from './file-state-machine.js';
 import { CONTENT_NODE_LABELS } from '../utils/node-schema.js';
@@ -40,6 +40,7 @@ import { UniqueIDHelper } from '../runtime/utils/UniqueIDHelper.js';
 import neo4j from 'neo4j-driver';
 import { matchesGlob } from '../runtime/utils/pattern-matching.js';
 import { processBatch } from '../runtime/utils/batch-processor.js';
+import { DEFAULT_INCLUDE_PATTERNS, DEFAULT_EXCLUDE_PATTERNS } from '../ingestion/constants.js';
 
 const execAsync = promisify(exec);
 
@@ -155,11 +156,22 @@ export interface BrainConfig {
   /** Embedding configuration */
   embeddings: {
     /** Default provider */
-    provider: 'gemini' | 'openai';
+    provider: 'gemini' | 'openai' | 'ollama';
     /** Default model */
     model: string;
     /** Enable embedding cache */
     cacheEnabled: boolean;
+    /** Ollama-specific configuration */
+    ollama?: {
+      /** Ollama API base URL (default: http://localhost:11434) */
+      baseUrl?: string;
+      /** Model name (default: nomic-embed-text) */
+      model?: string;
+      /** Batch size for parallel requests (default: 10) */
+      batchSize?: number;
+      /** Request timeout in ms (default: 30000) */
+      timeout?: number;
+    };
   };
 
   /** Auto-cleanup policy */
@@ -740,6 +752,16 @@ export class BrainManager {
    * 2. Find nodes where schemaVersion differs (or is missing)
    * 3. Mark those nodes as embeddingsDirty for re-processing
    */
+  /**
+   * Parent-child label relationships for schema versioning.
+   * When checking a parent label, skip nodes that have a child label
+   * (they use the child's schemaVersion instead).
+   */
+  private static readonly LABEL_CHILDREN: Record<string, string[]> = {
+    'MediaFile': ['ImageFile', 'ThreeDFile', 'DocumentFile'],
+    'DocumentFile': ['PDFDocument', 'WordDocument', 'SpreadsheetDocument'],
+  };
+
   private async checkSchemaUpdates(): Promise<void> {
     if (!this.neo4jClient) return;
 
@@ -748,13 +770,19 @@ export class BrainManager {
 
     for (const label of CONTENT_NODE_LABELS) {
       try {
-        // Get a sample node to compute current schema
+        // Build exclusion clause for child labels
+        const childLabels = BrainManager.LABEL_CHILDREN[label] || [];
+        const exclusionClause = childLabels.length > 0
+          ? `AND NOT (${childLabels.map(c => `n:${c}`).join(' OR ')})`
+          : '';
+
+        // Get a sample node to compute current schema (excluding nodes with child labels)
         const sampleResult = await this.neo4jClient.run(
-          `MATCH (n:${label}) RETURN n LIMIT 1`
+          `MATCH (n:${label}) WHERE true ${exclusionClause} RETURN n LIMIT 1`
         );
 
         if (sampleResult.records.length === 0) {
-          continue; // No nodes of this type
+          continue; // No nodes of this type (or all have child labels)
         }
 
         const sampleNode = sampleResult.records[0].get('n');
@@ -763,10 +791,11 @@ export class BrainManager {
         // Compute what schemaVersion should be for current property set
         const currentSchemaVersion = computeSchemaHash(label, props);
 
-        // Find nodes with different or missing schemaVersion
+        // Find nodes with different or missing schemaVersion (excluding nodes with child labels)
         const outdatedResult = await this.neo4jClient.run(
           `MATCH (n:${label})
-           WHERE n.schemaVersion IS NULL OR n.schemaVersion <> $currentVersion
+           WHERE (n.schemaVersion IS NULL OR n.schemaVersion <> $currentVersion)
+           ${exclusionClause}
            RETURN count(n) as count`,
           { currentVersion: currentSchemaVersion }
         );
@@ -776,10 +805,11 @@ export class BrainManager {
         if (outdatedCount > 0) {
           console.log(`[Brain] Found ${outdatedCount} outdated ${label} nodes (schema changed)`);
 
-          // Mark them as dirty for re-ingestion
+          // Mark them as dirty for re-ingestion (excluding nodes with child labels)
           await this.neo4jClient.run(
             `MATCH (n:${label})
-             WHERE n.schemaVersion IS NULL OR n.schemaVersion <> $currentVersion
+             WHERE (n.schemaVersion IS NULL OR n.schemaVersion <> $currentVersion)
+             ${exclusionClause}
              SET n.embeddingsDirty = true, n.schemaDirty = true`,
             { currentVersion: currentSchemaVersion }
           );
@@ -1368,11 +1398,14 @@ volumes:
     this.ingestionManager = new IncrementalIngestionManager(this.neo4jClient);
     console.log('[Brain] IncrementalIngestionManager initialized');
 
-    // Initialize embedding service
-    const geminiKey = this.config.apiKeys?.gemini || process.env.GEMINI_API_KEY;
-    this.embeddingService = new EmbeddingService(this.neo4jClient, geminiKey);
+    // Initialize embedding service with configured provider
+    const embeddingConfig = this.buildEmbeddingProviderConfig();
+    this.embeddingService = new EmbeddingService(this.neo4jClient, embeddingConfig);
     if (this.embeddingService.canGenerateEmbeddings()) {
-      console.log('[Brain] EmbeddingService initialized');
+      const providerInfo = this.embeddingService.getProviderInfo();
+      console.log(`[Brain] EmbeddingService initialized (${providerInfo?.name}/${providerInfo?.model})`);
+    } else {
+      console.log('[Brain] EmbeddingService initialized (no provider configured)');
     }
 
     // Initialize touched-files watcher
@@ -2476,23 +2509,9 @@ volumes:
       console.log(`[QuickIngest] Migrated ${orphanStats.migratedFiles} orphan files to project (embeddings preserved)`);
     }
 
-    // Use provided patterns or defaults
-    const includePatterns = options.include || [
-      '**/*.ts', '**/*.tsx', '**/*.js', '**/*.jsx',
-      '**/*.py',
-      '**/*.vue', '**/*.svelte',
-      '**/*.html', '**/*.css', '**/*.scss',
-      '**/*.md', '**/*.json', '**/*.yaml', '**/*.yml',
-      '**/*.pdf', '**/*.docx', '**/*.xlsx',
-      '**/*.png', '**/*.jpg', '**/*.jpeg', '**/*.gif',
-      '**/*.glb', '**/*.gltf',
-    ];
-
-    const excludePatterns = options.exclude || [
-      '**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**',
-      '**/__pycache__/**', '**/target/**', '**/.ragforge/**',
-      '**/coverage/**', '**/.next/**', '**/.nuxt/**',
-    ];
+    // Use provided patterns or defaults (from shared constants)
+    const includePatterns = options.include || DEFAULT_INCLUDE_PATTERNS;
+    const excludePatterns = options.exclude || DEFAULT_EXCLUDE_PATTERNS;
 
     // Start watcher with initial sync (this does the actual ingestion)
     // The watcher handles: lock, ingestion, embeddings, and watching
@@ -4862,6 +4881,7 @@ volumes:
 
   /** Get brain config */
   getConfig(): BrainConfig {
+    // Test comment v3 - should only regenerate this scope's embedding
     return this.config;
   }
 
@@ -4903,6 +4923,79 @@ volumes:
   /** Get embedding service */
   getEmbeddingService(): EmbeddingService | null {
     return this.embeddingService;
+  }
+
+  /**
+   * Build the embedding provider configuration based on brain config
+   */
+  private buildEmbeddingProviderConfig(): EmbeddingProviderConfig | undefined {
+    const provider = this.config.embeddings?.provider || 'gemini';
+
+    if (provider === 'ollama') {
+      // Ollama doesn't require an API key
+      const ollamaConfig = this.config.embeddings?.ollama || {};
+      return {
+        type: 'ollama',
+        baseUrl: ollamaConfig.baseUrl,
+        model: ollamaConfig.model || this.config.embeddings?.model,
+        batchSize: ollamaConfig.batchSize,
+        timeout: ollamaConfig.timeout,
+      };
+    }
+
+    // Gemini (default)
+    const geminiKey = this.config.apiKeys?.gemini || process.env.GEMINI_API_KEY;
+    if (!geminiKey) {
+      return undefined; // No API key, can't generate embeddings
+    }
+    return {
+      type: 'gemini',
+      apiKey: geminiKey,
+      dimension: 3072,
+    };
+  }
+
+  /**
+   * Switch the embedding provider at runtime
+   * @param provider - 'gemini' or 'ollama'
+   * @param config - Optional provider-specific configuration
+   */
+  async switchEmbeddingProvider(
+    provider: 'gemini' | 'ollama',
+    config?: { model?: string; baseUrl?: string }
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      if (provider === 'ollama') {
+        const { OllamaEmbeddingProvider } = await import('../runtime/embedding/ollama-embedding-provider.js');
+        const ollamaProvider = new OllamaEmbeddingProvider({
+          baseUrl: config?.baseUrl,
+          model: config?.model,
+        });
+        // Check if Ollama is running
+        const health = await ollamaProvider.checkHealth();
+        if (!health.ok) {
+          return { success: false, error: health.error };
+        }
+        this.embeddingService?.setProvider(ollamaProvider);
+        console.log(`[Brain] Switched to Ollama provider (${ollamaProvider.getModelName()})`);
+        return { success: true };
+      } else {
+        const geminiKey = this.config.apiKeys?.gemini || process.env.GEMINI_API_KEY;
+        if (!geminiKey) {
+          return { success: false, error: 'No Gemini API key configured' };
+        }
+        const { GeminiEmbeddingProvider } = await import('../runtime/embedding/embedding-provider.js');
+        const geminiProvider = new GeminiEmbeddingProvider({
+          apiKey: geminiKey,
+          dimension: 3072,
+        });
+        this.embeddingService?.setProvider(geminiProvider);
+        console.log(`[Brain] Switched to Gemini provider`);
+        return { success: true };
+      }
+    } catch (error: any) {
+      return { success: false, error: error.message };
+    }
   }
 
   /** Get ingestion lock */
@@ -5028,10 +5121,23 @@ volumes:
     // otherwise generate from path
     const projectId = options.projectId || ProjectRegistry.generateId(absolutePath);
 
-    // Check if already watching
+    // Check if already watching this exact project
     if (this.activeWatchers.has(projectId)) {
       console.log(`[Brain] Already watching project: ${projectId}`);
       return;
+    }
+
+    // Check if this path is inside an already-watched parent project
+    // If so, don't create a new watcher - just trigger a sync on the parent watcher
+    for (const [watcherId, watcher] of this.activeWatchers) {
+      const watcherRoot = watcher.getRoot();
+      if (absolutePath.startsWith(watcherRoot + path.sep)) {
+        console.log(`[Brain] Path ${absolutePath} is inside already-watched project ${watcherId}`);
+        console.log(`[Brain] Triggering sync on parent watcher instead of creating new watcher`);
+        // Queue the subdirectory for sync on the existing watcher
+        await watcher.queueDirectory(absolutePath);
+        return;
+      }
     }
 
     if (!this.neo4jClient) {
@@ -5041,25 +5147,9 @@ volumes:
     // Create IncrementalIngestionManager for the watcher
     const ingestionManager = new IncrementalIngestionManager(this.neo4jClient);
 
-    // Default patterns (code + documents + data + media)
-    const includePatterns = options.includePatterns || [
-      // Code
-      '**/*.ts', '**/*.tsx', '**/*.js', '**/*.jsx',
-      '**/*.py', '**/*.vue', '**/*.svelte',
-      '**/*.html', '**/*.css', '**/*.scss',
-      // Documents
-      '**/*.pdf', '**/*.docx', '**/*.xlsx', '**/*.xls', '**/*.csv',
-      // Data
-      '**/*.md', '**/*.json', '**/*.yaml', '**/*.yml',
-      // Media (images + 3D)
-      '**/*.png', '**/*.jpg', '**/*.jpeg', '**/*.gif', '**/*.webp', '**/*.svg',
-      '**/*.glb', '**/*.gltf', '**/*.obj',
-    ];
-
-    const excludePatterns = options.excludePatterns || [
-      '**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**',
-      '**/__pycache__/**', '**/target/**', '**/.ragforge/**',
-    ];
+    // Default patterns from shared constants
+    const includePatterns = options.includePatterns || DEFAULT_INCLUDE_PATTERNS;
+    const excludePatterns = options.excludePatterns || DEFAULT_EXCLUDE_PATTERNS;
 
     // Source config for the watcher
     const sourceConfig = {

@@ -33,7 +33,7 @@ Persistent knowledge graph with Neo4j:
 - Regex-based fallback for exotic types
 
 **Documents:**
-- PDF (Tika + Gemini Vision fallback)
+- PDF (pdfjs-dist + Gemini Vision for scans)
 - DOCX, XLSX (native parsing)
 - Markdown (section/heading extraction)
 - JSON, YAML, CSV

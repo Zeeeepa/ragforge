@@ -1,5 +1,5 @@
 /**
- * Brain Tools
+ * Brain Tools - Updated 2025-12-30
  *
  * Tools for interacting with the agent's persistent brain:
  * - ingest_directory: Quick ingest any directory into the brain
@@ -10,7 +10,7 @@
  * @since 2025-12-07
  */
 
-import { BrainManager, type QuickIngestOptions, type BrainSearchOptions, type QuickIngestResult, type UnifiedSearchResult } from '../brain/index.js';
+import { BrainManager, type QuickIngestOptions, type BrainSearchOptions, type QuickIngestResult, type UnifiedSearchResult, formatAsMarkdown, formatAsCompact, type BrainSearchOutput } from '../brain/index.js';
 import type { GeneratedToolDefinition } from './types/index.js';
 import { getGlobalFetchCache, type CachedFetchResult } from './web-tools.js';
 import { NODE_SCHEMAS, CONTENT_NODE_LABELS, type NodeTypeSchema } from '../utils/node-schema.js';
@@ -502,6 +502,26 @@ Only applies when semantic=false (BM25 mode).
 - 1: Allow 1 character difference (default, good for small typos)
 - 2: Allow 2 character differences (more tolerant, may return less relevant results)`,
         },
+        format: {
+          type: 'string',
+          enum: ['json', 'markdown', 'compact'],
+          optional: true,
+          description: `Output format for results:
+- "json": Full JSON output with all fields (default)
+- "markdown": Human-readable markdown with ASCII dependency tree
+- "compact": Minimal JSON with only essential fields
+
+Markdown format is ~90% smaller than full JSON and includes:
+- Results with title, location, score
+- ASCII tree visualization of dependency graph
+- Summary table of node types`,
+        },
+        include_source: {
+          type: 'boolean',
+          optional: true,
+          description: `Include source code in markdown output (default: true for first 5 results).
+Only used when format="markdown". Set to false to hide code snippets.`,
+        },
       },
       required: ['query'],
     },
@@ -529,6 +549,8 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
     summarize?: boolean;
     summarize_context?: string;
     fuzzy_distance?: 0 | 1 | 2;
+    format?: 'json' | 'markdown' | 'compact';
+    include_source?: boolean;
   }): Promise<UnifiedSearchResult & {
     waited_for_edits?: boolean;
     watchers_started?: string[];
@@ -563,6 +585,8 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
         type: string;
       }>;
     };
+    /** Formatted output when format parameter is used */
+    formatted_output?: string | object;
   }> => {
     const { createLogger } = await import('../runtime/utils/logger.js');
     const log = createLogger('brain_search');
@@ -1349,6 +1373,57 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
       const totalDuration = Date.now() - startTime;
       log.info('COMPLETE', { totalDuration, reranked, keywordBoosted, relationshipsExplored, summarized });
 
+      // Build the base response
+      const baseResponse = {
+        ...result,
+        waited_for_edits: waitedForSync || undefined,
+        watchers_started: watchersStarted.length > 0 ? watchersStarted : undefined,
+        flushed_projects: flushedProjects.length > 0 ? flushedProjects : undefined,
+        reranked: reranked || undefined,
+        keyword_boosted: keywordBoosted || undefined,
+        relationships_explored: relationshipsExplored || undefined,
+        summarized: summarized || undefined,
+        summary,
+        graph,
+      };
+
+      // Apply formatting if requested
+      let formatted_output: string | object | undefined;
+      if (params.format && params.format !== 'json') {
+        const formatterInput: BrainSearchOutput = {
+          results: result.results,
+          totalCount: result.totalCount,
+          searchedProjects: result.searchedProjects,
+          graph,
+          summary,
+        };
+
+        if (params.format === 'markdown') {
+          formatted_output = formatAsMarkdown(formatterInput, params.query, {
+            includeSource: params.include_source,
+            includeGraph: !!graph,
+            searchParams: {
+              query: params.query,
+              semantic: params.semantic,
+              embedding_type: params.embedding_type,
+              types: params.types,
+              projects: params.projects,
+              glob: params.glob,
+              base_path: params.base_path,
+              limit: params.limit,
+              min_score: params.min_score,
+              boost_keywords: params.boost_keywords,
+              boost_weight: params.boost_weight,
+              explore_depth: params.explore_depth,
+              use_reranking: params.use_reranking,
+              fuzzy_distance: params.fuzzy_distance,
+            },
+          });
+        } else if (params.format === 'compact') {
+          formatted_output = formatAsCompact(formatterInput, params.query);
+        }
+      }
+
       // When summarized, return only the summary (not full results) to reduce context size
       if (summarized && summary) {
         return {
@@ -1364,20 +1439,29 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
           summarized: true,
           summary,
           graph,
+          formatted_output,
+        };
+      }
+
+      // When format is markdown or compact, return only formatted output (not raw results) to save context
+      if (params.format === 'markdown' || params.format === 'compact') {
+        return {
+          results: [], // Empty to save context - use formatted_output instead
+          totalCount: result.totalCount,
+          searchedProjects: result.searchedProjects,
+          waited_for_edits: waitedForSync || undefined,
+          watchers_started: watchersStarted.length > 0 ? watchersStarted : undefined,
+          flushed_projects: flushedProjects.length > 0 ? flushedProjects : undefined,
+          reranked: reranked || undefined,
+          keyword_boosted: keywordBoosted || undefined,
+          relationships_explored: relationshipsExplored || undefined,
+          formatted_output,
         };
       }
 
       return {
-        ...result,
-        waited_for_edits: waitedForSync || undefined,
-        watchers_started: watchersStarted.length > 0 ? watchersStarted : undefined,
-        flushed_projects: flushedProjects.length > 0 ? flushedProjects : undefined,
-        reranked: reranked || undefined,
-        keyword_boosted: keywordBoosted || undefined,
-        relationships_explored: relationshipsExplored || undefined,
-        summarized: summarized || undefined,
-        summary,
-        graph,
+        ...baseResponse,
+        formatted_output,
       };
     } catch (error: any) {
       const totalDuration = Date.now() - startTime;
@@ -2649,12 +2733,13 @@ export function generateMarkFileDirtyHandler(ctx: BrainToolsContext) {
 
     try {
       // Mark all nodes associated with this file as dirty
+      // Use both file (relative) and absolutePath for matching to handle path format variations
       const result = await neo4jClient.run(
         `MATCH (n)
-         WHERE n.file = $filePath AND n.projectId = $projectId
+         WHERE (n.file = $relativePath OR n.absolutePath = $absolutePath) AND n.projectId = $projectId
          SET n.schemaDirty = true, n.embeddingsDirty = true
          RETURN count(n) AS count`,
-        { filePath: relativePath, projectId: project.id }
+        { relativePath, absolutePath, projectId: project.id }
       );
 
       const nodesMarked = result.records.length > 0 ? (result.records[0]?.get('count')?.toNumber() || 0) : 0;
@@ -4460,6 +4545,91 @@ export function generateSetApiKeyHandler(ctx: BrainToolsContext) {
 }
 
 /**
+ * Generate switch_embedding_provider tool definition
+ * Allows switching between Gemini (cloud) and Ollama (local) embedding providers
+ */
+export function generateSwitchEmbeddingProviderTool(): GeneratedToolDefinition {
+  return {
+    name: 'switch_embedding_provider',
+    description: `Switch the embedding provider between Gemini (cloud) and Ollama (local).
+
+Use this when:
+- You want to use free, local embeddings with Ollama
+- You've hit Gemini API quota limits
+- You need private/offline embedding generation
+
+Providers:
+- gemini: Cloud-based, requires API key, best quality (3072 dimensions)
+- ollama: Local, free, private (768-1024 dimensions depending on model)
+
+For Ollama, make sure it's running locally (default: http://localhost:11434)
+and you have an embedding model pulled (e.g., \`ollama pull nomic-embed-text\`).
+
+Recommended Ollama models:
+- nomic-embed-text (768 dims, good quality, default)
+- mxbai-embed-large (1024 dims, better quality)
+- all-minilm (384 dims, fast)
+
+Example:
+  switch_embedding_provider({ provider: "ollama" })
+  switch_embedding_provider({ provider: "ollama", model: "mxbai-embed-large" })
+  switch_embedding_provider({ provider: "gemini" })`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        provider: {
+          type: 'string',
+          enum: ['gemini', 'ollama'],
+          description: 'Embedding provider to switch to',
+        },
+        model: {
+          type: 'string',
+          description: 'Model name (optional, uses default for each provider)',
+        },
+        base_url: {
+          type: 'string',
+          description: 'Base URL for Ollama API (default: http://localhost:11434)',
+        },
+      },
+      required: ['provider'],
+    },
+  };
+}
+
+/**
+ * Generate handler for switch_embedding_provider
+ */
+export function generateSwitchEmbeddingProviderHandler(ctx: BrainToolsContext) {
+  return async (params: {
+    provider: 'gemini' | 'ollama';
+    model?: string;
+    base_url?: string;
+  }): Promise<{ success: boolean; message: string; provider_info?: { name: string; model: string } }> => {
+    const { provider, model, base_url } = params;
+
+    const result = await ctx.brain.switchEmbeddingProvider(provider, {
+      model,
+      baseUrl: base_url,
+    });
+
+    if (!result.success) {
+      return {
+        success: false,
+        message: result.error || 'Failed to switch provider',
+      };
+    }
+
+    const providerInfo = ctx.brain.getEmbeddingService()?.getProviderInfo();
+
+    return {
+      success: true,
+      message: `Switched to ${provider} embedding provider`,
+      provider_info: providerInfo || undefined,
+    };
+  };
+}
+
+/**
  * Generate get_brain_status tool definition
  */
 export function generateGetBrainStatusTool(): GeneratedToolDefinition {
@@ -4490,10 +4660,13 @@ export function generateGetBrainStatusHandler(ctx: BrainToolsContext) {
     brainPath: string;
     neo4j: { connected: boolean; uri?: string };
     apiKeys: { gemini: boolean; replicate: boolean };
+    embeddings: { enabled: boolean; provider?: string; model?: string };
     projects: number;
   }> => {
     const config = ctx.brain.getConfig();
     const neo4jClient = ctx.brain.getNeo4jClient();
+    const embeddingService = ctx.brain.getEmbeddingService();
+    const providerInfo = embeddingService?.getProviderInfo();
 
     return {
       brainPath: config.path,
@@ -4504,6 +4677,11 @@ export function generateGetBrainStatusHandler(ctx: BrainToolsContext) {
       apiKeys: {
         gemini: !!config.apiKeys.gemini,
         replicate: !!config.apiKeys.replicate,
+      },
+      embeddings: {
+        enabled: embeddingService?.canGenerateEmbeddings() || false,
+        provider: providerInfo?.name,
+        model: providerInfo?.model,
       },
       projects: ctx.brain.listProjects().length,
     };
@@ -5983,6 +6161,7 @@ export function generateExploreNodeHandler(ctx: BrainToolsContext) {
 export function generateSetupTools(): GeneratedToolDefinition[] {
   return [
     generateSetApiKeyTool(),
+    generateSwitchEmbeddingProviderTool(),
     generateGetBrainStatusTool(),
     generateCleanupBrainTool(),
     generateRunCypherTool(),
@@ -5995,8 +6174,10 @@ export function generateSetupTools(): GeneratedToolDefinition[] {
 export function generateSetupToolHandlers(ctx: BrainToolsContext): Record<string, (params: any) => Promise<any>> {
   return {
     set_api_key: generateSetApiKeyHandler(ctx),
+    switch_embedding_provider: generateSwitchEmbeddingProviderHandler(ctx),
     get_brain_status: generateGetBrainStatusHandler(ctx),
     cleanup_brain: generateCleanupBrainHandler(ctx),
     run_cypher: generateRunCypherHandler(ctx),
   };
 }
+// test watcher sam. 20 déc. 2025 02:19:28 CET

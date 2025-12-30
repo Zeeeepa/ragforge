@@ -181,7 +181,7 @@ export function detectFileCategory(filePath: string): 'code' | 'document' | 'dat
  * Get recommended include patterns for a directory
  */
 export async function detectIncludePatterns(rootPath: string): Promise<string[]> {
-  const { globby } = await import('globby');
+  const fg = (await import('fast-glob')).default;
   const fs = await import('fs/promises');
   const path = await import('path');
 
@@ -191,7 +191,7 @@ export async function detectIncludePatterns(rootPath: string): Promise<string[]>
     return ['**/*'];
   }
 
-  const sampleFiles = await globby(['**/*'], {
+  const sampleFiles = await fg(['**/*'], {
     cwd: rootPath,
     ignore: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**', '**/.ragforge/**', '**/__pycache__/**', '**/target/**'],
     onlyFiles: true,
