@@ -1174,12 +1174,14 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
             const nodeUuid = r.node?.uuid;
             if (!nodeUuid) continue;
 
-            // Add this result to graph nodes
+            // Add this result to graph nodes (include line numbers for location info)
             graphNodes.set(nodeUuid, {
               uuid: nodeUuid,
               name: r.node?.name || r.node?.signature || 'unnamed',
               type: r.node?.type || 'unknown',
               file: r.node?.file || r.node?.absolutePath,
+              startLine: r.node?.startLine,
+              endLine: r.node?.endLine,
               score: r.score,
               isSearchResult: true,
             });
@@ -4824,7 +4826,23 @@ export function generateCleanupBrainHandler(ctx: BrainToolsContext) {
     }
 
     if (mode === 'data_only') {
-      // Just clear Neo4j data
+      // 1. Stop all active watchers first (they have cached state that needs to be cleared)
+      const watchedProjects = ctx.brain.getWatchedProjects();
+      for (const projectId of watchedProjects) {
+        try {
+          // Get the watcher to access its root path
+          const projects = await ctx.brain.listProjects();
+          const project = projects.find(p => p.id === projectId);
+          if (project?.path) {
+            await ctx.brain.stopWatching(project.path);
+            details.push(`Stopped watcher: ${projectId}`);
+          }
+        } catch (err: any) {
+          details.push(`Warning: Could not stop watcher ${projectId}: ${err.message}`);
+        }
+      }
+
+      // 2. Clear Neo4j data
       const neo4jClient = ctx.brain.getNeo4jClient();
       if (neo4jClient) {
         try {
@@ -4838,7 +4856,7 @@ export function generateCleanupBrainHandler(ctx: BrainToolsContext) {
         }
       }
 
-      // Clear projects registry (both file and in-memory)
+      // 3. Clear projects registry (both file and in-memory)
       try {
         await ctx.brain.clearProjectsRegistry();
         details.push('Cleared projects registry');
@@ -4848,7 +4866,7 @@ export function generateCleanupBrainHandler(ctx: BrainToolsContext) {
 
       return {
         success: true,
-        message: 'Brain data cleared successfully. Config and credentials preserved.',
+        message: 'Brain data cleared successfully. Config and credentials preserved. All watchers stopped - re-ingest to restart.',
         details,
       };
     }

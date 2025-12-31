@@ -22,6 +22,12 @@ import { GeminiEmbeddingProvider, type EmbeddingProviderInterface } from '../run
 import { OllamaEmbeddingProvider } from '../runtime/embedding/ollama-embedding-provider.js';
 import { chunkText, needsChunking, type TextChunk } from '../runtime/embedding/text-chunker.js';
 import { getRecordEmbeddingExtractors } from '../utils/node-schema.js';
+import {
+  NodeStateMachine,
+  STATE_PROPERTIES as P,
+  getRecordExtractors,
+  areParsersRegistered,
+} from '../ingestion/index.js';
 
 /**
  * Threshold for chunking large content (in characters)
@@ -209,11 +215,21 @@ export function hashContent(text: string): string {
 }
 
 /**
- * Build embedding field configs using FIELD_MAPPING from node-schema.ts
- * This ensures a single source of truth for field extraction logic.
+ * Build embedding field configs.
+ *
+ * Source of truth:
+ * 1. Parser-registry (new system) - if parsers are registered
+ * 2. node-schema.ts FIELD_MAPPING (legacy fallback)
+ *
+ * This ensures gradual migration to the new parser system.
  */
 function buildEmbeddingConfigs(label: string, hasDescription: boolean = true): EmbeddingFieldConfig[] {
-  const extractors = getRecordEmbeddingExtractors(label);
+  // Use parser-registry extractors if parsers are registered
+  // Otherwise fall back to legacy node-schema extractors
+  const extractors = areParsersRegistered()
+    ? getRecordExtractors(label)
+    : getRecordEmbeddingExtractors(label);
+
   const configs: EmbeddingFieldConfig[] = [
     {
       propertyName: 'embedding_name',
@@ -262,7 +278,7 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
                    s.embedding_description_hash AS embedding_description_hash,
                    s.embedding_provider AS embedding_provider,
                    s.embedding_model AS embedding_model,
-                   s.embeddingsDirty AS embeddingsDirty
+                   s.${P.state} AS _state
             ORDER BY s.file, s.startLine`,
     embeddings: buildEmbeddingConfigs('Scope', true),
   },
@@ -275,7 +291,7 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
                    f.embedding_content_hash AS embedding_content_hash,
                    f.embedding_provider AS embedding_provider,
                    f.embedding_model AS embedding_model,
-                   f.embeddingsDirty AS embeddingsDirty`,
+                   f.${P.state} AS _state`,
     embeddings: buildEmbeddingConfigs('File', false),
   },
   {
@@ -288,7 +304,7 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
                    m.embedding_description_hash AS embedding_description_hash,
                    m.embedding_provider AS embedding_provider,
                    m.embedding_model AS embedding_model,
-                   m.embeddingsDirty AS embeddingsDirty`,
+                   m.${P.state} AS _state`,
     embeddings: buildEmbeddingConfigs('MarkdownDocument', true),
   },
   {
@@ -299,7 +315,7 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
                    s.embedding_content_hash AS embedding_content_hash,
                    s.embedding_provider AS embedding_provider,
                    s.embedding_model AS embedding_model,
-                   s.embeddingsDirty AS embeddingsDirty`,
+                   s.${P.state} AS _state`,
     embeddings: buildEmbeddingConfigs('MarkdownSection', false),
   },
   {
@@ -311,7 +327,7 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
                    c.embedding_content_hash AS embedding_content_hash,
                    c.embedding_provider AS embedding_provider,
                    c.embedding_model AS embedding_model,
-                   c.embeddingsDirty AS embeddingsDirty`,
+                   c.${P.state} AS _state`,
     embeddings: buildEmbeddingConfigs('CodeBlock', false),
   },
   {
@@ -323,7 +339,7 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
                    d.embedding_content_hash AS embedding_content_hash,
                    d.embedding_provider AS embedding_provider,
                    d.embedding_model AS embedding_model,
-                   d.embeddingsDirty AS embeddingsDirty`,
+                   d.${P.state} AS _state`,
     embeddings: buildEmbeddingConfigs('DataFile', false),
   },
   {
@@ -336,7 +352,7 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
                    w.embedding_description_hash AS embedding_description_hash,
                    w.embedding_provider AS embedding_provider,
                    w.embedding_model AS embedding_model,
-                   w.embeddingsDirty AS embeddingsDirty`,
+                   w.${P.state} AS _state`,
     embeddings: buildEmbeddingConfigs('WebPage', true),
   },
   {
@@ -350,7 +366,7 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
                    m.embedding_description_hash AS embedding_description_hash,
                    m.embedding_provider AS embedding_provider,
                    m.embedding_model AS embedding_model,
-                   m.embeddingsDirty AS embeddingsDirty`,
+                   m.${P.state} AS _state`,
     embeddings: buildEmbeddingConfigs('MediaFile', true),
   },
   {
@@ -364,7 +380,7 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
                    t.embedding_description_hash AS embedding_description_hash,
                    t.embedding_provider AS embedding_provider,
                    t.embedding_model AS embedding_model,
-                   t.embeddingsDirty AS embeddingsDirty`,
+                   t.${P.state} AS _state`,
     embeddings: buildEmbeddingConfigs('ThreeDFile', true),
   },
   {
@@ -378,7 +394,7 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
                    d.embedding_description_hash AS embedding_description_hash,
                    d.embedding_provider AS embedding_provider,
                    d.embedding_model AS embedding_model,
-                   d.embeddingsDirty AS embeddingsDirty`,
+                   d.${P.state} AS _state`,
     embeddings: buildEmbeddingConfigs('DocumentFile', true),
   },
 ];
@@ -519,6 +535,7 @@ export type EmbeddingProviderConfig =
  */
 export class EmbeddingService {
   private embeddingProvider: EmbeddingProviderInterface | null = null;
+  private stateMachine: NodeStateMachine | null = null;
 
   /**
    * Create an EmbeddingService
@@ -563,6 +580,21 @@ export class EmbeddingService {
    */
   setProvider(provider: EmbeddingProviderInterface): void {
     this.embeddingProvider = provider;
+  }
+
+  /**
+   * Set the state machine for state-based embedding
+   * The service uses _state property to track embedding pipeline progress
+   */
+  setStateMachine(stateMachine: NodeStateMachine): void {
+    this.stateMachine = stateMachine;
+  }
+
+  /**
+   * Check if state machine is configured
+   */
+  hasStateMachine(): boolean {
+    return this.stateMachine !== null;
   }
 
   /**
@@ -974,7 +1006,11 @@ export class EmbeddingService {
              embedding_content_hash: chunk.hash,
              embedding_provider: chunk.provider,
              embedding_model: chunk.model,
-             embeddingsDirty: false
+             ${P.state}: 'ready',
+             ${P.stateChangedAt}: datetime(),
+             ${P.embeddedAt}: datetime(),
+             ${P.embeddingProvider}: chunk.provider,
+             ${P.embeddingModel}: chunk.model
            })
            CREATE (parent)-[:HAS_EMBEDDING_CHUNK]->(c)`,
           { chunks: chunkData, parentLabel: label }
@@ -983,7 +1019,7 @@ export class EmbeddingService {
         embeddedByType.content += tasks.length;
       }
 
-      // Mark nodes in this batch as done (embeddingsDirty = false)
+      // Mark nodes in this batch as done (transition to 'ready' state)
       // Collect unique nodes that were in this batch
       const processedUuids = new Set<string>();
       for (const task of batch) {
@@ -1012,7 +1048,9 @@ export class EmbeddingService {
           await this.neo4jClient.run(
             `UNWIND $uuids AS uuid
              MATCH (n:${label} {uuid: uuid})
-             SET n.embeddingsDirty = false`,
+             SET n.${P.state} = 'ready',
+                 n.${P.stateChangedAt} = datetime(),
+                 n.${P.embeddedAt} = datetime()`,
             { uuids: regularNodes.map(n => n.uuid) }
           );
         }
@@ -1026,8 +1064,12 @@ export class EmbeddingService {
           await this.neo4jClient.run(
             `UNWIND $nodes AS node
              MATCH (n:${label} {uuid: node.uuid})
-             SET n.embeddingsDirty = false, n.usesChunks = true, n.chunkCount = node.chunkCount,
-                 n.embedding_content_hash = node.contentHash`,
+             SET n.usesChunks = true,
+                 n.chunkCount = node.chunkCount,
+                 n.embedding_content_hash = node.contentHash,
+                 n.${P.state} = 'ready',
+                 n.${P.stateChangedAt} = datetime(),
+                 n.${P.embeddedAt} = datetime()`,
             { nodes: chunkData }
           );
         }
@@ -1064,6 +1106,38 @@ export class EmbeddingService {
   }
 
   /**
+   * Wrap a query with state-based filtering
+   * Only fetches nodes in 'linked' state (ready for embedding)
+   */
+  private wrapQueryWithStateFilter(query: string): string {
+    // Find the label from the query (e.g., "MATCH (s:Scope" -> "s")
+    const matchRegex = /MATCH\s*\((\w+):(\w+)/i;
+    const match = query.match(matchRegex);
+    if (!match) {
+      return query; // Can't parse, return as-is
+    }
+
+    const varName = match[1]; // e.g., "s"
+
+    // Check if there's already a WHERE clause
+    const hasWhere = /WHERE/i.test(query);
+
+    if (hasWhere) {
+      // Add state filter to existing WHERE clause
+      return query.replace(
+        /WHERE/i,
+        `WHERE ${varName}.${P.state} = 'linked' AND`
+      );
+    } else {
+      // Find "RETURN" and insert WHERE before it
+      return query.replace(
+        /RETURN/i,
+        `WHERE ${varName}.${P.state} = 'linked'\n            RETURN`
+      );
+    }
+  }
+
+  /**
    * Collect embedding tasks from a node type (without embedding)
    * Returns tasks ready for batched embedding
    */
@@ -1091,8 +1165,11 @@ export class EmbeddingService {
       params.limit = neo4j.int(config.limit);
     }
 
+    // Apply state filtering - only fetch nodes in 'linked' state
+    const query = this.wrapQueryWithStateFilter(config.query);
+
     // Fetch nodes
-    const result = await this.neo4jClient.run(config.query, params);
+    const result = await this.neo4jClient.run(query, params);
 
     if (result.records.length === 0) {
       return {
@@ -1132,7 +1209,7 @@ export class EmbeddingService {
         const existingHash = incrementalOnly ? (record.get(embeddingConfig.hashProperty) || null) : null;
         const existingProvider = record.get('embedding_provider') || null;
         const existingModel = record.get('embedding_model') || null;
-        const embeddingsDirty = record.get('embeddingsDirty') === true;
+        const nodeState = record.get('_state') || null;
 
         // Skip empty/tiny texts
         if (!rawText || rawText.length < 5) {
@@ -1280,29 +1357,37 @@ export class EmbeddingService {
   }
   /**
    * Build Cypher query for saving embeddings to a node
-   * Now also stores embedding_provider and embedding_model for compatibility tracking
+   * Sets embedding data and transitions state to 'ready'
    */
   private buildEmbeddingSaveCypher(embeddingProp: string, label: string): string {
-    // All save queries now include provider and model metadata
+    // Provider metadata
     const providerProps = `, n.embedding_provider = item.provider, n.embedding_model = item.model`;
+
+    // State machine properties - transition to 'ready' state after embedding
+    const stateProps = `,
+              n.${P.state} = 'ready',
+              n.${P.stateChangedAt} = datetime(),
+              n.${P.embeddedAt} = datetime(),
+              n.${P.embeddingProvider} = item.provider,
+              n.${P.embeddingModel} = item.model`;
 
     if (embeddingProp === 'embedding_name') {
       return `UNWIND $batch AS item
               MATCH (n:${label} {uuid: item.uuid})
-              SET n.embedding_name = item.embedding, n.embedding_name_hash = item.hash, n.embeddingsDirty = false${providerProps}`;
+              SET n.embedding_name = item.embedding, n.embedding_name_hash = item.hash${providerProps}${stateProps}`;
     } else if (embeddingProp === 'embedding_content') {
       return `UNWIND $batch AS item
               MATCH (n:${label} {uuid: item.uuid})
-              SET n.embedding_content = item.embedding, n.embedding_content_hash = item.hash, n.embeddingsDirty = false${providerProps}`;
+              SET n.embedding_content = item.embedding, n.embedding_content_hash = item.hash${providerProps}${stateProps}`;
     } else if (embeddingProp === 'embedding_description') {
       return `UNWIND $batch AS item
               MATCH (n:${label} {uuid: item.uuid})
-              SET n.embedding_description = item.embedding, n.embedding_description_hash = item.hash, n.embeddingsDirty = false${providerProps}`;
+              SET n.embedding_description = item.embedding, n.embedding_description_hash = item.hash${providerProps}${stateProps}`;
     } else {
       // Fallback for legacy 'embedding' property
       return `UNWIND $batch AS item
               MATCH (n:${label} {uuid: item.uuid})
-              SET n.embedding = item.embedding, n.embedding_hash = item.hash, n.embeddingsDirty = false${providerProps}`;
+              SET n.embedding = item.embedding, n.embedding_hash = item.hash${providerProps}${stateProps}`;
     }
   }
 

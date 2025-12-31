@@ -46,6 +46,8 @@ export interface BrainSearchOutput {
       name: string;
       type: string;
       file?: string;
+      startLine?: number;
+      endLine?: number;
       score: number | null;
       isSearchResult: boolean;
     }>;
@@ -429,8 +431,9 @@ function buildAsciiTree(
 ): string {
   if (graph.nodes.length === 0) return '(empty graph)';
 
-  const SKIP_EDGE_TYPES = new Set(['HAS_EMBEDDING_CHUNK']);
-  const SKIP_NODE_TYPES = new Set(['EmbeddingChunk']);
+  // Skip relationships that are redundant (file/project info already shown in node line)
+  const SKIP_EDGE_TYPES = new Set(['HAS_EMBEDDING_CHUNK', 'DEFINED_IN', 'BELONGS_TO', 'IN_DIRECTORY']);
+  const SKIP_NODE_TYPES = new Set(['EmbeddingChunk', 'File', 'Directory', 'Project']);
 
   // Build lookup maps
   const nodeMap = new Map(graph.nodes.map((n) => [n.uuid, n]));
@@ -491,9 +494,17 @@ function buildAsciiTree(
     const connector = depth === 0 ? '' : isLast ? '└── ' : '├── ';
     const childPrefix = depth === 0 ? '' : prefix + (isLast ? '    ' : '│   ');
 
-    // Node line
+    // Node line with location info (file:startLine-endLine or file:startLine)
     const scoreStr = node.score !== null ? ` ★${node.score.toFixed(1)}` : '';
-    const fileInfo = node.file ? ` @ ${node.file}` : '';
+    let fileInfo = '';
+    if (node.file) {
+      const lineInfo = node.startLine
+        ? node.endLine && node.endLine !== node.startLine
+          ? `:${node.startLine}-${node.endLine}`
+          : `:${node.startLine}`
+        : '';
+      fileInfo = ` @ ${node.file}${lineInfo}`;
+    }
     result.push(`${prefix}${connector}${node.name} (${node.type})${scoreStr}${fileInfo}`);
 
     // Get outgoing edges grouped by type

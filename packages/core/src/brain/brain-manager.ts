@@ -41,6 +41,17 @@ import neo4j from 'neo4j-driver';
 import { matchesGlob } from '../runtime/utils/pattern-matching.js';
 import { processBatch } from '../runtime/utils/batch-processor.js';
 import { DEFAULT_INCLUDE_PATTERNS, DEFAULT_EXCLUDE_PATTERNS } from '../ingestion/constants.js';
+import {
+  IngestionOrchestrator,
+  type OrchestratorDependencies,
+  type FileChange,
+  type ReingestOptions,
+  type IngestionStats,
+  NodeStateMachine,
+  type StateCounts,
+  registerAllParsers,
+  areParsersRegistered,
+} from '../ingestion/index.js';
 
 const execAsync = promisify(exec);
 
@@ -406,6 +417,8 @@ export class BrainManager {
   private ingestionLock: IngestionLock;
   private embeddingLock: IngestionLock;
   private activeWatchers: Map<string, FileWatcher> = new Map();
+  private _orchestrator: IngestionOrchestrator | null = null;
+  private _stateMachine: NodeStateMachine | null = null;
 
   private constructor(config: BrainConfig) {
     this.config = config;
@@ -461,6 +474,12 @@ export class BrainManager {
 
     console.log('[Brain] Initializing...');
 
+    // 0. Register all parsers (content extraction, embedding field definitions)
+    if (!areParsersRegistered()) {
+      registerAllParsers();
+      console.log('[Brain] Parsers registered');
+    }
+
     // 1. Create brain directory structure
     await this.ensureBrainDirectories();
 
@@ -488,8 +507,130 @@ export class BrainManager {
     // 9. Load projects from Neo4j into cache (for sync listProjects())
     await this.refreshProjectsCache();
 
+    // 10. Initialize ingestion orchestrator
+    await this.initializeOrchestrator();
+
     this.initialized = true;
     console.log('[Brain] Initialized successfully');
+  }
+
+  /**
+   * Initialize the ingestion orchestrator with wired dependencies
+   */
+  private async initializeOrchestrator(): Promise<void> {
+    if (!this.neo4jClient) {
+      console.warn('[Brain] Cannot initialize orchestrator: Neo4j client not connected');
+      return;
+    }
+
+    // Initialize state machine
+    this._stateMachine = new NodeStateMachine(this.neo4jClient);
+    console.log('[Brain] NodeStateMachine initialized');
+
+    const driver = this.neo4jClient.getDriver();
+
+    const deps: OrchestratorDependencies = {
+      driver,
+
+      // Parse files using UniversalSourceAdapter
+      parseFiles: async (options) => {
+        const result = await this.sourceAdapter.parse({
+          source: {
+            type: 'files',
+            root: options.root,
+            include: options.include,
+          },
+          projectId: options.projectId,
+          existingUUIDMapping: options.existingUUIDMapping,
+        });
+        return {
+          nodes: result.graph.nodes,
+          relationships: result.graph.relationships,
+          metadata: {
+            filesProcessed: result.graph.metadata.filesProcessed,
+            nodesGenerated: result.graph.metadata.nodesGenerated,
+          },
+        };
+      },
+
+      // Ingest graph using IncrementalIngestionManager
+      ingestGraph: async (graph, options) => {
+        const manager = this.getIngestionManager();
+        await manager.ingestGraph(
+          { nodes: graph.nodes, relationships: graph.relationships },
+          { projectId: options.projectId, markDirty: true }
+        );
+      },
+
+      // Delete nodes for files
+      deleteNodesForFiles: async (files, _projectId) => {
+        const manager = this.getIngestionManager();
+        // deleteNodesForFiles only takes one argument (filePaths)
+        return manager.deleteNodesForFiles(files);
+      },
+
+      // Get embedding provider info
+      getEmbeddingProviderInfo: () => {
+        const service = this.getEmbeddingService();
+        if (!service) return null;
+        const info = service.getProviderInfo();
+        // info returns { name, model } - map to { provider, model }
+        return info ? { provider: info.name, model: info.model } : null;
+      },
+
+      // Generate embeddings for dirty nodes
+      generateEmbeddings: async (projectId) => {
+        const service = this.getEmbeddingService();
+        if (!service) return 0;
+        // projectId is required for generateMultiEmbeddings
+        if (!projectId) {
+          console.warn('[Orchestrator] Cannot generate embeddings without projectId');
+          return 0;
+        }
+        const result = await service.generateMultiEmbeddings({
+          projectId,
+          incrementalOnly: true,
+          verbose: false,
+        });
+        return result.totalEmbedded;
+      },
+    };
+
+    this._orchestrator = new IngestionOrchestrator(deps, {
+      verbose: false,
+      batchIntervalMs: 1000,
+      maxBatchSize: 100,
+      maxOrphanFiles: 100,
+      orphanRetentionDays: 7,
+    });
+
+    await this._orchestrator.initialize();
+    console.log('[Brain] Ingestion orchestrator initialized');
+  }
+
+  /**
+   * Get the ingestion orchestrator
+   * Returns null if not initialized
+   */
+  get orchestrator(): IngestionOrchestrator | null {
+    return this._orchestrator;
+  }
+
+  /**
+   * Get the node state machine
+   * Returns null if not initialized
+   */
+  get stateMachine(): NodeStateMachine | null {
+    return this._stateMachine;
+  }
+
+  /**
+   * Get node state counts for a project (or all projects)
+   * Useful for dashboards and monitoring
+   */
+  async getStateCounts(projectId?: string): Promise<StateCounts | null> {
+    if (!this._stateMachine) return null;
+    return this._stateMachine.countByState(projectId);
   }
 
   /**
@@ -4923,6 +5064,14 @@ volumes:
   /** Get embedding service */
   getEmbeddingService(): EmbeddingService | null {
     return this.embeddingService;
+  }
+
+  /** Get ingestion manager */
+  getIngestionManager(): IncrementalIngestionManager {
+    if (!this.ingestionManager) {
+      throw new Error('Ingestion manager not initialized. Call initialize() first.');
+    }
+    return this.ingestionManager;
   }
 
   /**

@@ -159,6 +159,14 @@ export class Neo4jClient {
   }
 
   /**
+   * Get the underlying Neo4j driver
+   * Use this for advanced operations that need direct driver access
+   */
+  getDriver(): Driver {
+    return this.driver;
+  }
+
+  /**
    * Close the driver connection
    */
   async close(): Promise<void> {

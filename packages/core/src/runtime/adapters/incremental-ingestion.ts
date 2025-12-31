@@ -32,6 +32,7 @@ import {
   type FileInfo,
   type BatchResult as FileProcessorBatchResult,
 } from '../../brain/file-processor.js';
+import { STATE_PROPERTIES as P } from '../../ingestion/state-types.js';
 
 export interface IncrementalStats {
   unchanged: number;
@@ -572,12 +573,17 @@ export class IncrementalIngestionManager {
   /**
    * Ingest nodes and relationships into Neo4j
    * Uses UNWIND batching for optimal performance
-   * @param markDirty - If true, marks Scope nodes as embeddingsDirty=true
+   *
+   * SIMPLIFIED: No more capture/restore of embeddings.
+   * - SET n += props preserves properties not in props (like embeddings)
+   * - State machine tracks when embeddings need regeneration via _state = 'linked'
+   *
+   * @param markForEmbedding - If true, marks content nodes with _state = 'linked'
    */
   private async ingestNodes(
     nodes: ParsedNode[],
     relationships: ParsedRelationship[],
-    markDirty: boolean = false
+    markForEmbedding: boolean = false
   ): Promise<void> {
     if (nodes.length === 0 && relationships.length === 0) {
       return;
@@ -593,13 +599,6 @@ export class IncrementalIngestionManager {
       // Add schemaVersion to content nodes (for detecting schema changes)
       addSchemaVersion(node.labels, props);
 
-      // Note: schemaDirty is cleared via REMOVE in the query below, not via props
-
-      // Mark Scope nodes as dirty if their embeddings need regeneration
-      if (markDirty && node.labels.includes('Scope')) {
-        props.embeddingsDirty = true;
-      }
-
       if (!nodesByLabel.has(labels)) {
         nodesByLabel.set(labels, []);
       }
@@ -613,21 +612,21 @@ export class IncrementalIngestionManager {
       if (nodeData.length === 0) continue;
 
       // Determine unique field based on node type
-      // File and Directory use 'path', Project uses 'projectId', others use 'uuid'
-      // Note: ImageFile, ThreeDFile, DocumentFile are MediaFile subtypes and use 'uuid'
       const labelsArray = labels.split(':');
       const isMediaFile = labelsArray.includes('MediaFile') || labelsArray.includes('ImageFile')
         || labelsArray.includes('ThreeDFile') || labelsArray.includes('DocumentFile');
       const isFileOrDirectory = (labelsArray.includes('File') || labelsArray.includes('Directory')) && !isMediaFile;
       const isProject = labelsArray.includes('Project');
-      
+      const isContentNode = labelsArray.includes('Scope') || labelsArray.includes('MarkdownSection')
+        || labelsArray.includes('CodeBlock') || labelsArray.includes('DataSection')
+        || labelsArray.includes('WebPage') || isMediaFile;
+
       let uniqueField: string;
       let uniqueValue: string;
       if (isFileOrDirectory) {
         uniqueField = 'path';
         uniqueValue = 'nodeData.props.path';
       } else if (isProject) {
-        // Use projectId as unique field for Project nodes (ensures consistency)
         uniqueField = 'projectId';
         uniqueValue = 'nodeData.props.projectId';
       } else {
@@ -635,106 +634,21 @@ export class IncrementalIngestionManager {
         uniqueValue = 'nodeData.uuid';
       }
 
-      // For MediaFile types, preserve textContent, extractionMethod, and embeddings
-      // These are set by read_file analysis and should not be overwritten by re-ingestion
-      if (isMediaFile) {
-        await this.client.run(
-          `
-          UNWIND $nodes AS nodeData
-          MERGE (n:${labels} {${uniqueField}: ${uniqueValue}})
-          SET n += nodeData.props,
-              n.textContent = COALESCE(n.textContent, null),
-              n.extractionMethod = COALESCE(n.extractionMethod, null),
-              n.embedding_name = COALESCE(n.embedding_name, null),
-              n.embedding_description = COALESCE(n.embedding_description, null),
-              n.embedding_content = COALESCE(n.embedding_content, null),
-              n.embedding_name_hash = COALESCE(n.embedding_name_hash, null),
-              n.embedding_description_hash = COALESCE(n.embedding_description_hash, null),
-              n.embedding_content_hash = COALESCE(n.embedding_content_hash, null),
-              n.embeddingsDirty = COALESCE(n.embeddingsDirty, null)
-          REMOVE n.schemaDirty
-          `,
-          { nodes: nodeData }
-        );
-      } else {
-        // Preserve embedding vectors and hashes during re-ingestion
-        // Step 1: Query existing embeddings BEFORE merge
-        const uuids = nodeData.map((n: any) => n.uuid);
-        const existingEmbeddings = await this.client.run(
-          `
-          MATCH (n:${labels})
-          WHERE n.uuid IN $uuids
-          RETURN n.uuid AS uuid,
-                 n.embedding_name AS emb_name, n.embedding_content AS emb_content, n.embedding_description AS emb_desc,
-                 n.embedding_name_hash AS hash_name, n.embedding_content_hash AS hash_content, n.embedding_description_hash AS hash_desc,
-                 n.embedding_provider AS emb_provider, n.embedding_model AS emb_model
-          `,
-          { uuids }
-        );
+      // Build state machine SET clause for content nodes
+      const stateClause = (markForEmbedding && isContentNode)
+        ? `, n.${P.state} = 'linked', n.${P.stateChangedAt} = datetime()`
+        : '';
 
-        // Build map of existing embeddings
-        const embeddingMap = new Map<string, any>();
-        for (const record of existingEmbeddings.records) {
-          embeddingMap.set(record.get('uuid'), {
-            emb_name: record.get('emb_name'),
-            emb_content: record.get('emb_content'),
-            emb_desc: record.get('emb_desc'),
-            hash_name: record.get('hash_name'),
-            hash_content: record.get('hash_content'),
-            hash_desc: record.get('hash_desc'),
-            emb_provider: record.get('emb_provider'),
-            emb_model: record.get('emb_model'),
-          });
-        }
-        console.log(`   🔒 Captured ${embeddingMap.size} existing embeddings for ${labels} (${uuids.length} uuids queried)`);
-
-        // Step 2: MERGE nodes with props
-        await this.client.run(
-          `
-          UNWIND $nodes AS nodeData
-          MERGE (n:${labels} {${uniqueField}: ${uniqueValue}})
-          SET n += nodeData.props
-          REMOVE n.schemaDirty
-          `,
-          { nodes: nodeData }
-        );
-
-        // Step 3: Restore embeddings for existing nodes
-        const restoreData = [];
-        for (const node of nodeData) {
-          const existing = embeddingMap.get(node.uuid);
-          // Restore if we have any embedding data (vectors, hashes, or provider/model info)
-          if (existing && (existing.emb_name || existing.emb_content || existing.emb_desc ||
-              existing.hash_name || existing.hash_content || existing.hash_desc ||
-              existing.emb_provider || existing.emb_model)) {
-            restoreData.push({
-              uuid: node.uuid,
-              ...existing,
-            });
-          }
-        }
-
-        if (restoreData.length > 0) {
-          console.log(`   🔄 Restoring embeddings for ${restoreData.length} ${labels} nodes`);
-          await this.client.run(
-            `
-            UNWIND $data AS d
-            MATCH (n:${labels} {uuid: d.uuid})
-            SET n.embedding_name = COALESCE(n.embedding_name, d.emb_name),
-                n.embedding_content = COALESCE(n.embedding_content, d.emb_content),
-                n.embedding_description = COALESCE(n.embedding_description, d.emb_desc),
-                n.embedding_name_hash = COALESCE(n.embedding_name_hash, d.hash_name),
-                n.embedding_content_hash = COALESCE(n.embedding_content_hash, d.hash_content),
-                n.embedding_description_hash = COALESCE(n.embedding_description_hash, d.hash_desc),
-                n.embedding_provider = COALESCE(n.embedding_provider, d.emb_provider),
-                n.embedding_model = COALESCE(n.embedding_model, d.emb_model)
-            `,
-            { data: restoreData }
-          );
-        } else {
-          console.log(`   ⚠️ No embeddings to restore for ${labels} (${nodeData.length} nodes)`);
-        }
-      }
+      // MERGE with += preserves existing embeddings (they're not in props)
+      // No need for capture/restore - embeddings stay on the node
+      await this.client.run(
+        `
+        UNWIND $nodes AS nodeData
+        MERGE (n:${labels} {${uniqueField}: ${uniqueValue}})
+        SET n += nodeData.props${stateClause}
+        `,
+        { nodes: nodeData }
+      );
 
       processedNodes += nodeData.length;
       console.log(`   📦 Upserted ${nodeData.length} ${labels} nodes (${processedNodes}/${totalNodes})`);
@@ -1504,6 +1418,30 @@ export class IncrementalIngestionManager {
     );
 
     return result.records[0]?.get('dirty') === true;
+  }
+
+  /**
+   * Ingest a pre-parsed graph into Neo4j
+   * Public wrapper around the private ingestNodes method
+   *
+   * @param graph - Parsed nodes and relationships
+   * @param options - Ingestion options
+   */
+  async ingestGraph(
+    graph: {
+      nodes: ParsedNode[];
+      relationships: ParsedRelationship[];
+    },
+    options: { projectId?: string; markDirty?: boolean } = {}
+  ): Promise<{ nodesCreated: number; relationshipsCreated: number }> {
+    const { markDirty = true } = options;
+
+    await this.ingestNodes(graph.nodes, graph.relationships, markDirty);
+
+    return {
+      nodesCreated: graph.nodes.length,
+      relationshipsCreated: graph.relationships.length,
+    };
   }
 
   /**
