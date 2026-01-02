@@ -20,6 +20,7 @@ import {
   BrainManager,
   generateBrainToolHandlers,
   generateSetupToolHandlers,
+  generateFsTools,
   generateImageTools,
   generate3DTools,
   generateAgentToolHandlers,
@@ -35,6 +36,7 @@ import {
   StructuredLLMExecutor,
   GeminiAPIProvider,
   type BrainToolsContext,
+  type FsToolsContext,
   type ImageToolsContext,
   type ThreeDToolsContext,
   type AgentToolsContext,
@@ -722,9 +724,27 @@ class BrainDaemon {
       };
       const webToolHandlers = createWebToolHandlers(webToolsCtx);
 
+      // Generate FS tools (list_directory, glob_files, grep_files, search_files)
+      // These run in daemon to ensure latest code is used after builds
+      const fsToolsCtx: FsToolsContext = {
+        projectRoot: process.cwd(),
+      };
+      const fsTools = generateFsTools(fsToolsCtx);
+
+      // Filter out fs-tools that have brain-aware versions in brainHandlers
+      // Brain versions have Neo4j integration (cleanup nodes, update paths, etc.)
+      const brainToolNames = new Set(Object.keys(brainHandlers));
+      const filteredFsHandlers: Record<string, (params: any) => Promise<any>> = {};
+      for (const [name, handler] of Object.entries(fsTools.handlers)) {
+        if (!brainToolNames.has(name)) {
+          filteredFsHandlers[name] = handler;
+        }
+      }
+
       this.toolHandlers = {
         ...brainHandlers,
         ...setupHandlers,
+        ...filteredFsHandlers,
         ...imageTools.handlers,
         ...threeDTools.handlers,
         ...agentHandlers,

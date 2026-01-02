@@ -647,10 +647,12 @@ Parameters:
 - context_lines: Number of lines to show before/after each match (default: 0, max: 5)
 - max_results: Maximum number of matches to return (default: 100)
 - extract_hierarchy: Extract dependency hierarchy for results (default: false). Requires brain to be available.
+- analyze: Analyze matched files on-the-fly to extract scope relationships (CONSUMES, CONSUMED_BY, INHERITS_FROM, etc.). Scopes are filtered to only those containing matched lines. Default: false.
 
 Example: grep_files({ pattern: "**/*.ts", regex: "function.*Handler" })
 Example: grep_files({ pattern: "src/**/*.js", regex: "TODO|FIXME", ignore_case: true, context_lines: 3 })
-Example: grep_files({ pattern: "**/*.ts", regex: "export function", extract_hierarchy: true })`,
+Example: grep_files({ pattern: "**/*.ts", regex: "export function", extract_hierarchy: true })
+Example: grep_files({ pattern: "**/*.ts", regex: "class.*Service", analyze: true })`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -677,6 +679,10 @@ Example: grep_files({ pattern: "**/*.ts", regex: "export function", extract_hier
         extract_hierarchy: {
           type: 'boolean',
           description: 'Extract dependency hierarchy for results (default: false). Requires brain to be available.',
+        },
+        analyze: {
+          type: 'boolean',
+          description: 'Analyze matched files on-the-fly to extract scope relationships (CONSUMES, CONSUMED_BY, INHERITS_FROM, etc.). Scopes are filtered to only those containing matched lines. Default: false.',
         },
       },
       required: ['pattern', 'regex'],
@@ -881,13 +887,13 @@ async function tryRipgrep(
 }
 
 export function generateGrepFilesHandler(ctx: FsToolsContext) {
-  return async (params: { pattern: string; regex: string; ignore_case?: boolean; context_lines?: number; max_results?: number; extract_hierarchy?: boolean }) => {
+  return async (params: { pattern: string; regex: string; ignore_case?: boolean; context_lines?: number; max_results?: number; extract_hierarchy?: boolean; analyze?: boolean }) => {
     const fs = await import('fs/promises');
     const { glob } = await import('glob');
 
     const projectRoot = getProjectRoot(ctx) || process.cwd();
 
-    const { pattern, regex, ignore_case = false, context_lines = 0, max_results = 100, extract_hierarchy = false } = params;
+    const { pattern, regex, ignore_case = false, context_lines = 0, max_results = 100, extract_hierarchy = false, analyze = false } = params;
 
     try {
       // Validate regex
@@ -946,6 +952,140 @@ export function generateGrepFilesHandler(ctx: FsToolsContext) {
           result.hierarchy = hierarchyResult;
         } catch (err: any) {
           result.hierarchy_error = err.message || 'Brain not available';
+        }
+      }
+
+      // Handle analyze option - on-the-fly scope analysis filtered by matched lines
+      if (analyze && enrichedMatches.length > 0) {
+        try {
+          // Group matches by file
+          const matchesByFile = new Map<string, number[]>();
+          for (const match of enrichedMatches) {
+            const absPath = path.isAbsolute(match.file) ? match.file : path.join(projectRoot, match.file);
+            if (!matchesByFile.has(absPath)) {
+              matchesByFile.set(absPath, []);
+            }
+            matchesByFile.get(absPath)!.push(match.line);
+          }
+
+          // Analyze files with target lines for filtering
+          const filePaths = [...matchesByFile.keys()];
+          const codeExtensions = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py'];
+          const codeFiles = filePaths.filter(f => codeExtensions.some(ext => f.endsWith(ext)));
+
+          if (codeFiles.length > 0) {
+            // Build target_lines map for filtering
+            const targetLines: Record<string, number[]> = {};
+            for (const file of codeFiles) {
+              targetLines[file] = matchesByFile.get(file)!;
+            }
+
+            // Call analyze_files directly (grep_files now runs in daemon, so we have latest code)
+            const { generateAnalyzeFilesHandler } = await import('./brain-tools.js');
+            const analyzeHandler = generateAnalyzeFilesHandler({ brain: null as any });
+
+            // Call once with JSON format, then format to markdown if needed
+            const jsonResult = await analyzeHandler({
+              paths: codeFiles.slice(0, 10),
+              target_lines: targetLines,
+              format: 'json',
+              include_source: true,  // Need source for markdown formatting
+            }) as { success?: boolean; files?: any[]; totalScopes?: number; totalRelationships?: number; parseTimeMs?: number };
+
+            // Generate markdown from the JSON result (avoids double parsing)
+            let markdownResult: string | { success?: boolean; formatted_output?: string } | null = null;
+            if (jsonResult?.success) {
+              // Import markdown formatter and format the result
+              const { formatAnalyzeFilesAsMarkdown } = await import('./brain-tools.js');
+              const pathModule = await import('path');
+              
+              // Build file contents map from the JSON result (parallel)
+              const fileContents = new Map<string, string>();
+              const fsPromises = await import('fs/promises');
+              const readPromises = (jsonResult.files || []).map(async (file) => {
+                try {
+                  const content = await fsPromises.readFile(file.path, 'utf-8');
+                  return { path: file.path, content };
+                } catch {
+                  return null;
+                }
+              });
+              const readResults = await Promise.all(readPromises);
+              for (const r of readResults) {
+                if (r) fileContents.set(r.path, r.content);
+              }
+              
+              markdownResult = formatAnalyzeFilesAsMarkdown(
+                { success: true, files: jsonResult.files || [], totalScopes: jsonResult.totalScopes || 0, totalRelationships: jsonResult.totalRelationships || 0, parseTimeMs: jsonResult.parseTimeMs || 0 },
+                fileContents,
+                pathModule,
+                { maxTopScopes: 5 }
+              );
+            }
+
+            // Enrich each match with its containing scope
+            if (jsonResult?.success && jsonResult.files) {
+              // Build a map of (file, line) -> scope info
+              const scopesByFile = new Map<string, any[]>();
+              for (const file of jsonResult.files) {
+                scopesByFile.set(file.path, file.scopes || []);
+              }
+
+              // Add scope info to each match
+              for (const match of enrichedMatches) {
+                const absPath = path.isAbsolute(match.file) ? match.file : path.join(projectRoot, match.file);
+                const scopes = scopesByFile.get(absPath);
+                if (scopes) {
+                  // Find the most specific scope containing this line
+                  let bestScope: any = null;
+                  for (const scope of scopes) {
+                    if (match.line >= scope.startLine && match.line <= scope.endLine) {
+                      if (!bestScope || (scope.endLine - scope.startLine) < (bestScope.endLine - bestScope.startLine)) {
+                        bestScope = scope;
+                      }
+                    }
+                  }
+                  if (bestScope) {
+                    // Only include basic scope info - relationships are in the ASCII graph
+                    (match as any).scope = {
+                      name: bestScope.name,
+                      type: bestScope.type,
+                      lines: `${bestScope.startLine}-${bestScope.endLine}`,
+                    };
+                  }
+                }
+              }
+            }
+
+            // When analyze=true, return clean markdown instead of JSON
+            if (markdownResult && typeof markdownResult === 'string') {
+              // Build compact matches table
+              const matchesTable: string[] = [];
+              matchesTable.push('# Grep Results');
+              matchesTable.push('');
+              matchesTable.push(`**Pattern:** \`${pattern}\` | **Regex:** \`${regex}\` | **Matches:** ${enrichedMatches.length}${result.truncated ? ' (truncated)' : ''}`);
+              matchesTable.push('');
+              matchesTable.push('| File | Line | Scope | Match |');
+              matchesTable.push('|------|------|-------|-------|');
+
+              for (const m of enrichedMatches) {
+                const fileName = path.basename(m.file);
+                const scopeInfo = (m as any).scope ? `${(m as any).scope.name}()` : '-';
+                const matchContent = m.content.length > 60 ? m.content.slice(0, 57) + '...' : m.content;
+                const escapedMatch = matchContent.replace(/\|/g, '\\|').replace(/`/g, "'");
+                matchesTable.push(`| ${fileName} | ${m.line} | ${scopeInfo} | \`${escapedMatch}\` |`);
+              }
+
+              matchesTable.push('');
+              matchesTable.push('---');
+              matchesTable.push('');
+
+              // Return pure markdown (matches table + analysis)
+              return matchesTable.join('\n') + markdownResult;
+            }
+          }
+        } catch (err: any) {
+          result.analysis_error = err.message || 'Analysis failed';
         }
       }
 
@@ -1057,6 +1197,140 @@ export function generateGrepFilesHandler(ctx: FsToolsContext) {
       } catch (err: any) {
         // If brain is not available, extraction will be handled by MCP wrapper
         result.hierarchy_error = err.message || 'Brain not available (will be handled by MCP wrapper if available)';
+      }
+    }
+
+    // Handle analyze option for Node.js fallback
+    if (analyze && matches.length > 0) {
+      try {
+        const { generateAnalyzeFilesHandler } = await import('./brain-tools.js');
+        const analyzeHandler = generateAnalyzeFilesHandler({ brain: null as any });
+
+        // Group matches by file
+        const matchesByFile = new Map<string, number[]>();
+        for (const match of matches) {
+          const absPath = path.isAbsolute(match.file) ? match.file : path.join(projectRoot, match.file);
+          if (!matchesByFile.has(absPath)) {
+            matchesByFile.set(absPath, []);
+          }
+          matchesByFile.get(absPath)!.push(match.line);
+        }
+
+        // Analyze files with target lines for filtering
+        const filePaths = [...matchesByFile.keys()];
+        const codeExtensions = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py'];
+        const codeFiles = filePaths.filter(f => codeExtensions.some(ext => f.endsWith(ext)));
+
+        if (codeFiles.length > 0) {
+          // Build target_lines map for filtering
+          const targetLines: Record<string, number[]> = {};
+          for (const file of codeFiles) {
+            targetLines[file] = matchesByFile.get(file)!;
+          }
+
+          // First get JSON to enrich matches
+          const jsonResult = await analyzeHandler({
+            paths: codeFiles.slice(0, 10),
+            target_lines: targetLines,
+            format: 'json',
+            include_source: false,
+          }) as { success?: boolean; files?: any[]; totalScopes?: number; totalRelationships?: number; parseTimeMs?: number };
+
+          // Enrich each match with its containing scope
+          if (jsonResult.success && jsonResult.files) {
+            const scopesByFile = new Map<string, any[]>();
+            for (const file of jsonResult.files) {
+              scopesByFile.set(file.path, file.scopes || []);
+            }
+
+            for (const match of matches) {
+              const absPath = path.isAbsolute(match.file) ? match.file : path.join(projectRoot, match.file);
+              const scopes = scopesByFile.get(absPath);
+              if (scopes) {
+                let bestScope: any = null;
+                for (const scope of scopes) {
+                  if (match.line >= scope.startLine && match.line <= scope.endLine) {
+                    if (!bestScope || (scope.endLine - scope.startLine) < (bestScope.endLine - bestScope.startLine)) {
+                      bestScope = scope;
+                    }
+                  }
+                }
+                if (bestScope) {
+                  // Only include basic scope info - relationships are in the ASCII graph
+                  (match as any).scope = {
+                    name: bestScope.name,
+                    type: bestScope.type,
+                    lines: `${bestScope.startLine}-${bestScope.endLine}`,
+                  };
+                }
+              }
+            }
+          }
+
+          // Generate markdown from the JSON result (avoids double parsing)
+          if (jsonResult.success && jsonResult.files) {
+            const { formatAnalyzeFilesAsMarkdown } = await import('./brain-tools.js');
+            const fsPromises = await import('fs/promises');
+
+            // Read file contents for code snippets (parallel)
+            const fileContents = new Map<string, string>();
+            const fileReadPromises = jsonResult.files.map(async (file) => {
+              try {
+                const content = await fsPromises.readFile(file.path, 'utf-8');
+                return { path: file.path, content };
+              } catch {
+                return null;
+              }
+            });
+            const fileResults = await Promise.all(fileReadPromises);
+            for (const result of fileResults) {
+              if (result) fileContents.set(result.path, result.content);
+            }
+
+            // Use totals already calculated by analyzeHandler
+            const markdownResult = formatAnalyzeFilesAsMarkdown(
+              {
+                success: true,
+                files: jsonResult.files,
+                totalScopes: jsonResult.totalScopes || 0,
+                totalRelationships: jsonResult.totalRelationships || 0,
+                parseTimeMs: jsonResult.parseTimeMs || 0,
+              },
+              fileContents,
+              path,
+              { maxTopScopes: 5 }
+            );
+
+            // When analyze=true, return clean markdown instead of JSON
+            if (markdownResult && typeof markdownResult === 'string') {
+              // Build compact matches table
+              const matchesTable: string[] = [];
+              matchesTable.push('# Grep Results');
+              matchesTable.push('');
+              matchesTable.push(`**Pattern:** \`${pattern}\` | **Regex:** \`${regex}\` | **Matches:** ${matches.length}${result.truncated ? ' (truncated)' : ''}`);
+              matchesTable.push('');
+              matchesTable.push('| File | Line | Scope | Match |');
+              matchesTable.push('|------|------|-------|-------|');
+
+              for (const m of matches) {
+                const fileName = path.basename(m.file);
+                const scopeInfo = (m as any).scope ? `${(m as any).scope.name}()` : '-';
+                const matchContent = m.content.length > 60 ? m.content.slice(0, 57) + '...' : m.content;
+                const escapedMatch = matchContent.replace(/\|/g, '\\|').replace(/`/g, "'");
+                matchesTable.push(`| ${fileName} | ${m.line} | ${scopeInfo} | \`${escapedMatch}\` |`);
+              }
+
+              matchesTable.push('');
+              matchesTable.push('---');
+              matchesTable.push('');
+
+              // Return pure markdown (matches table + analysis)
+              return matchesTable.join('\n') + markdownResult;
+            }
+          }
+        }
+      } catch (err: any) {
+        result.analysis_error = err.message || 'Analysis failed';
       }
     }
 

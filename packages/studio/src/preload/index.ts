@@ -45,6 +45,37 @@ export interface StudioAPI {
     setApiKey: (keyName: 'gemini' | 'replicate', value: string) => Promise<boolean>;
   };
 
+  // Ollama (local embeddings)
+  ollama: {
+    status: () => Promise<{
+      installed: boolean;
+      running: boolean;
+      version?: string;
+      models?: string[];
+      error?: string;
+    }>;
+    checkInstalled: () => Promise<boolean>;
+    checkRunning: () => Promise<boolean>;
+    getInstallInstructions: () => Promise<string>;
+    install: () => Promise<boolean>;
+    start: () => Promise<boolean>;
+    hasModel: (modelName: string) => Promise<boolean>;
+    pullModel: (modelName?: string) => Promise<boolean>;
+    getDefaultModel: () => Promise<string>;
+    onInstallProgress: (callback: (progress: {
+      stage: 'downloading' | 'installing' | 'complete' | 'error';
+      message: string;
+      percent?: number;
+    }) => void) => void;
+    onPullProgress: (callback: (progress: {
+      status: string;
+      digest?: string;
+      total?: number;
+      completed?: number;
+      percent?: number;
+    }) => void) => void;
+  };
+
   // Daemon API (RagForge MCP Server - auto-starts if needed)
   daemon: {
     status: () => Promise<{ running: boolean; ready: boolean; status?: string; details?: any }>;
@@ -102,6 +133,24 @@ const api: StudioAPI = {
   config: {
     getApiKey: (keyName) => ipcRenderer.invoke('config:get-api-key', keyName),
     setApiKey: (keyName, value) => ipcRenderer.invoke('config:set-api-key', keyName, value),
+  },
+
+  ollama: {
+    status: () => ipcRenderer.invoke('ollama:status'),
+    checkInstalled: () => ipcRenderer.invoke('ollama:check-installed'),
+    checkRunning: () => ipcRenderer.invoke('ollama:check-running'),
+    getInstallInstructions: () => ipcRenderer.invoke('ollama:get-install-instructions'),
+    install: () => ipcRenderer.invoke('ollama:install'),
+    start: () => ipcRenderer.invoke('ollama:start'),
+    hasModel: (modelName) => ipcRenderer.invoke('ollama:has-model', modelName),
+    pullModel: (modelName) => ipcRenderer.invoke('ollama:pull-model', modelName),
+    getDefaultModel: () => ipcRenderer.invoke('ollama:get-default-model'),
+    onInstallProgress: (callback) => {
+      ipcRenderer.on('ollama:install-progress', (_event, progress) => callback(progress));
+    },
+    onPullProgress: (callback) => {
+      ipcRenderer.on('ollama:pull-progress', (_event, progress) => callback(progress));
+    },
   },
 
   daemon: {

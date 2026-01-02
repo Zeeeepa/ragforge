@@ -15,6 +15,7 @@ import type { GeneratedToolDefinition } from './types/index.js';
 import { getGlobalFetchCache, type CachedFetchResult } from './web-tools.js';
 import { NODE_SCHEMAS, CONTENT_NODE_LABELS, type NodeTypeSchema } from '../utils/node-schema.js';
 import { isDocumentFile, parseDocumentFile, type DocumentFileInfo } from '../runtime/adapters/document-file-parser.js';
+import { extractReferences, resolveAllReferences, type ResolvedReference } from '../brain/reference-extractor.js';
 import * as path from 'path';
 
 // Image file extensions
@@ -2778,11 +2779,1162 @@ export function generateMarkFileDirtyHandler(ctx: BrainToolsContext) {
 }
 
 // ============================================
+// Touch File Tool (for external tool integration)
+// ============================================
+
+/**
+ * Generate touch_file tool definition
+ *
+ * This tool is designed for integration with external tools (like LucieCode/Gemini CLI).
+ * It marks a file for incremental ingestion without reading its content.
+ *
+ * For orphan files (not in any project): creates File node in 'discovered' state
+ * For project files: marks as dirty for re-ingestion
+ */
+export function generateTouchFileTool(): GeneratedToolDefinition {
+  return {
+    name: 'touch_file',
+    description: `Mark a file for incremental ingestion (lightweight operation).
+
+This tool is designed for integration with external file tools. Call it after any file operation
+(read, write, edit, grep match) to keep the brain's knowledge graph up to date.
+
+Behavior:
+- **Orphan files** (not in any project): Creates a File node in 'discovered' state.
+  The TouchedFilesWatcher will process it through: discovered → parsing → linked → embedded
+- **Project files**: Marks the file as dirty (schemaDirty=true) for re-ingestion on next cycle
+
+This is a fire-and-forget operation - it queues work but doesn't wait for completion.
+Use brain_search which automatically waits for pending ingestion.
+
+Parameters:
+- path: File path to touch (absolute or relative to cwd)
+- trigger_processing: If true, trigger immediate processing (default: false)
+
+Example: touch_file({ path: "/home/user/project/src/utils.ts" })
+Example: touch_file({ path: "src/index.ts", trigger_processing: true })`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'File path to touch (absolute or relative)',
+        },
+        trigger_processing: {
+          type: 'boolean',
+          description: 'Trigger immediate processing instead of waiting for next cycle (default: false)',
+        },
+      },
+      required: ['path'],
+    },
+  };
+}
+
+/**
+ * Result type for touch_file
+ */
+interface TouchFileResult {
+  success: boolean;
+  path: string;
+  /** Whether this is an orphan file (not in any project) */
+  orphan: boolean;
+  /** For orphan files: whether a new File node was created */
+  created?: boolean;
+  /** Previous state (for orphan files) */
+  previousState?: string | null;
+  /** New state after touch */
+  newState: string;
+  /** Project ID if file is in a project */
+  projectId?: string;
+  /** Whether processing was triggered */
+  processingTriggered?: boolean;
+  /** Error message if failed */
+  error?: string;
+}
+
+/**
+ * Generate handler for touch_file
+ */
+export function generateTouchFileHandler(ctx: BrainToolsContext) {
+  return async (params: {
+    path: string;
+    trigger_processing?: boolean;
+  }): Promise<TouchFileResult> => {
+    const { path: filePath, trigger_processing = false } = params;
+    const pathModule = await import('path');
+
+    // Resolve absolute path
+    const absolutePath = pathModule.isAbsolute(filePath)
+      ? filePath
+      : pathModule.resolve(process.cwd(), filePath);
+
+    try {
+      // Check if file exists
+      const fs = await import('fs/promises');
+      try {
+        const stat = await fs.stat(absolutePath);
+        if (stat.isDirectory()) {
+          return {
+            success: false,
+            path: absolutePath,
+            orphan: false,
+            newState: 'is_directory',
+            error: 'Path is a directory, not a file',
+          };
+        }
+      } catch {
+        return {
+          success: false,
+          path: absolutePath,
+          orphan: false,
+          newState: 'not_found',
+          error: 'File not found',
+        };
+      }
+
+      // Check if file is in a known project
+      const project = await findProjectForFile(ctx.brain, absolutePath);
+
+      if (project) {
+        // File is in a project - queue for re-ingestion
+        ctx.brain.queueFileChange(absolutePath, 'updated');
+
+        return {
+          success: true,
+          path: absolutePath,
+          orphan: false,
+          projectId: project.id,
+          newState: 'queued',
+          processingTriggered: false, // Processing happens via watcher
+        };
+      }
+
+      // File is not in any project - use touchFile for orphan tracking
+      const result = await ctx.brain.touchFile(absolutePath);
+
+      return {
+        success: true,
+        path: absolutePath,
+        orphan: true,
+        created: result.created,
+        previousState: result.previousState,
+        newState: result.newState,
+        processingTriggered: false, // Processing happens via watcher
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        path: absolutePath,
+        orphan: false,
+        newState: 'error',
+        error: err.message,
+      };
+    }
+  };
+}
+
+// ============================================
+// analyze_files - Parse files and extract relationships
+// ============================================
+
+/**
+ * Scope relationship extracted from code analysis
+ */
+interface ScopeRelationship {
+  type: 'CONSUMES' | 'CONSUMED_BY' | 'INHERITS_FROM' | 'INHERITED_BY' | 'IMPLEMENTS' | 'IMPLEMENTED_BY' | 'USES_LIBRARY' | 'DECORATED_BY' | 'DECORATES';
+  target: string;
+  targetType?: string;
+  targetFile?: string;
+  targetStartLine?: number;
+  targetEndLine?: number;
+}
+
+/**
+ * Analyzed scope with relationships
+ */
+interface AnalyzedScope {
+  name: string;
+  type: string;
+  signature: string;
+  startLine: number;
+  endLine: number;
+  docstring?: string;
+  relationships: ScopeRelationship[];
+  children: AnalyzedScope[];
+}
+
+/**
+ * Result of analyzing a single file
+ */
+interface AnalyzedFile {
+  path: string;
+  language: 'typescript' | 'python' | 'unsupported';
+  scopes: AnalyzedScope[];
+  imports: Array<{
+    source: string;
+    imported: string;
+    isLocal: boolean;
+  }>;
+  exports: string[];
+  error?: string;
+}
+
+/**
+ * Result of analyze_files tool
+ */
+interface AnalyzeFilesResult {
+  success: boolean;
+  files: AnalyzedFile[];
+  totalScopes: number;
+  totalRelationships: number;
+  parseTimeMs: number;
+  error?: string;
+}
+
+/**
+ * Generate analyze_files tool definition
+ */
+export function generateAnalyzeFilesTool(): GeneratedToolDefinition {
+  return {
+    name: 'analyze_files',
+    description: `Parse TypeScript/Python files and extract scope relationships without storing in database.
+
+Returns for each file:
+- Scopes (functions, classes, methods, interfaces, etc.)
+- Relationships:
+  - CONSUMES: References to other scopes (function calls, new Class(), variable usage)
+  - INHERITS_FROM: Class inheritance (extends)
+  - IMPLEMENTS: Interface implementation (implements)
+  - DECORATED_BY: Decorators applied to scopes
+  - USES_LIBRARY: External library imports
+
+Useful for understanding code structure on-the-fly without full ingestion.
+Optimized for batch processing (multiple files in one call).
+
+Parameters:
+- paths: Array of file paths to analyze
+- target_lines: Optional map of file path -> line numbers to filter scopes (for grep results)
+- format: Output format - "markdown" (default, ASCII tree + code snippets), "json" (full data)
+- include_source: Include source code in results (default: true)
+- max_depth: Maximum nesting depth for children (default: 3)
+
+Example: analyze_files({ paths: ["src/auth.ts", "src/utils.ts"] })
+Example: analyze_files({ paths: ["lib/parser.py"], format: "json" })
+Example (grep): analyze_files({ paths: ["src/auth.ts"], target_lines: { "src/auth.ts": [42, 87] } })`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        paths: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of file paths to analyze (absolute or relative)',
+        },
+        target_lines: {
+          type: 'object',
+          additionalProperties: {
+            type: 'array',
+            items: { type: 'number' },
+          },
+          description: 'Optional: Map of file path -> line numbers. Only scopes containing these lines are returned. Useful for grep results.',
+        },
+        format: {
+          type: 'string',
+          enum: ['markdown', 'json'],
+          description: 'Output format: "markdown" (ASCII tree + top scopes with code) or "json" (full data). Default: "markdown"',
+        },
+        include_source: {
+          type: 'boolean',
+          description: 'Include source code in results (default: true)',
+        },
+        max_depth: {
+          type: 'number',
+          description: 'Maximum nesting depth for children (default: 3)',
+        },
+        max_top_scopes: {
+          type: 'number',
+          description: 'Maximum number of top scopes to show with code snippets in markdown format (default: 5)',
+        },
+      },
+      required: ['paths'],
+    },
+  };
+}
+
+// Lazy-loaded parsers for analyze_files
+let tsParserPromise: Promise<any> | null = null;
+let pyParserPromise: Promise<any> | null = null;
+
+async function getTypeScriptParser() {
+  if (!tsParserPromise) {
+    tsParserPromise = (async () => {
+      const { TypeScriptLanguageParser } = await import('@luciformresearch/codeparsers');
+      const parser = new TypeScriptLanguageParser();
+      await parser.initialize();
+      return parser;
+    })();
+  }
+  return tsParserPromise;
+}
+
+async function getPythonParser() {
+  if (!pyParserPromise) {
+    pyParserPromise = (async () => {
+      const { PythonLanguageParser } = await import('@luciformresearch/codeparsers');
+      const parser = new PythonLanguageParser();
+      await parser.initialize();
+      return parser;
+    })();
+  }
+  return pyParserPromise;
+}
+
+/**
+ * Convert UniversalScope to AnalyzedScope with relationships
+ */
+function convertToAnalyzedScope(
+  scope: any,
+  allScopes: Map<string, any>,
+  maxDepth: number,
+  currentDepth: number = 0
+): AnalyzedScope {
+  const relationships: ScopeRelationship[] = [];
+
+  // Extract CONSUMES from identifierReferences
+  if (scope.references) {
+    for (const ref of scope.references) {
+      if (ref.targetScope && ref.kind === 'local_scope') {
+        relationships.push({
+          type: 'CONSUMES',
+          target: ref.targetScope,
+          targetType: allScopes.get(ref.targetScope)?.type,
+        });
+      }
+    }
+  }
+
+  // Extract INHERITS_FROM and IMPLEMENTS from heritageClauses
+  const tsSpecific = scope.languageSpecific?.typescript;
+  if (tsSpecific?.heritageClauses) {
+    for (const clause of tsSpecific.heritageClauses) {
+      for (const typeName of clause.types) {
+        relationships.push({
+          type: clause.clause === 'implements' ? 'IMPLEMENTS' : 'INHERITS_FROM',
+          target: typeName,
+        });
+      }
+    }
+  }
+
+  // Extract DECORATED_BY from decoratorDetails
+  if (tsSpecific?.decoratorDetails) {
+    for (const decorator of tsSpecific.decoratorDetails) {
+      relationships.push({
+        type: 'DECORATED_BY',
+        target: decorator.name,
+      });
+    }
+  }
+
+  // Extract USES_LIBRARY from imports (external only)
+  if (scope.imports) {
+    for (const imp of scope.imports) {
+      if (!imp.isLocal) {
+        relationships.push({
+          type: 'USES_LIBRARY',
+          target: imp.source,
+        });
+      }
+    }
+  }
+
+  // Deduplicate relationships
+  const seen = new Set<string>();
+  const uniqueRels = relationships.filter(rel => {
+    const key = `${rel.type}:${rel.target}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  return {
+    name: scope.name,
+    type: scope.type,
+    signature: scope.signature || scope.name,
+    startLine: scope.startLine,
+    endLine: scope.endLine,
+    docstring: scope.docstring,
+    relationships: uniqueRels,
+    children: [], // Will be populated by caller if needed
+  };
+}
+
+/**
+ * Format analyze_files results as markdown with ASCII tree and code snippets
+ */
+export function formatAnalyzeFilesAsMarkdown(
+  result: AnalyzeFilesResult,
+  fileContents: Map<string, string>,
+  pathModule: typeof import('path'),
+  options: { maxSourceLines?: number; maxTopScopes?: number } = {}
+): string {
+  const { maxSourceLines = 25, maxTopScopes = 10 } = options;
+  const lines: string[] = [];
+
+  // Header
+  lines.push(`# Code Analysis`);
+  lines.push('');
+  lines.push(`**Files:** ${result.files.length} | **Scopes:** ${result.totalScopes} | **Relationships:** ${result.totalRelationships} | **Time:** ${result.parseTimeMs}ms`);
+  lines.push('');
+  lines.push('---');
+  lines.push('');
+
+  // Collect all scopes with file info for ranking
+  const allScopes: Array<{
+    scope: AnalyzedScope;
+    file: AnalyzedFile;
+    size: number;
+  }> = [];
+
+  for (const file of result.files) {
+    for (const scope of file.scopes) {
+      allScopes.push({
+        scope,
+        file,
+        size: scope.endLine - scope.startLine,
+      });
+    }
+  }
+
+  // Sort by size (largest first) and take top N
+  const topScopes = allScopes
+    .sort((a, b) => b.size - a.size)
+    .slice(0, maxTopScopes);
+
+  // Top Scopes with code snippets
+  if (topScopes.length > 0) {
+    lines.push('## Top Scopes');
+    lines.push('');
+
+    for (let i = 0; i < topScopes.length; i++) {
+      const { scope, file } = topScopes[i];
+      const fileName = pathModule.basename(file.path);
+      const lineRange = scope.endLine !== scope.startLine
+        ? `${scope.startLine}-${scope.endLine}`
+        : `${scope.startLine}`;
+
+      // Title
+      lines.push(`### ${i + 1}. ${scope.name} (${scope.type})`);
+      lines.push(`📍 \`${fileName}:${lineRange}\``);
+
+      // Docstring if available
+      if (scope.docstring) {
+        const docLines = scope.docstring.split('\n').slice(0, 3).join(' ').trim();
+        lines.push(`📝 ${docLines.length > 150 ? docLines.slice(0, 147) + '...' : docLines}`);
+      }
+
+      // Code snippet
+      const content = fileContents.get(file.path);
+      if (content) {
+        const contentLines = content.split('\n');
+        const startIdx = Math.max(0, scope.startLine - 1);
+        const endIdx = Math.min(contentLines.length, scope.startLine - 1 + maxSourceLines);
+        const snippet = contentLines.slice(startIdx, endIdx).join('\n');
+        const lang = file.language === 'typescript' ? 'typescript' : 'python';
+
+        lines.push('');
+        lines.push('```' + lang);
+        lines.push(snippet);
+        if (scope.endLine - scope.startLine > maxSourceLines) {
+          lines.push(`... (${scope.endLine - scope.startLine - maxSourceLines} more lines)`);
+        }
+        lines.push('```');
+      }
+
+      lines.push('');
+    }
+  }
+
+  // Dependency Graph as ASCII tree
+  lines.push('---');
+  lines.push('');
+  lines.push('## Dependency Graph');
+  lines.push('');
+  lines.push('```');
+  lines.push(buildAnalyzeFilesAsciiTree(result, pathModule));
+  lines.push('```');
+  lines.push('');
+
+  // Node Types Summary
+  lines.push('---');
+  lines.push('');
+  lines.push('## Summary');
+  lines.push('');
+  const typeCounts: Record<string, number> = {};
+  for (const file of result.files) {
+    for (const scope of file.scopes) {
+      typeCounts[scope.type] = (typeCounts[scope.type] || 0) + 1;
+    }
+  }
+  lines.push('| Type | Count |');
+  lines.push('|------|-------|');
+  for (const [type, count] of Object.entries(typeCounts).sort((a, b) => b[1] - a[1])) {
+    lines.push(`| ${type} | ${count} |`);
+  }
+  lines.push('');
+
+  return lines.join('\n');
+}
+
+/**
+ * Build ASCII tree for analyze_files results
+ */
+function buildAnalyzeFilesAsciiTree(
+  result: AnalyzeFilesResult,
+  pathModule: typeof import('path')
+): string {
+  const lines: string[] = [];
+  const visited = new Set<string>();
+
+  for (const file of result.files) {
+    if (file.scopes.length === 0) continue;
+
+    const fileName = pathModule.basename(file.path);
+
+    // Build scope map for this file
+    const scopeMap = new Map<string, AnalyzedScope>();
+    for (const scope of file.scopes) {
+      scopeMap.set(scope.name, scope);
+    }
+
+    // Build CONSUMED_BY relationships (inverse of CONSUMES)
+    const consumedByMap = new Map<string, ScopeRelationship[]>();
+    for (const scope of file.scopes) {
+      for (const rel of scope.relationships) {
+        if (rel.type === 'CONSUMES') {
+          // Extract function name from "functionName:startLine-endLine" or "path::functionName:startLine-endLine"
+          const rawTarget = rel.target.split('::').pop() || rel.target;
+          const targetName = rawTarget.split(':')[0];
+          if (!consumedByMap.has(targetName)) {
+            consumedByMap.set(targetName, []);
+          }
+          consumedByMap.get(targetName)!.push({
+            type: 'CONSUMED_BY',
+            target: scope.name,
+            targetType: scope.type,
+            targetStartLine: scope.startLine,
+            targetEndLine: scope.endLine,
+          });
+        }
+      }
+    }
+
+    // Find root scopes (not consumed by others in same file)
+    const consumed = new Set<string>();
+    for (const scope of file.scopes) {
+      for (const rel of scope.relationships) {
+        if (rel.type === 'CONSUMES') {
+          // Extract function name from "functionName:startLine-endLine"
+          const rawTarget = rel.target.split('::').pop() || rel.target;
+          consumed.add(rawTarget.split(':')[0]);
+        }
+      }
+    }
+
+    // Render roots first (scopes not consumed by others in this file)
+    const roots = file.scopes.filter(s => !consumed.has(s.name));
+    for (const root of roots) {
+      lines.push(...renderScope(root, '', true, 0, fileName, consumedByMap));
+    }
+
+    // Then render consumed scopes that have CONSUMED_BY relationships
+    // (scopes consumed by other scopes in this file)
+    const consumedScopes = file.scopes.filter(s =>
+      consumed.has(s.name) && consumedByMap.has(s.name)
+    );
+    for (const scope of consumedScopes) {
+      lines.push(...renderScope(scope, '', true, 0, fileName, consumedByMap));
+    }
+  }
+
+  function renderScope(
+    scope: AnalyzedScope,
+    prefix: string,
+    isLast: boolean,
+    depth: number,
+    fileName: string,
+    consumedByMap: Map<string, ScopeRelationship[]>
+  ): string[] {
+    if (depth > 3 || visited.has(scope.name)) {
+      return [];
+    }
+    visited.add(scope.name);
+
+    const resultLines: string[] = [];
+    const connector = depth === 0 ? '' : isLast ? '└── ' : '├── ';
+    const childPrefix = depth === 0 ? '' : prefix + (isLast ? '    ' : '│   ');
+
+    // Node line
+    const lineInfo = scope.endLine !== scope.startLine
+      ? `${scope.startLine}-${scope.endLine}`
+      : `${scope.startLine}`;
+    resultLines.push(`${prefix}${connector}${scope.name} (${scope.type}) @ ${fileName}:${lineInfo}`);
+
+    // Collect all relationships including CONSUMED_BY
+    const allRels = [...scope.relationships];
+    const consumedBy = consumedByMap.get(scope.name);
+    if (consumedBy) {
+      allRels.push(...consumedBy);
+    }
+
+    // Group relationships by type
+    const relsByType = new Map<string, ScopeRelationship[]>();
+    for (const rel of allRels) {
+      if (!relsByType.has(rel.type)) relsByType.set(rel.type, []);
+      relsByType.get(rel.type)!.push(rel);
+    }
+
+    const relTypes = Array.from(relsByType.keys());
+
+    for (let i = 0; i < relTypes.length; i++) {
+      const relType = relTypes[i];
+      const rels = relsByType.get(relType)!;
+      const isLastType = i === relTypes.length - 1;
+      const typeConnector = isLastType ? '└── ' : '├── ';
+      const typePrefix = childPrefix + (isLastType ? '    ' : '│   ');
+
+      resultLines.push(`${childPrefix}${typeConnector}[${relType}]`);
+
+      for (let j = 0; j < rels.length; j++) {
+        const rel = rels[j];
+        const isLastRel = j === rels.length - 1;
+        const relConnector = isLastRel ? '└── ' : '├── ';
+        const targetName = rel.target.split('::').pop() || rel.target;
+        const targetType = rel.targetType ? ` (${rel.targetType})` : '';
+        const targetFile = rel.targetFile ? ` @ ${rel.targetFile}` : '';
+        resultLines.push(`${typePrefix}${relConnector}${targetName}${targetType}${targetFile}`);
+      }
+    }
+
+    return resultLines;
+  }
+
+  return lines.join('\n') || '(no scopes found)';
+}
+
+/**
+ * Generate handler for analyze_files
+ */
+export function generateAnalyzeFilesHandler(_ctx: BrainToolsContext) {
+  return async (params: {
+    paths: string[];
+    target_lines?: Record<string, number[]>;
+    format?: 'markdown' | 'json';
+    include_source?: boolean;
+    max_depth?: number;
+    max_top_scopes?: number;
+  }): Promise<AnalyzeFilesResult | string> => {
+    const { paths, target_lines, format = 'markdown', include_source = true, max_depth = 3, max_top_scopes = 5 } = params;
+    const startTime = Date.now();
+    const pathModule = await import('path');
+    const fs = await import('fs/promises');
+
+    const analyzedFiles: AnalyzedFile[] = [];
+    const fileContents = new Map<string, string>();
+    let totalScopes = 0;
+    let totalRelationships = 0;
+
+    // Global cache for parsed files (shared across all analyzed files)
+    // This prevents re-parsing the same file multiple times
+    interface CachedAnalysis {
+      analysis: any;
+      scopeLines: Map<string, { startLine: number; endLine: number }>;
+      content: string;  // Store content to avoid re-reading
+    }
+    const globalAnalysisCache = new Map<string, CachedAnalysis>();
+
+    // Helper to parse a file with caching
+    const parseFileWithCache = async (
+      filePath: string,
+      parser: any,
+      fsModule: typeof import('fs/promises')
+    ): Promise<CachedAnalysis | null> => {
+      // Check cache first
+      if (globalAnalysisCache.has(filePath)) {
+        return globalAnalysisCache.get(filePath)!;
+      }
+
+      try {
+        const content = await fsModule.readFile(filePath, 'utf-8');
+        const analysis = await parser.parseFile(filePath, content);
+
+        // Build scope lines map
+        const scopeLines = new Map<string, { startLine: number; endLine: number }>();
+        const collectScopes = (scopes: any[]) => {
+          for (const s of scopes) {
+            scopeLines.set(s.name, { startLine: s.startLine, endLine: s.endLine });
+            if (s.children) collectScopes(s.children);
+          }
+        };
+        collectScopes(analysis.scopes);
+
+        const cached: CachedAnalysis = { analysis, scopeLines, content };
+        globalAnalysisCache.set(filePath, cached);
+        return cached;
+      } catch {
+        return null;
+      }
+    };
+
+    // Determine which parsers we need
+    const needsTs = paths.some(p => /\.(ts|tsx|js|jsx|mjs|cjs)$/i.test(p));
+    const needsPy = paths.some(p => /\.py$/i.test(p));
+
+    // Initialize parsers in parallel
+    const [tsParser, pyParser] = await Promise.all([
+      needsTs ? getTypeScriptParser() : null,
+      needsPy ? getPythonParser() : null,
+    ]);
+
+    // =========================================================================
+    // PHASE 1: Parse all files, build allScopes, calculate same-file relationships
+    // =========================================================================
+    interface ParsedFileData {
+      absolutePath: string;
+      filePath: string;
+      isTs: boolean;
+      analysis: any;
+      content: string;
+      allScopes: AnalyzedScope[];
+      analyzedScopes: AnalyzedScope[];
+      imports: any[];
+      exports: any[];
+    }
+    const parsedFiles: ParsedFileData[] = [];
+
+    // Process each file
+    for (const filePath of paths) {
+      const absolutePath = pathModule.isAbsolute(filePath)
+        ? filePath
+        : pathModule.resolve(process.cwd(), filePath);
+
+      const ext = pathModule.extname(absolutePath).toLowerCase();
+
+      // Check if we support this file type
+      const isTs = /\.(ts|tsx|js|jsx|mjs|cjs)$/i.test(ext);
+      const isPy = ext === '.py';
+
+      if (!isTs && !isPy) {
+        analyzedFiles.push({
+          path: absolutePath,
+          language: 'unsupported',
+          scopes: [],
+          imports: [],
+          exports: [],
+          error: `Unsupported file type: ${ext}`,
+        });
+        continue;
+      }
+
+      try {
+        // Parse with appropriate parser (using cache)
+        const parser = isTs ? tsParser : pyParser;
+        if (!parser) {
+          throw new Error('Parser not initialized');
+        }
+
+        const cached = await parseFileWithCache(absolutePath, parser, fs);
+        if (!cached) {
+          throw new Error('Failed to parse file');
+        }
+        const { analysis, content } = cached;
+
+        // Use cached content for markdown formatting (no second read needed)
+        if (include_source) {
+          fileContents.set(absolutePath, content);
+        }
+
+        // Build scope map for relationship resolution
+        const scopeMap = new Map<string, any>();
+        const buildScopeMap = (scopes: any[]) => {
+          for (const scope of scopes) {
+            scopeMap.set(scope.name, scope);
+          }
+        };
+        buildScopeMap(analysis.scopes);
+
+        // Convert scopes to analyzed format - keep ALL scopes for CONSUMED_BY calculation
+        const allScopes: AnalyzedScope[] = analysis.scopes.map((scope: any) => {
+          const analyzed = convertToAnalyzedScope(scope, scopeMap, max_depth);
+          return analyzed;
+        });
+
+        // Calculate CONSUMED_BY using ALL scopes before filtering
+        const consumedByMap = new Map<string, ScopeRelationship[]>();
+        for (const scope of allScopes) {
+          for (const rel of scope.relationships) {
+            if (rel.type === 'CONSUMES' && !rel.targetFile) {
+              const targetName = rel.target.includes('::')
+                ? rel.target.split('::').pop()!.split(':')[0]
+                : rel.target;
+
+              if (!consumedByMap.has(targetName)) {
+                consumedByMap.set(targetName, []);
+              }
+              consumedByMap.get(targetName)!.push({
+                type: 'CONSUMED_BY',
+                target: scope.name,
+                targetType: scope.type,
+                targetStartLine: scope.startLine,
+                targetEndLine: scope.endLine,
+              });
+            }
+          }
+        }
+
+        // Add CONSUMED_BY to all scopes
+        for (const scope of allScopes) {
+          const consumedBy = consumedByMap.get(scope.name);
+          if (consumedBy) {
+            for (const rel of consumedBy) {
+              const exists = scope.relationships.some(
+                r => r.type === 'CONSUMED_BY' && r.target === rel.target
+              );
+              if (!exists) {
+                scope.relationships.push(rel);
+              }
+            }
+          }
+        }
+
+        // NOW filter scopes by target lines if provided
+        let analyzedScopes = allScopes;
+        const fileTargetLines = target_lines?.[filePath] || target_lines?.[absolutePath];
+        if (fileTargetLines && fileTargetLines.length > 0) {
+          // Keep only scopes that contain at least one target line
+          analyzedScopes = allScopes.filter(scope => {
+            return fileTargetLines.some(line =>
+              line >= scope.startLine && line <= scope.endLine
+            );
+          });
+        }
+
+        // Cross-file relationships are extracted in Phase 2 after all files are parsed
+        // (This block is now handled in Phase 2 below)
+        const _skipCrossFileHere = true;
+        if (!_skipCrossFileHere) {
+          const refs = extractReferences(content, absolutePath);
+          const localRefs = refs.filter(r => r.isLocal && r.type === 'code');
+
+          if (localRefs.length > 0) {
+            // Find project root by looking for package.json
+            const projectRoot = await findProjectRoot(absolutePath, pathModule, fs);
+
+            if (projectRoot) {
+              const resolvedRefs = await resolveAllReferences(localRefs, absolutePath, projectRoot);
+
+              // Build a map of symbol -> resolved reference
+              const symbolToRef = new Map<string, ResolvedReference>();
+              for (const ref of resolvedRefs) {
+                for (const symbol of ref.symbols) {
+                  if (symbol !== '*' && symbol !== 'default') {
+                    symbolToRef.set(symbol, ref);
+                  }
+                }
+              }
+
+              // Analyze target files to get line numbers for imported symbols
+              // Uses global cache to avoid re-parsing files
+              const uniqueTargetFiles = [...new Set(resolvedRefs.map(r => r.absolutePath))];
+
+              for (const targetPath of uniqueTargetFiles) {
+                // Parse with cache (will skip if already cached)
+                await parseFileWithCache(targetPath, parser, fs);
+              }
+
+              // For each scope, check if it uses any imported symbols
+              const contentLines = content.split('\n');
+              for (const scope of analyzedScopes) {
+                const scopeSource = contentLines.slice(scope.startLine - 1, scope.endLine).join('\n');
+
+                for (const [symbol, ref] of symbolToRef) {
+                  // Check if symbol is used in the scope
+                  // Patterns to detect:
+                  // 1. Function call: symbol( or symbol<...>( for generics
+                  // 2. Instantiation: new Symbol( or new Symbol<...>(
+                  const patterns = [
+                    new RegExp(`\\b${symbol}\\s*(<[^>]*>)?\\s*\\(`),           // fn() or fn<T>()
+                    new RegExp(`\\bnew\\s+${symbol}\\s*(<[^>]*>)?\\s*\\(`),    // new Class() or new Class<T>()
+                  ];
+
+                  const isUsed = patterns.some(p => p.test(scopeSource));
+                  if (isUsed) {
+                    // Add cross-file CONSUMES relationship with line numbers if available
+                    const relativePath = pathModule.relative(pathModule.dirname(absolutePath), ref.absolutePath);
+                    const targetCached = globalAnalysisCache.get(ref.absolutePath);
+                    const targetScopeInfo = targetCached?.scopeLines.get(symbol);
+
+                    scope.relationships.push({
+                      type: 'CONSUMES',
+                      target: symbol,
+                      targetFile: relativePath,
+                      targetStartLine: targetScopeInfo?.startLine,
+                      targetEndLine: targetScopeInfo?.endLine,
+                    });
+                  }
+                }
+              }
+            }
+          }
+        } // end if (!_skipCrossFileHere)
+
+        // Store parsed file data for Phase 2
+        parsedFiles.push({
+          absolutePath,
+          filePath,
+          isTs,
+          analysis,
+          content,
+          allScopes,
+          analyzedScopes,
+          imports: analysis.imports,
+          exports: analysis.exports,
+        });
+      } catch (err: any) {
+        analyzedFiles.push({
+          path: absolutePath,
+          language: isTs ? 'typescript' : 'python',
+          scopes: [],
+          imports: [],
+          exports: [],
+          error: err.message,
+        });
+      }
+    }
+
+    // =========================================================================
+    // PHASE 2: Cross-file relationship enrichment
+    // Check ALL scopes (including filtered) for relationships TO filtered scopes
+    // =========================================================================
+
+    // Build global map of filtered scopes by name for quick lookup
+    const filteredScopesByName = new Map<string, Array<{ scope: AnalyzedScope; filePath: string }>>();
+    for (const pf of parsedFiles) {
+      for (const scope of pf.analyzedScopes) {
+        if (!filteredScopesByName.has(scope.name)) {
+          filteredScopesByName.set(scope.name, []);
+        }
+        filteredScopesByName.get(scope.name)!.push({ scope, filePath: pf.absolutePath });
+      }
+    }
+
+    // For each parsed file, check ALL scopes for cross-file relationships
+    for (const pf of parsedFiles) {
+      const parser = pf.isTs ? tsParser : pyParser;
+      if (!parser) continue;
+
+      try {
+        const refs = extractReferences(pf.content, pf.absolutePath);
+        const localRefs = refs.filter(r => r.isLocal && r.type === 'code');
+
+        if (localRefs.length > 0) {
+          const projectRoot = await findProjectRoot(pf.absolutePath, pathModule, fs);
+
+          if (projectRoot) {
+            const resolvedRefs = await resolveAllReferences(localRefs, pf.absolutePath, projectRoot);
+
+            // Build symbol -> resolved reference map
+            const symbolToRef = new Map<string, ResolvedReference>();
+            for (const ref of resolvedRefs) {
+              for (const symbol of ref.symbols) {
+                if (symbol !== '*' && symbol !== 'default') {
+                  symbolToRef.set(symbol, ref);
+                }
+              }
+            }
+
+            // Parse target files for line numbers
+            const uniqueTargetFiles = [...new Set(resolvedRefs.map(r => r.absolutePath))];
+            for (const targetPath of uniqueTargetFiles) {
+              await parseFileWithCache(targetPath, parser, fs);
+            }
+
+            // Check ALL scopes (not just filtered) for cross-file usage
+            const contentLines = pf.content.split('\n');
+            for (const scope of pf.allScopes) {
+              const scopeSource = contentLines.slice(scope.startLine - 1, scope.endLine).join('\n');
+              const isInFilter = pf.analyzedScopes.includes(scope);
+
+              for (const [symbol, ref] of symbolToRef) {
+                const patterns = [
+                  new RegExp(`\\b${symbol}\\s*(<[^>]*>)?\\s*\\(`),
+                  new RegExp(`\\bnew\\s+${symbol}\\s*(<[^>]*>)?\\s*\\(`),
+                ];
+
+                const isUsed = patterns.some(p => p.test(scopeSource));
+                if (isUsed) {
+                  const relativePath = pathModule.relative(pathModule.dirname(pf.absolutePath), ref.absolutePath);
+                  const targetCached = globalAnalysisCache.get(ref.absolutePath);
+                  const targetScopeInfo = targetCached?.scopeLines.get(symbol);
+
+                  // If THIS scope is in the filter, add CONSUMES
+                  if (isInFilter) {
+                    const exists = scope.relationships.some(
+                      r => r.type === 'CONSUMES' && r.target === symbol && r.targetFile === relativePath
+                    );
+                    if (!exists) {
+                      scope.relationships.push({
+                        type: 'CONSUMES',
+                        target: symbol,
+                        targetFile: relativePath,
+                        targetStartLine: targetScopeInfo?.startLine,
+                        targetEndLine: targetScopeInfo?.endLine,
+                      });
+                    }
+                  }
+
+                  // If TARGET scope is in the filter, add CONSUMED_BY to it
+                  const targetScopes = filteredScopesByName.get(symbol);
+                  if (targetScopes) {
+                    for (const targetEntry of targetScopes) {
+                      if (targetEntry.filePath === ref.absolutePath) {
+                        const inverseRelPath = pathModule.relative(
+                          pathModule.dirname(ref.absolutePath),
+                          pf.absolutePath
+                        );
+                        const exists = targetEntry.scope.relationships.some(
+                          r => r.type === 'CONSUMED_BY' && r.target === scope.name && r.targetFile === inverseRelPath
+                        );
+                        if (!exists) {
+                          targetEntry.scope.relationships.push({
+                            type: 'CONSUMED_BY',
+                            target: scope.name,
+                            targetType: scope.type,
+                            targetFile: inverseRelPath,
+                            targetStartLine: scope.startLine,
+                            targetEndLine: scope.endLine,
+                          });
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+
+              // Check INHERITS_FROM, IMPLEMENTS, DECORATED_BY for inverse relationships
+              // Only if scope is NOT in filter (filtered scopes already have their relations)
+              if (!isInFilter) {
+                for (const rel of scope.relationships) {
+                  if (rel.type === 'INHERITS_FROM' || rel.type === 'IMPLEMENTS' || rel.type === 'DECORATED_BY') {
+                    const targetScopes = filteredScopesByName.get(rel.target);
+                    if (targetScopes) {
+                      const inverseType = rel.type === 'INHERITS_FROM' ? 'INHERITED_BY'
+                        : rel.type === 'IMPLEMENTS' ? 'IMPLEMENTED_BY'
+                        : 'DECORATES';
+
+                      for (const targetEntry of targetScopes) {
+                        const exists = targetEntry.scope.relationships.some(
+                          r => r.type === inverseType && r.target === scope.name
+                        );
+                        if (!exists) {
+                          targetEntry.scope.relationships.push({
+                            type: inverseType,
+                            target: scope.name,
+                            targetType: scope.type,
+                            targetStartLine: scope.startLine,
+                            targetEndLine: scope.endLine,
+                          });
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      } catch (refErr: any) {
+        console.error('[analyze_files] Cross-file ref error:', refErr?.message || refErr);
+      }
+    }
+
+    // =========================================================================
+    // PHASE 3: Build final result from parsed files
+    // =========================================================================
+    for (const pf of parsedFiles) {
+      for (const scope of pf.analyzedScopes) {
+        totalRelationships += scope.relationships.length;
+      }
+      totalScopes += pf.analyzedScopes.length;
+
+      analyzedFiles.push({
+        path: pf.absolutePath,
+        language: pf.isTs ? 'typescript' : 'python',
+        scopes: pf.analyzedScopes,
+        imports: pf.imports.map((imp: any) => ({
+          source: imp.source,
+          imported: imp.imported,
+          isLocal: imp.isLocal,
+        })),
+        exports: pf.exports.map((exp: any) => exp.exported || exp),
+      });
+    }
+
+    // Cross-file relationships are now properly calculated in Phase 2
+
+    const result: AnalyzeFilesResult = {
+      success: true,
+      files: analyzedFiles,
+      totalScopes,
+      totalRelationships,
+      parseTimeMs: Date.now() - startTime,
+    };
+
+    // Return markdown or JSON based on format
+    if (format === 'markdown') {
+      return formatAnalyzeFilesAsMarkdown(result, fileContents, pathModule, { maxTopScopes: max_top_scopes });
+    }
+
+    return result;
+  };
+}
+
+// ============================================
 // Brain-Aware File Tools
 // ============================================
 
 const DEFAULT_READ_LIMIT = 2000;
 const MAX_LINE_LENGTH = 2000;
+
+/**
+ * Helper: Find project root by looking for package.json or tsconfig.json
+ */
+async function findProjectRoot(
+  filePath: string,
+  pathModule: typeof import('path'),
+  fs: typeof import('fs/promises')
+): Promise<string | null> {
+  let currentDir = pathModule.dirname(filePath);
+  const root = pathModule.parse(currentDir).root;
+
+  while (currentDir !== root) {
+    try {
+      // Check for package.json
+      await fs.access(pathModule.join(currentDir, 'package.json'));
+      return currentDir;
+    } catch {
+      // Check for tsconfig.json
+      try {
+        await fs.access(pathModule.join(currentDir, 'tsconfig.json'));
+        return currentDir;
+      } catch {
+        // Move up one directory
+        currentDir = pathModule.dirname(currentDir);
+      }
+    }
+  }
+
+  return null;
+}
 
 /**
  * Helper: Find which project a file belongs to
@@ -2912,6 +4064,10 @@ Example: read_file({ path: "/home/user/project/screenshot.png" })  // Visual des
         ocr: {
           type: 'boolean',
           description: 'For images/documents: use OCR text extraction. Default: false for images (visual description), true for PDFs (text extraction). Low confidence OCR automatically falls back to Gemini Vision.',
+        },
+        analyze: {
+          type: 'boolean',
+          description: 'For code files: include scope analysis with relationships (CONSUMES, CONSUMED_BY, INHERITS_FROM, IMPLEMENTS, DECORATED_BY). Uses database if file is ingested, otherwise analyzes on-the-fly. Default: false.',
         },
       },
       required: ['path'],
@@ -3125,8 +4281,8 @@ function stripLineNumberPrefix(text: string): string {
  * Generate handler for read_file (brain-aware with caching)
  */
 export function generateBrainReadFileHandler(ctx: BrainToolsContext) {
-  return async (params: { path: string; offset?: number; limit?: number; ocr?: boolean }): Promise<any> => {
-    const { path: filePath, offset = 0, limit = DEFAULT_READ_LIMIT, ocr } = params;
+  return async (params: { path: string; offset?: number; limit?: number; ocr?: boolean; analyze?: boolean }): Promise<any> => {
+    const { path: filePath, offset = 0, limit = DEFAULT_READ_LIMIT, ocr, analyze = false } = params;
     const fs = await import('fs/promises');
     const pathModule = await import('path');
     const crypto = await import('crypto');
@@ -3511,7 +4667,8 @@ export function generateBrainReadFileHandler(ctx: BrainToolsContext) {
       console.debug(`[brain-tools] updateFileAccess skipped for ${absolutePath}: ${err.message}`);
     });
 
-    return {
+    // Build base result
+    const result: any = {
       path: filePath,
       absolute_path: absolutePath,
       total_lines: totalLines,
@@ -3520,6 +4677,110 @@ export function generateBrainReadFileHandler(ctx: BrainToolsContext) {
       has_more: hasMoreLines,
       content: output,
     };
+
+    // If analyze is requested, add scope analysis
+    if (analyze) {
+      const codeExtensions = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py'];
+      if (codeExtensions.includes(ext)) {
+        try {
+          // Check if file is in an ingested project
+          const registeredProjects = ctx.brain.listProjects();
+          const projectForFile = registeredProjects.find(
+            p => absolutePath.startsWith(p.path + pathModule.sep)
+          );
+
+          if (projectForFile) {
+            // File is in an ingested project - query relationships from DB
+            // Filter scopes that overlap with read lines
+            const readStart = offset + 1; // 1-based
+            const readEnd = offset + selectedLines.length;
+
+            const query = `
+              MATCH (s:Scope)-[:DEFINED_IN]->(f:File {path: $filePath})
+              WHERE s.startLine <= $readEnd AND s.endLine >= $readStart
+              OPTIONAL MATCH (s)-[consumes:CONSUMES]->(consumed:Scope)
+              OPTIONAL MATCH (consumer:Scope)-[consumedBy:CONSUMES]->(s)
+              OPTIONAL MATCH (s)-[inherits:INHERITS_FROM]->(parent)
+              OPTIONAL MATCH (s)-[implements:IMPLEMENTS]->(iface)
+              OPTIONAL MATCH (s)-[decorated:DECORATED_BY]->(decorator)
+              RETURN s.name AS name, s.type AS type, s.startLine AS startLine, s.endLine AS endLine,
+                     collect(DISTINCT {type: 'CONSUMES', target: consumed.name}) AS consumes,
+                     collect(DISTINCT {type: 'CONSUMED_BY', target: consumer.name}) AS consumedBy,
+                     collect(DISTINCT {type: 'INHERITS_FROM', target: parent.name}) AS inherits,
+                     collect(DISTINCT {type: 'IMPLEMENTS', target: iface.name}) AS implements,
+                     collect(DISTINCT {type: 'DECORATED_BY', target: decorator.name}) AS decorated
+              ORDER BY s.startLine
+            `;
+
+            const dbResult = await ctx.brain.runCypher(query, {
+              filePath: absolutePath,
+              readStart,
+              readEnd,
+            });
+
+            if (dbResult.records && dbResult.records.length > 0) {
+              result.analysis = {
+                source: 'database',
+                lines_analyzed: `${readStart}-${readEnd}`,
+                scopes: dbResult.records.map((r: any) => {
+                  const allRels = [
+                    ...r.consumes.filter((x: any) => x.target),
+                    ...r.consumedBy.filter((x: any) => x.target),
+                    ...r.inherits.filter((x: any) => x.target),
+                    ...r.implements.filter((x: any) => x.target),
+                    ...r.decorated.filter((x: any) => x.target),
+                  ];
+                  return {
+                    name: r.name,
+                    type: r.type,
+                    startLine: r.startLine?.toNumber?.() || r.startLine,
+                    endLine: r.endLine?.toNumber?.() || r.endLine,
+                    relationships: allRels,
+                  };
+                }),
+              };
+            }
+          }
+
+          // If no DB result or not ingested, use on-the-fly analysis
+          if (!result.analysis) {
+            const analyzeHandler = generateAnalyzeFilesHandler(ctx);
+            const analysisResult = await analyzeHandler({
+              paths: [absolutePath],
+              format: 'json',
+              include_source: false,
+            }) as AnalyzeFilesResult;
+
+            if (analysisResult.success && analysisResult.files?.[0]?.scopes) {
+              // Filter scopes to only those overlapping with read lines
+              const readStart = offset + 1; // 1-based
+              const readEnd = offset + selectedLines.length;
+
+              const filteredScopes = analysisResult.files[0].scopes
+                .filter((s: any) => s.startLine <= readEnd && s.endLine >= readStart)
+                .map((s: any) => ({
+                  name: s.name,
+                  type: s.type,
+                  startLine: s.startLine,
+                  endLine: s.endLine,
+                  relationships: s.relationships,
+                }));
+
+              result.analysis = {
+                source: 'on-the-fly',
+                lines_analyzed: `${readStart}-${readEnd}`,
+                scopes: filteredScopes,
+              };
+            }
+          }
+        } catch (err: any) {
+          console.warn(`[read_file] Analysis failed: ${err.message}`);
+          result.analysis = { error: err.message };
+        }
+      }
+    }
+
+    return result;
   };
 }
 
@@ -4360,8 +5621,11 @@ export function generateBrainTools(): GeneratedToolDefinition[] {
     generateListWatchersTool(),
     generateStartWatcherTool(),
     generateStopWatcherTool(),
-    // File dirty marking
+    // File dirty marking and touch
     generateMarkFileDirtyTool(),
+    generateTouchFileTool(),
+    // Code analysis (parse without storing)
+    generateAnalyzeFilesTool(),
     // Brain-aware file tools - handle touchFile for orphan files
     // and triggerReIngestion for file modifications
     generateBrainReadFileTool(),
@@ -4406,8 +5670,11 @@ export function generateBrainToolHandlers(ctx: BrainToolsContext): Record<string
     list_watchers: generateListWatchersHandler(ctx),
     start_watcher: generateStartWatcherHandler(ctx),
     stop_watcher: generateStopWatcherHandler(ctx),
-    // File dirty marking
+    // File dirty marking and touch
     mark_file_dirty: generateMarkFileDirtyHandler(ctx),
+    touch_file: generateTouchFileHandler(ctx),
+    // Code analysis (parse without storing)
+    analyze_files: generateAnalyzeFilesHandler(ctx),
     // Brain-aware file tools - these handle touchFile for orphan files
     // and trigger re-ingestion on file modifications
     read_file: generateBrainReadFileHandler(ctx),

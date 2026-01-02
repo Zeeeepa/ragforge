@@ -148,107 +148,166 @@ export function extractReferences(
 
 /**
  * Extract TypeScript/JavaScript imports
+ * Handles multi-line imports like:
+ *   import {
+ *     foo,
+ *     bar,
+ *   } from './module';
  */
 function extractTypeScriptReferences(content: string): ExtractedReference[] {
   const refs: ExtractedReference[] = [];
-  const lines = content.split('\n');
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const lineNum = i + 1;
+  // Helper to get line number from character index
+  const getLineNumber = (index: number): number => {
+    return content.substring(0, index).split('\n').length;
+  };
 
-    // Named imports: import { foo, bar } from './module'
-    const namedMatch = line.match(/import\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]/);
-    if (namedMatch) {
-      const symbols = namedMatch[1].split(',').map(s => s.trim().split(/\s+as\s+/)[0].trim()).filter(Boolean);
-      const source = namedMatch[2];
+  // Named imports (multi-line safe): import { foo, bar } from './module'
+  // Uses [\s\S] to match across lines
+  const namedImportRegex = /import\s*\{([\s\S]*?)\}\s*from\s*['"]([^'"]+)['"]/g;
+  let match: RegExpExecArray | null;
+  while ((match = namedImportRegex.exec(content)) !== null) {
+    const symbolsBlock = match[1];
+    const source = match[2];
+    const symbols = symbolsBlock
+      .split(',')
+      .map(s => s.trim().replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim())
+      .filter(Boolean);
+    refs.push({
+      source,
+      symbols,
+      type: 'code',
+      line: getLineNumber(match.index),
+      isLocal: isLocalImport(source),
+    });
+  }
+
+  // Default import: import Foo from './module'
+  const defaultImportRegex = /import\s+(\w+)\s+from\s*['"]([^'"]+)['"]/g;
+  while ((match = defaultImportRegex.exec(content)) !== null) {
+    refs.push({
+      source: match[2],
+      symbols: ['default'],
+      type: 'code',
+      line: getLineNumber(match.index),
+      isLocal: isLocalImport(match[2]),
+    });
+  }
+
+  // Namespace import: import * as Foo from './module'
+  const namespaceImportRegex = /import\s*\*\s*as\s+(\w+)\s*from\s*['"]([^'"]+)['"]/g;
+  while ((match = namespaceImportRegex.exec(content)) !== null) {
+    refs.push({
+      source: match[2],
+      symbols: ['*'],
+      type: 'code',
+      line: getLineNumber(match.index),
+      isLocal: isLocalImport(match[2]),
+    });
+  }
+
+  // Side-effect import: import './module'
+  const sideEffectImportRegex = /import\s+['"]([^'"]+)['"]/g;
+  while ((match = sideEffectImportRegex.exec(content)) !== null) {
+    const source = match[1];
+    const ext = path.extname(source).toLowerCase();
+    refs.push({
+      source,
+      symbols: [],
+      type: TYPE_BY_EXTENSION[ext] || 'code',
+      line: getLineNumber(match.index),
+      isLocal: isLocalImport(source),
+    });
+  }
+
+  // Dynamic import with destructuring: const { foo, bar } = await import('./module')
+  const destructuredDynamicRegex = /(?:const|let|var)\s*\{([^}]+)\}\s*=\s*await\s+import\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+  while ((match = destructuredDynamicRegex.exec(content)) !== null) {
+    const symbolsBlock = match[1];
+    const source = match[2];
+    const symbols = symbolsBlock
+      .split(',')
+      .map(s => s.trim().split(/\s+as\s+/)[0].trim())
+      .filter(Boolean);
+    refs.push({
+      source,
+      symbols,
+      type: 'code',
+      line: getLineNumber(match.index),
+      isLocal: isLocalImport(source),
+    });
+  }
+
+  // Dynamic import with namespace: const module = await import('./module')
+  const namespaceDynamicRegex = /(?:const|let|var)\s+(\w+)\s*=\s*await\s+import\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+  while ((match = namespaceDynamicRegex.exec(content)) !== null) {
+    refs.push({
+      source: match[2],
+      symbols: ['*'],
+      type: 'code',
+      line: getLineNumber(match.index),
+      isLocal: isLocalImport(match[2]),
+    });
+  }
+
+  // Inline dynamic import: (await import('./module')).foo
+  const inlineDynamicRegex = /\(\s*await\s+import\s*\(\s*['"]([^'"]+)['"]\s*\)\s*\)\.(\w+)/g;
+  while ((match = inlineDynamicRegex.exec(content)) !== null) {
+    refs.push({
+      source: match[1],
+      symbols: [match[2]],
+      type: 'code',
+      line: getLineNumber(match.index),
+      isLocal: isLocalImport(match[1]),
+    });
+  }
+
+  // Fallback: Simple dynamic import without assignment (for side effects or untracked usage)
+  // Only match if not already captured by previous patterns
+  const simpleDynamicRegex = /(?<!(?:const|let|var)\s*(?:\{[^}]*\}|\w+)\s*=\s*await\s+)import\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+  while ((match = simpleDynamicRegex.exec(content)) !== null) {
+    const source = match[1];
+    const line = getLineNumber(match.index);
+    // Check if this wasn't already captured
+    const existsAlready = refs.some(r => r.source === source && r.line === line);
+    if (!existsAlready) {
       refs.push({
         source,
-        symbols,
+        symbols: ['*'],
         type: 'code',
-        line: lineNum,
+        line,
         isLocal: isLocalImport(source),
       });
-      continue;
     }
+  }
 
-    // Default import: import Foo from './module'
-    const defaultMatch = line.match(/import\s+(\w+)\s+from\s*['"]([^'"]+)['"]/);
-    if (defaultMatch) {
-      refs.push({
-        source: defaultMatch[2],
-        symbols: ['default'],
-        type: 'code',
-        line: lineNum,
-        isLocal: isLocalImport(defaultMatch[2]),
-      });
-      continue;
-    }
+  // Re-exports (multi-line safe): export { foo } from './module'
+  const reexportRegex = /export\s*\{([\s\S]*?)\}\s*from\s*['"]([^'"]+)['"]/g;
+  while ((match = reexportRegex.exec(content)) !== null) {
+    const symbolsBlock = match[1];
+    const symbols = symbolsBlock
+      .split(',')
+      .map(s => s.trim().replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim())
+      .filter(Boolean);
+    refs.push({
+      source: match[2],
+      symbols,
+      type: 'code',
+      line: getLineNumber(match.index),
+      isLocal: isLocalImport(match[2]),
+    });
+  }
 
-    // Namespace import: import * as Foo from './module'
-    const namespaceMatch = line.match(/import\s*\*\s*as\s+(\w+)\s*from\s*['"]([^'"]+)['"]/);
-    if (namespaceMatch) {
-      refs.push({
-        source: namespaceMatch[2],
-        symbols: ['*'],
-        type: 'code',
-        line: lineNum,
-        isLocal: isLocalImport(namespaceMatch[2]),
-      });
-      continue;
-    }
-
-    // Side-effect import: import './module'
-    const sideEffectMatch = line.match(/import\s+['"]([^'"]+)['"]/);
-    if (sideEffectMatch) {
-      const source = sideEffectMatch[1];
-      const ext = path.extname(source).toLowerCase();
-      refs.push({
-        source,
-        symbols: [],
-        type: TYPE_BY_EXTENSION[ext] || 'code',
-        line: lineNum,
-        isLocal: isLocalImport(source),
-      });
-      continue;
-    }
-
-    // Dynamic import: import('./module') or require('./module')
-    const dynamicMatches = line.matchAll(/(?:import|require)\s*\(\s*['"]([^'"]+)['"]\s*\)/g);
-    for (const match of dynamicMatches) {
-      refs.push({
-        source: match[1],
-        symbols: ['*'],
-        type: 'code',
-        line: lineNum,
-        isLocal: isLocalImport(match[1]),
-      });
-    }
-
-    // Re-exports: export { foo } from './module'
-    const reexportMatch = line.match(/export\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]/);
-    if (reexportMatch) {
-      const symbols = reexportMatch[1].split(',').map(s => s.trim().split(/\s+as\s+/)[0].trim()).filter(Boolean);
-      refs.push({
-        source: reexportMatch[2],
-        symbols,
-        type: 'code',
-        line: lineNum,
-        isLocal: isLocalImport(reexportMatch[2]),
-      });
-    }
-
-    // Export all: export * from './module'
-    const exportAllMatch = line.match(/export\s*\*\s*from\s*['"]([^'"]+)['"]/);
-    if (exportAllMatch) {
-      refs.push({
-        source: exportAllMatch[1],
-        symbols: ['*'],
-        type: 'code',
-        line: lineNum,
-        isLocal: isLocalImport(exportAllMatch[1]),
-      });
-    }
+  // Export all: export * from './module'
+  const exportAllRegex = /export\s*\*\s*from\s*['"]([^'"]+)['"]/g;
+  while ((match = exportAllRegex.exec(content)) !== null) {
+    refs.push({
+      source: match[1],
+      symbols: ['*'],
+      type: 'code',
+      line: getLineNumber(match.index),
+      isLocal: isLocalImport(match[1]),
+    });
   }
 
   return refs;
@@ -555,25 +614,50 @@ function isLocalImport(source: string): boolean {
 
 /**
  * Try to resolve a path with common extensions
+ * Handles TypeScript ESM convention where imports use .js but files are .ts
  */
 async function resolveWithExtensions(
   source: string,
   baseDir: string
 ): Promise<string | null> {
-  // If source already has extension, try it directly
-  if (path.extname(source)) {
+  const ext = path.extname(source);
+
+  // If source has extension
+  if (ext) {
     const fullPath = path.resolve(baseDir, source);
+
+    // Try the exact path first
     try {
       await fs.access(fullPath);
       return fullPath;
     } catch {
-      return null;
+      // TypeScript ESM: imports use .js but files are .ts/.tsx
+      if (ext === '.js' || ext === '.jsx') {
+        const tsExt = ext === '.js' ? '.ts' : '.tsx';
+        const tsPath = fullPath.replace(/\.(js|jsx)$/, tsExt);
+        try {
+          await fs.access(tsPath);
+          return tsPath;
+        } catch {
+          // Also try .tsx for .js imports
+          if (ext === '.js') {
+            const tsxPath = fullPath.replace(/\.js$/, '.tsx');
+            try {
+              await fs.access(tsxPath);
+              return tsxPath;
+            } catch {
+              // Fall through to extension search
+            }
+          }
+        }
+      }
     }
   }
 
-  // Try with code extensions
-  for (const ext of CODE_EXTENSIONS) {
-    const fullPath = path.resolve(baseDir, source + ext);
+  // Try without extension, adding common code extensions
+  const basePath = ext ? source.slice(0, -ext.length) : source;
+  for (const codeExt of CODE_EXTENSIONS) {
+    const fullPath = path.resolve(baseDir, basePath + codeExt);
     try {
       await fs.access(fullPath);
       return fullPath;
@@ -584,7 +668,7 @@ async function resolveWithExtensions(
 
   // Try as directory with index file
   for (const indexFile of INDEX_FILES) {
-    const fullPath = path.resolve(baseDir, source, indexFile);
+    const fullPath = path.resolve(baseDir, basePath, indexFile);
     try {
       await fs.access(fullPath);
       return fullPath;

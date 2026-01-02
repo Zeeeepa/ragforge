@@ -17,6 +17,7 @@
     "packages/*"
   ],
   "scripts": {
+    "setup": "bash scripts/setup.sh",
     "prebuild": "npx tsx scripts/stop-daemon.ts || true",
     "build": "turbo run build",
     "dev": "turbo run dev",

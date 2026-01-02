@@ -8,6 +8,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
 import { DockerManager } from './docker';
 import { Neo4jManager } from './neo4j';
+import { OllamaManager } from './ollama';
 import * as daemonClient from './daemon-client';
 
 const RAGFORGE_DIR = path.join(homedir(), '.ragforge');
@@ -16,6 +17,7 @@ const RAGFORGE_ENV_FILE = path.join(RAGFORGE_DIR, '.env');
 let mainWindow: BrowserWindow | null = null;
 const dockerManager = new DockerManager();
 const neo4jManager = new Neo4jManager();
+const ollamaManager = new OllamaManager();
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -271,6 +273,57 @@ ipcMain.handle('config:set-api-key', async (_event, keyName: 'gemini' | 'replica
     console.error(`Failed to save API key ${keyName}:`, err);
     return false;
   }
+});
+
+// ========== Ollama ==========
+
+// Get Ollama status (installed, running, models)
+ipcMain.handle('ollama:status', async () => {
+  return ollamaManager.getStatus();
+});
+
+// Check if Ollama is installed
+ipcMain.handle('ollama:check-installed', async () => {
+  return ollamaManager.checkInstalled();
+});
+
+// Check if Ollama is running
+ipcMain.handle('ollama:check-running', async () => {
+  return ollamaManager.checkRunning();
+});
+
+// Get install instructions for current platform
+ipcMain.handle('ollama:get-install-instructions', async () => {
+  return ollamaManager.getInstallInstructions();
+});
+
+// Install Ollama (platform-specific)
+ipcMain.handle('ollama:install', async () => {
+  return ollamaManager.installOllama((progress) => {
+    mainWindow?.webContents.send('ollama:install-progress', progress);
+  });
+});
+
+// Start Ollama service
+ipcMain.handle('ollama:start', async () => {
+  return ollamaManager.startOllama();
+});
+
+// Check if a model is available
+ipcMain.handle('ollama:has-model', async (_event, modelName: string) => {
+  return ollamaManager.hasModel(modelName);
+});
+
+// Pull a model
+ipcMain.handle('ollama:pull-model', async (_event, modelName?: string) => {
+  return ollamaManager.pullModel(modelName, (progress) => {
+    mainWindow?.webContents.send('ollama:pull-progress', progress);
+  });
+});
+
+// Get default embedding model name
+ipcMain.handle('ollama:get-default-model', async () => {
+  return ollamaManager.getDefaultEmbeddingModel();
 });
 
 // ========== Daemon API ==========

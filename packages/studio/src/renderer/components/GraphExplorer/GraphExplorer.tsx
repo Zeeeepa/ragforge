@@ -17,6 +17,7 @@ import { Play, Loader2, Settings2, LayoutGrid, Maximize2, Minimize2, Search, X, 
 import ScopeNode from './nodes/ScopeNode';
 import FileNode from './nodes/FileNode';
 import DocumentNode from './nodes/DocumentNode';
+import LibraryNode from './nodes/LibraryNode';
 import { ExpandProvider, useExpand } from './ExpandContext';
 
 // Custom node types
@@ -24,6 +25,7 @@ const nodeTypes = {
   scope: ScopeNode,
   file: FileNode,
   document: DocumentNode,
+  library: LibraryNode,
 };
 
 // Properties to hide from the inspector (internal/large data)
@@ -251,6 +253,10 @@ function GraphExplorerInner() {
   const [searchMode, setSearchMode] = useState(false);
   const [searchSemantic, setSearchSemantic] = useState(false); // false = BM25, true = semantic
   const [fuzzyDistance, setFuzzyDistance] = useState<0 | 1 | 2>(1); // For BM25 mode
+  const [boostKeywords, setBoostKeywords] = useState(''); // Comma-separated keywords to boost
+  const [minScore, setMinScore] = useState(0.3); // Min score threshold (for semantic)
+  const [embeddingType, setEmbeddingType] = useState<'all' | 'name' | 'content' | 'description'>('all');
+  const [showAdvanced, setShowAdvanced] = useState(false); // Toggle advanced options
   const [daemonStatus, setDaemonStatus] = useState<'unknown' | 'starting' | 'ready' | 'error'>('unknown');
   const [daemonMessage, setDaemonMessage] = useState('');
 
@@ -338,8 +344,9 @@ function GraphExplorerInner() {
     if (labels.includes('MarkdownDocument')) return 'document';
     if (labels.includes('MarkdownSection')) return 'document';
     if (labels.includes('WebPage')) return 'document';
+    // Library nodes
+    if (labels.includes('ExternalLibrary')) return 'library';
     // Default for others
-    if (labels.includes('ExternalLibrary')) return 'file';
     if (labels.includes('Directory')) return 'file';
     if (labels.includes('Project')) return 'file';
     if (labels.includes('Summary')) return 'document';
@@ -415,12 +422,20 @@ function GraphExplorerInner() {
         setDaemonMessage(msg);
       });
 
+      // Parse boost keywords from comma-separated string
+      const parsedBoostKeywords = boostKeywords
+        .split(',')
+        .map(k => k.trim())
+        .filter(k => k.length > 0);
+
       // Call brain_search via daemon (auto-starts if needed)
       const response = await window.studio.daemon.brainSearch(searchQuery, {
         semantic: searchSemantic,
         limit,
         explore_depth: searchDepth,
         fuzzy_distance: searchSemantic ? undefined : fuzzyDistance,
+        boost_keywords: parsedBoostKeywords.length > 0 ? parsedBoostKeywords : undefined,
+        min_score: searchSemantic ? minScore : undefined,
       });
 
       setDaemonStatus('ready');
@@ -814,7 +829,72 @@ function GraphExplorerInner() {
                     </select>
                   </div>
                 )}
+
+                {/* Min score (only for semantic mode) */}
+                {searchSemantic && (
+                  <div className="flex items-center gap-1">
+                    <label className="text-xs text-gray-400">Min:</label>
+                    <input
+                      type="range"
+                      min="0"
+                      max="1"
+                      step="0.1"
+                      value={minScore}
+                      onChange={(e) => setMinScore(parseFloat(e.target.value))}
+                      className="w-16 h-1"
+                    />
+                    <span className="text-xs text-gray-500 w-6">{minScore}</span>
+                  </div>
+                )}
+
+                {/* Advanced toggle */}
+                <button
+                  onClick={() => setShowAdvanced(!showAdvanced)}
+                  className="text-xs text-gray-400 hover:text-white flex items-center gap-1"
+                >
+                  <Settings2 className="w-3 h-3" />
+                  {showAdvanced ? 'Less' : 'More'}
+                </button>
               </div>
+
+              {/* Advanced options */}
+              {showAdvanced && (
+                <div className="mt-2 pt-2 border-t border-gray-700 space-y-2">
+                  {/* Boost keywords */}
+                  <div className="flex items-center gap-2">
+                    <label className="text-xs text-gray-400 w-12">Boost:</label>
+                    <input
+                      type="text"
+                      value={boostKeywords}
+                      onChange={(e) => setBoostKeywords(e.target.value)}
+                      placeholder="keyword1, keyword2..."
+                      className="flex-1 bg-gray-900 border border-gray-600 rounded px-2 py-1 text-xs focus:outline-none focus:border-blue-500"
+                    />
+                  </div>
+
+                  {/* Embedding type (only for semantic mode) */}
+                  {searchSemantic && (
+                    <div className="flex items-center gap-2">
+                      <label className="text-xs text-gray-400 w-12">Search:</label>
+                      <div className="flex gap-1 flex-1">
+                        {(['all', 'name', 'content', 'description'] as const).map((type) => (
+                          <button
+                            key={type}
+                            onClick={() => setEmbeddingType(type)}
+                            className={`px-2 py-0.5 text-xs rounded ${
+                              embeddingType === type
+                                ? 'bg-purple-600 text-white'
+                                : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                            }`}
+                          >
+                            {type}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Daemon status */}
               {daemonMessage && (

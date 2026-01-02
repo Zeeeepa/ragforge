@@ -1,0 +1,46 @@
+# RagForge Docker Compose Configuration
+#
+# Quick Start:
+#   1. Run: npm run setup (creates ~/.ragforge/.env with password)
+#   2. Run: docker-compose up -d
+#
+# Or manually:
+#   1. Copy .env.example to ~/.ragforge/.env
+#   2. Run: docker-compose --env-file ~/.ragforge/.env up -d
+
+version: '3.8'
+
+services:
+  neo4j:
+    image: neo4j:5.23-community
+    container_name: ragforge-brain-neo4j
+    ports:
+      - "7687:7687"   # Bolt protocol
+      - "7474:7474"   # HTTP browser
+    environment:
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:-ragforge}
+      - NEO4J_PLUGINS=["apoc", "graph-data-science"]
+      - NEO4J_apoc_export_file_enabled=true
+      - NEO4J_apoc_import_file_enabled=true
+      - NEO4J_apoc_import_file_use__neo4j__config=true
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*,gds.*
+      - NEO4J_dbms_security_procedures_allowlist=apoc.*,gds.*
+    volumes:
+      - ragforge_brain_data:/data
+      - ragforge_brain_logs:/logs
+      - ragforge_brain_import:/var/lib/neo4j/import
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  ragforge_brain_data:
+    name: ragforge_brain_data
+  ragforge_brain_logs:
+    name: ragforge_brain_logs
+  ragforge_brain_import:
+    name: ragforge_brain_import

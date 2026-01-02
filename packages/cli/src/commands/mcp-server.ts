@@ -129,50 +129,6 @@ async function prepareToolsForMcp(
     log('debug', `Daemon background start failed: ${err.message} (will retry on first tool call)`);
   });
 
-  // Add FS tools (list_directory, glob_files, etc.) - these run locally as they don't need brain
-  // NOTE: delete_path, move_file, copy_file are now in brain-tools only
-  const fsTools = generateFsTools({ projectRoot: () => ctx.currentProjectPath || process.cwd() });
-  allTools.push(...fsTools.tools);
-  for (const [name, handler] of Object.entries(fsTools.handlers)) {
-    // Wrap handlers for grep_files and search_files to handle extract_hierarchy via daemon
-    if (name === 'grep_files' || name === 'search_files') {
-      allHandlers[name] = async (args: any) => {
-        // Temporarily remove extract_hierarchy from args to let handler return matches only
-        const extractHierarchy = args.extract_hierarchy;
-        const handlerArgs = { ...args };
-        delete handlerArgs.extract_hierarchy;
-
-        // Call the handler first to get matches (without extract_hierarchy)
-        const result = await handler(handlerArgs);
-
-        // If extract_hierarchy is requested and we have matches, call extract_dependency_hierarchy via daemon
-        if (extractHierarchy && result.matches && result.matches.length > 0) {
-          try {
-            // Use daemon proxy (same pattern as brain_search)
-            const hierarchyResult = await callToolViaDaemon('extract_dependency_hierarchy', {
-              results: result.matches,
-              depth: 1,
-              direction: 'both',
-              max_scopes: Math.min(result.matches.length, 10),
-            });
-
-            if (hierarchyResult.success) {
-              result.hierarchy = hierarchyResult.result;
-            } else {
-              result.hierarchy_error = hierarchyResult.error || 'Failed to extract hierarchy via daemon';
-            }
-          } catch (err: any) {
-            result.hierarchy_error = err.message || 'Failed to extract hierarchy';
-          }
-        }
-
-        return result;
-      };
-    } else {
-      allHandlers[name] = handler;
-    }
-  }
-
   // Add shell tools (with default confirmation that always allows)
   const shellTools = generateShellTools({
     projectRoot: () => ctx.currentProjectPath || process.cwd(),
@@ -208,6 +164,15 @@ async function prepareToolsForMcp(
     }
     return result.result;
   };
+
+  // Add FS tools via daemon (ensures latest code is used after builds)
+  // NOTE: delete_path, move_file, copy_file are in brain-tools only (with Neo4j integration)
+  const fsTools = generateFsTools({ projectRoot: () => ctx.currentProjectPath || process.cwd() });
+  allTools.push(...fsTools.tools);
+  for (const toolDef of fsTools.tools) {
+    allHandlers[toolDef.name] = createDaemonProxyHandler(toolDef.name);
+  }
+  log('debug', `FS tools enabled (via daemon) - ${fsTools.tools.length} tools`);
 
   // Add brain tools via daemon (with auto-restart)
   {

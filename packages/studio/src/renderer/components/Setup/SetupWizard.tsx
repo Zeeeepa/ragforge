@@ -9,13 +9,14 @@ import {
   Key,
   Sparkles,
   Box,
+  Cpu,
 } from 'lucide-react';
 
 interface SetupWizardProps {
   onComplete: () => void;
 }
 
-type Step = 'docker' | 'neo4j-image' | 'neo4j-container' | 'connection' | 'gemini-key' | 'replicate-key' | 'done';
+type Step = 'docker' | 'neo4j-image' | 'neo4j-container' | 'connection' | 'gemini-key' | 'replicate-key' | 'ollama' | 'done';
 
 interface StepStatus {
   docker: 'pending' | 'checking' | 'success' | 'error';
@@ -24,6 +25,7 @@ interface StepStatus {
   connection: 'pending' | 'checking' | 'success' | 'error';
   geminiKey: 'pending' | 'checking' | 'success' | 'error' | 'saving';
   replicateKey: 'pending' | 'checking' | 'success' | 'skipped' | 'saving';
+  ollama: 'pending' | 'checking' | 'installing' | 'starting' | 'pulling' | 'success' | 'skipped' | 'error';
 }
 
 export default function SetupWizard({ onComplete }: SetupWizardProps) {
@@ -35,8 +37,10 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
     connection: 'pending',
     geminiKey: 'pending',
     replicateKey: 'pending',
+    ollama: 'pending',
   });
   const [pullProgress, setPullProgress] = useState<string>('');
+  const [ollamaProgress, setOllamaProgress] = useState<string>('');
   const [error, setError] = useState<string>('');
   const [geminiKey, setGeminiKey] = useState<string>('');
   const [replicateKey, setReplicateKey] = useState<string>('');
@@ -45,6 +49,16 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
     // Listen for pull progress
     window.studio.neo4j.onPullProgress((progress) => {
       setPullProgress(progress.status + (progress.progress ? ` ${progress.progress}` : ''));
+    });
+
+    // Listen for Ollama install progress
+    window.studio.ollama.onInstallProgress((progress) => {
+      setOllamaProgress(progress.message);
+    });
+
+    // Listen for Ollama model pull progress
+    window.studio.ollama.onPullProgress((progress) => {
+      setOllamaProgress(progress.status + (progress.percent ? ` (${progress.percent}%)` : ''));
     });
 
     // Start checking
@@ -211,12 +225,99 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
     if (success) {
       setStatus((s) => ({ ...s, replicateKey: 'success' }));
     }
-    setCurrentStep('done');
+    setCurrentStep('ollama');
+    checkOllama();
   }
 
   function skipReplicateKey() {
     setStatus((s) => ({ ...s, replicateKey: 'skipped' }));
+    setCurrentStep('ollama');
+    checkOllama();
+  }
+
+  async function checkOllama() {
+    setStatus((s) => ({ ...s, ollama: 'checking' }));
+    setOllamaProgress('');
+    setError('');
+
+    const ollamaStatus = await window.studio.ollama.status();
+
+    if (ollamaStatus.running) {
+      // Check if the default model is available
+      const defaultModel = await window.studio.ollama.getDefaultModel();
+      const hasModel = await window.studio.ollama.hasModel(defaultModel);
+
+      if (hasModel) {
+        setStatus((s) => ({ ...s, ollama: 'success' }));
+        setCurrentStep('done');
+      } else {
+        // Need to pull model
+        setStatus((s) => ({ ...s, ollama: 'pending' }));
+      }
+    } else if (ollamaStatus.installed) {
+      // Installed but not running
+      setStatus((s) => ({ ...s, ollama: 'pending' }));
+      setError('Ollama is installed but not running.');
+    } else {
+      // Not installed
+      setStatus((s) => ({ ...s, ollama: 'pending' }));
+    }
+  }
+
+  async function installOllama() {
+    setStatus((s) => ({ ...s, ollama: 'installing' }));
+    setOllamaProgress('Starting installation...');
+    setError('');
+
+    const success = await window.studio.ollama.install();
+
+    if (success) {
+      setOllamaProgress('Installation complete! Starting Ollama...');
+      await startOllama();
+    } else {
+      setStatus((s) => ({ ...s, ollama: 'error' }));
+      setError('Failed to install Ollama');
+    }
+  }
+
+  async function startOllama() {
+    setStatus((s) => ({ ...s, ollama: 'starting' }));
+    setOllamaProgress('Starting Ollama...');
+
+    const success = await window.studio.ollama.start();
+
+    if (success) {
+      setOllamaProgress('Ollama started! Pulling embedding model...');
+      await pullOllamaModel();
+    } else {
+      setStatus((s) => ({ ...s, ollama: 'error' }));
+      setError('Failed to start Ollama. Please start it manually.');
+    }
+  }
+
+  async function pullOllamaModel() {
+    setStatus((s) => ({ ...s, ollama: 'pulling' }));
+    setOllamaProgress('Downloading nomic-embed-text model...');
+
+    const success = await window.studio.ollama.pullModel();
+
+    if (success) {
+      setStatus((s) => ({ ...s, ollama: 'success' }));
+      setOllamaProgress('');
+      setCurrentStep('done');
+    } else {
+      setStatus((s) => ({ ...s, ollama: 'error' }));
+      setError('Failed to pull model');
+    }
+  }
+
+  function skipOllama() {
+    setStatus((s) => ({ ...s, ollama: 'skipped' }));
     setCurrentStep('done');
+  }
+
+  function openOllamaDownload() {
+    window.studio.shell.openExternal('https://ollama.ai/download');
   }
 
   function openDockerDownload() {
@@ -412,6 +513,90 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
                     Skip this step
                   </button>
                 </div>
+              </div>
+            )}
+          </StepItem>
+
+          {/* Step 7: Ollama (Optional) */}
+          <StepItem
+            number={7}
+            title="Ollama"
+            description="Optional - Free local embeddings"
+            status={status.ollama}
+            active={currentStep === 'ollama'}
+          >
+            {currentStep === 'ollama' && status.ollama !== 'success' && status.ollama !== 'skipped' && (
+              <div className="mt-3 space-y-3">
+                <div className="flex items-start gap-2 text-sm text-gray-400">
+                  <Cpu className="w-4 h-4 mt-0.5 text-cyan-400" />
+                  <p>
+                    Ollama provides free, local embeddings without needing an API key.
+                    Great for privacy and offline usage.
+                    <button
+                      onClick={openOllamaDownload}
+                      className="ml-1 text-blue-400 hover:text-blue-300 inline-flex items-center gap-1"
+                    >
+                      Learn more <ExternalLink className="w-3 h-3" />
+                    </button>
+                  </p>
+                </div>
+
+                {ollamaProgress && (
+                  <p className="text-sm text-cyan-400">{ollamaProgress}</p>
+                )}
+
+                {error && status.ollama === 'error' && (
+                  <p className="text-sm text-red-400">{error}</p>
+                )}
+
+                {status.ollama === 'pending' && (
+                  <div className="flex gap-2 flex-wrap">
+                    <button
+                      onClick={installOllama}
+                      className="flex items-center gap-2 px-4 py-2 bg-cyan-600 hover:bg-cyan-700 rounded text-sm"
+                    >
+                      <Download className="w-4 h-4" />
+                      Install Ollama
+                    </button>
+                    <button
+                      onClick={startOllama}
+                      className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 rounded text-sm"
+                    >
+                      <Play className="w-4 h-4" />
+                      Start Ollama
+                    </button>
+                    <button
+                      onClick={pullOllamaModel}
+                      className="flex items-center gap-2 px-4 py-2 bg-purple-600 hover:bg-purple-700 rounded text-sm"
+                    >
+                      <Download className="w-4 h-4" />
+                      Pull Model
+                    </button>
+                    <button
+                      onClick={skipOllama}
+                      className="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded text-sm"
+                    >
+                      Skip
+                    </button>
+                  </div>
+                )}
+
+                {status.ollama === 'error' && (
+                  <div className="flex gap-2">
+                    <button
+                      onClick={checkOllama}
+                      className="flex items-center gap-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded text-sm"
+                    >
+                      Check again
+                    </button>
+                    <button
+                      onClick={skipOllama}
+                      className="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded text-sm"
+                    >
+                      Skip
+                    </button>
+                  </div>
+                )}
               </div>
             )}
           </StepItem>

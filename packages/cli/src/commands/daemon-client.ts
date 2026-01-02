@@ -541,8 +541,16 @@ export { DAEMON_PORT, DAEMON_URL };
  * - Proper file watching and orphan tracking
  */
 const DAEMON_TOOL_NAMES = [
+  // FS tools (file system exploration - ensures latest code after build)
+  'list_directory',
+  'glob_files',
+  'grep_files',
+  'search_files',
+  'analyze_files',
+
   // File tools (for brain integration - touchFile on read, triggerReIngestion on modify)
   'read_file',
+  'read_files',
   'write_file',
   'create_file',
   'edit_file',
@@ -563,11 +571,14 @@ const DAEMON_TOOL_NAMES = [
   'start_watcher',
   'stop_watcher',
   'mark_file_dirty',
+  'touch_file',
   'get_schema',
   'run_cypher',
   'extract_dependency_hierarchy',
+  'explore_node',
   'notify_user',
   'update_todos',
+  'call_research_agent',
 
   // Image tools
   'read_image',

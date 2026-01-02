@@ -1370,6 +1370,67 @@ export class CodeSourceAdapter extends SourceAdapter {
       }
     }
 
+    // Phase 3: Create DECORATED_BY relationships from decoratorDetails
+    console.log(`   🎀 Processing decorators...`);
+    for (const [filePath, analysis] of codeFiles) {
+      for (const scope of analysis.scopes) {
+        const tsMetadata = (scope as any).languageSpecific?.typescript;
+
+        if (tsMetadata?.decoratorDetails && tsMetadata.decoratorDetails.length > 0) {
+          const sourceUuid = this.generateUUID(scope, filePath);
+
+          for (const decorator of tsMetadata.decoratorDetails) {
+            // Try to find the decorator as a local scope
+            let decoratorUuid: string | undefined;
+
+            // Check in same file first
+            for (const s of analysis.scopes) {
+              if (s.name === decorator.name && s.type === 'function') {
+                decoratorUuid = this.generateUUID(s, filePath);
+                break;
+              }
+            }
+
+            // Check in other files if not found locally
+            if (!decoratorUuid) {
+              for (const [otherPath, otherAnalysis] of codeFiles) {
+                if (otherPath === filePath) continue;
+                for (const s of otherAnalysis.scopes) {
+                  if (s.name === decorator.name && s.type === 'function') {
+                    decoratorUuid = this.generateUUID(s, otherPath);
+                    break;
+                  }
+                }
+                if (decoratorUuid) break;
+              }
+            }
+
+            if (decoratorUuid) {
+              // Avoid duplicates
+              const isDuplicate = relationships.some(
+                r => r.type === 'DECORATED_BY' && r.from === sourceUuid && r.to === decoratorUuid
+              );
+
+              if (!isDuplicate) {
+                relationships.push({
+                  type: 'DECORATED_BY',
+                  from: sourceUuid,
+                  to: decoratorUuid,
+                  properties: {
+                    decoratorName: decorator.name,
+                    arguments: decorator.arguments || undefined,
+                    line: decorator.line
+                  }
+                });
+              }
+            }
+            // Note: If decorator is from an external library, we don't create a relationship
+            // as we'd need to link to an ExternalLibrary node with a specific symbol
+          }
+        }
+      }
+    }
+
     // Create ExternalLibrary nodes and USES_LIBRARY relationships
     console.log(`   📦 Processing external library references...`);
     const externalLibs = new Map<string, Set<string>>(); // library name -> symbols
