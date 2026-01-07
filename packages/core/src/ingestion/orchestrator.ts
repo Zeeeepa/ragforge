@@ -88,6 +88,25 @@ export interface OrchestratorDependencies {
    * Called after ingestion to update embeddings
    */
   generateEmbeddings?: (projectId?: string) => Promise<number>;
+
+  /**
+   * Transform the parsed graph before ingestion
+   * Use this to inject custom metadata on nodes (e.g., community metadata)
+   * Called after parsing, before ingestGraph
+   */
+  transformGraph?: (graph: {
+    nodes: Array<{ labels: string[]; id: string; properties: Record<string, any> }>;
+    relationships: Array<{ type: string; from: string; to: string; properties?: Record<string, any> }>;
+    metadata: { filesProcessed: number; nodesGenerated: number };
+  }) => Promise<{
+    nodes: Array<{ labels: string[]; id: string; properties: Record<string, any> }>;
+    relationships: Array<{ type: string; from: string; to: string; properties?: Record<string, any> }>;
+    metadata: { filesProcessed: number; nodesGenerated: number };
+  }> | {
+    nodes: Array<{ labels: string[]; id: string; properties: Record<string, any> }>;
+    relationships: Array<{ type: string; from: string; to: string; properties?: Record<string, any> }>;
+    metadata: { filesProcessed: number; nodesGenerated: number };
+  };
 }
 
 /**
@@ -263,13 +282,18 @@ export class IngestionOrchestrator {
         const rootPath = this.findCommonRoot(filesToParse);
 
         // Parse files
-        const graph = await this.deps.parseFiles({
+        let graph = await this.deps.parseFiles({
           root: rootPath,
           include: filesToParse.map(f => this.getRelativePath(f, undefined, rootPath)),
           projectId,
           existingUUIDMapping: uuidMapping,
           verbose,
         });
+
+        // Apply graph transformation if provided (e.g., inject custom metadata)
+        if (this.deps.transformGraph) {
+          graph = await this.deps.transformGraph(graph);
+        }
 
         // Ingest into Neo4j
         await this.deps.ingestGraph(graph, { projectId, verbose });

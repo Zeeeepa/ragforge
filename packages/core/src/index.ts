@@ -286,8 +286,74 @@ export type {
 // Database
 export * from './database/index.js';
 
-// Document Ingestion (temporarily disabled - llamaindex removed)
-// export * from './ingestion';
+// Document Ingestion - Parsers (selective export to avoid conflicts)
+export {
+  // Parser registry
+  ParserRegistry,
+  parserRegistry,
+  registerParser,
+  getParserForFile,
+  canParseFile,
+  getFieldMapping,
+  getEmbedConfigs,
+  // All parsers
+  CodeParser,
+  codeParser,
+  MarkdownParser,
+  markdownParser,
+  DocumentParser,
+  documentParser,
+  MediaParser,
+  mediaParser,
+  DataParser,
+  dataParser,
+  WebParser,
+  webParser,
+  allParsers,
+  registerAllParsers,
+  areParsersRegistered,
+  getParserStats,
+  // Graph operations
+  GraphMerger,
+  createGraphMerger,
+  ReferenceLinker,
+  createReferenceLinker,
+  // Content extractor
+  ContentExtractor,
+  contentExtractor,
+  extractContent,
+  computeNodeHash,
+  hasNodeChanged,
+  // Node state machine
+  NodeStateMachine,
+  // Orchestrator
+  IngestionOrchestrator,
+  createOrchestrator,
+} from './ingestion/index.js';
+export type {
+  // Parser types
+  ParseInput,
+  ParserNode,
+  ParserRelationship,
+  ParseOutput,
+  ContentParser,
+  NodeTypeDefinition,
+  ChunkingConfig,
+  // Graph types
+  MergeNode,
+  MergeRelationship,
+  MergeOptions,
+  MergeStats,
+  LinkOptions,
+  LinkStats,
+  // Orchestrator types
+  OrchestratorDependencies,
+  OrchestratorConfig,
+  // Ingestion types (for hooks and adapters)
+  FileChange,
+  IngestionStats,
+  ReingestOptions,
+} from './ingestion/index.js';
 
 // ============================================
 // Runtime (merged from @luciformresearch/ragforge-runtime)

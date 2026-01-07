@@ -20,7 +20,8 @@ export type ReferenceType =
   | 'document'    // Markdown, PDF, docs
   | 'stylesheet'  // CSS, SCSS
   | 'data'        // JSON, YAML
-  | 'external';   // URL externe (non résolu)
+  | 'external'    // Package externe (npm, etc.)
+  | 'url';        // URL web (http/https)
 
 export type RelationType =
   | 'CONSUMES'          // Scope → Scope (code)
@@ -29,10 +30,12 @@ export type RelationType =
   | 'REFERENCES_DOC'    // * → document
   | 'REFERENCES_STYLE'  // * → stylesheet
   | 'REFERENCES_DATA'   // * → data file
+  | 'LINKS_TO_URL'      // * → URL externe
+  | 'MENTIONS_FILE'     // * → fichier mentionné (non résolu avec certitude)
   | 'PENDING_IMPORT';   // Non résolu
 
 export interface ExtractedReference {
-  /** Source brute (e.g., "./utils", "../styles/main.css") */
+  /** Source brute (e.g., "./utils", "../styles/main.css", "https://example.com") */
   source: string;
   /** Symboles importés (e.g., ["foo", "bar"] ou ["*"] ou ["default"]) */
   symbols: string[];
@@ -42,6 +45,12 @@ export interface ExtractedReference {
   line?: number;
   /** Est-ce une référence locale (vs package npm/externe) */
   isLocal: boolean;
+  /** Pour les URLs: URL complète */
+  url?: string;
+  /** Score de confiance (0-1) pour les références extraites par heuristique */
+  confidence?: number;
+  /** Contexte d'extraction (pour debug/affichage) */
+  context?: string;
 }
 
 export interface ResolvedReference extends ExtractedReference {
@@ -108,6 +117,15 @@ const INDEX_FILES = ['index.ts', 'index.tsx', 'index.js', 'index.jsx', 'index.mj
 // Extraction Functions
 // ============================================
 
+/** Code file extensions - these get import-style extraction only */
+const CODE_FILE_EXTENSIONS = new Set([
+  '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+  '.py', '.pyw',
+  '.go', '.rs', '.rb', '.php', '.java', '.c', '.cpp', '.h', '.hpp',
+  '.vue', '.svelte',
+  '.css', '.scss', '.sass', '.less',
+]);
+
 /**
  * Extract all references from file content
  */
@@ -126,24 +144,43 @@ export function extractReferences(
   else if (['.py', '.pyw'].includes(ext)) {
     refs.push(...extractPythonReferences(content));
   }
-  // Markdown
+  // Markdown - use both specific + generic extraction
   else if (['.md', '.mdx', '.markdown'].includes(ext)) {
     refs.push(...extractMarkdownReferences(content));
+    // Also extract URLs and loose file paths from markdown content
+    refs.push(...extractGenericReferences(content));
   }
   // CSS / SCSS
   else if (['.css', '.scss', '.sass', '.less'].includes(ext)) {
     refs.push(...extractCssReferences(content));
   }
-  // HTML
+  // HTML - use both specific + generic extraction
   else if (['.html', '.htm', '.xhtml'].includes(ext)) {
     refs.push(...extractHtmlReferences(content));
+    // Also extract URLs and loose file paths from HTML text content
+    refs.push(...extractGenericReferences(content));
   }
   // Vue / Svelte (extract from script section)
   else if (['.vue', '.svelte'].includes(ext)) {
     refs.push(...extractVueSvelteReferences(content));
   }
+  // Non-code documents (PDF text, DOCX text, TXT, etc.) - generic extraction only
+  else if (!CODE_FILE_EXTENSIONS.has(ext)) {
+    refs.push(...extractGenericReferences(content));
+  }
 
-  return refs;
+  // Deduplicate by source (keep first occurrence)
+  const seen = new Set<string>();
+  const deduped: ExtractedReference[] = [];
+  for (const ref of refs) {
+    const key = `${ref.type}:${ref.source}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      deduped.push(ref);
+    }
+  }
+
+  return deduped;
 }
 
 /**
@@ -602,6 +639,453 @@ function extractVueSvelteReferences(content: string): ExtractedReference[] {
 }
 
 // ============================================
+// Generic Reference Extraction (URLs & Loose Paths)
+// ============================================
+
+/**
+ * Common file extensions for detection in plain text
+ */
+const FILE_EXTENSIONS_PATTERN = /\.(ts|tsx|js|jsx|py|md|json|yaml|yml|xml|html|css|scss|vue|svelte|go|rs|rb|php|java|c|cpp|h|hpp|txt|pdf|docx?|xlsx?|csv|png|jpe?g|gif|svg|webp|mp[34]|wav|zip|tar|gz)$/i;
+
+/**
+ * Extract web URLs from any text content
+ * Captures: http://, https://, www.
+ */
+function extractWebUrls(content: string): ExtractedReference[] {
+  const refs: ExtractedReference[] = [];
+  const lines = content.split('\n');
+  const seenUrls = new Set<string>();
+
+  // URL patterns
+  const urlPatterns = [
+    // Full URLs: http:// or https://
+    /https?:\/\/[^\s<>"')\]]+/gi,
+    // www. URLs without protocol
+    /(?<![\/\w])www\.[^\s<>"')\]]+/gi,
+  ];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const lineNum = i + 1;
+
+    for (const pattern of urlPatterns) {
+      const matches = line.matchAll(pattern);
+      for (const match of matches) {
+        let url = match[0];
+
+        // Clean trailing punctuation that's likely not part of URL
+        url = url.replace(/[.,;:!?)]+$/, '');
+
+        // Skip if already seen
+        if (seenUrls.has(url)) continue;
+        seenUrls.add(url);
+
+        // Add protocol if missing
+        const fullUrl = url.startsWith('www.') ? `https://${url}` : url;
+
+        refs.push({
+          source: fullUrl,
+          symbols: [],
+          type: 'url',
+          line: lineNum,
+          isLocal: false,
+          url: fullUrl,
+          confidence: 1.0,
+        });
+      }
+    }
+  }
+
+  return refs;
+}
+
+/**
+ * Extract loose file paths from plain text
+ * Detects paths mentioned without explicit link syntax
+ *
+ * Examples:
+ * - "see src/utils.ts for details"
+ * - "the config is in ./config/settings.json"
+ * - "open /home/user/file.md"
+ * - "check C:\Users\file.txt"
+ */
+function extractLooseFilePaths(content: string): ExtractedReference[] {
+  const refs: ExtractedReference[] = [];
+  const lines = content.split('\n');
+  const seenPaths = new Set<string>();
+
+  // Patterns for file paths in plain text
+  const pathPatterns = [
+    // Unix absolute paths: /home/user/file.ts
+    /(?<![:\w])\/(?:[\w.-]+\/)*[\w.-]+\.[a-zA-Z0-9]{1,5}(?![\/\w])/g,
+
+    // Relative paths with ./ or ../
+    /\.\.?\/(?:[\w.-]+\/)*[\w.-]+\.[a-zA-Z0-9]{1,5}(?![\/\w])/g,
+
+    // Paths starting with common directories: src/, lib/, docs/, etc.
+    /(?<![\/\w])(?:src|lib|docs|test|tests|spec|app|packages|components|utils|helpers|config|public|assets|images|styles|scripts|bin|dist|build|node_modules)\/(?:[\w.-]+\/)*[\w.-]+\.[a-zA-Z0-9]{1,5}(?![\/\w])/gi,
+
+    // Windows paths: C:\Users\file.txt
+    /[A-Za-z]:\\(?:[\w.-]+\\)*[\w.-]+\.[a-zA-Z0-9]{1,5}(?![\\\/\w])/g,
+
+    // Home directory: ~/Documents/file.md
+    /~\/(?:[\w.-]+\/)*[\w.-]+\.[a-zA-Z0-9]{1,5}(?![\/\w])/g,
+
+    // Simple filename with extension in context (lower confidence)
+    // e.g., "voir le fichier config.json" or "edit Button.tsx"
+    /(?<=\s|^|["'`])[\w.-]+(?:\.(?:ts|tsx|js|jsx|py|md|json|yaml|yml|xml|html|css|vue|svelte|pdf|docx?|xlsx?))(?=[\s,;:.\-!?)"'`]|$)/gi,
+  ];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const lineNum = i + 1;
+
+    // Skip lines that look like code (imports, requires, etc.)
+    if (/^\s*(import|export|require|from|const|let|var|function|class)\s/.test(line)) {
+      continue;
+    }
+
+    for (let patternIndex = 0; patternIndex < pathPatterns.length; patternIndex++) {
+      const pattern = pathPatterns[patternIndex];
+      // Reset lastIndex for global patterns
+      pattern.lastIndex = 0;
+
+      const matches = line.matchAll(pattern);
+      for (const match of matches) {
+        let filePath = match[0];
+
+        // Normalize Windows paths to Unix
+        filePath = filePath.replace(/\\/g, '/');
+
+        // Skip if doesn't have a valid file extension
+        if (!FILE_EXTENSIONS_PATTERN.test(filePath)) {
+          continue;
+        }
+
+        // Skip URLs (already handled by extractWebUrls)
+        if (filePath.includes('://') || filePath.startsWith('www.')) {
+          continue;
+        }
+
+        // Skip if already seen
+        const normalizedPath = filePath.toLowerCase();
+        if (seenPaths.has(normalizedPath)) continue;
+        seenPaths.add(normalizedPath);
+
+        // Determine confidence based on pattern
+        // Simple filenames have lower confidence than full paths
+        const isSimpleFilename = !filePath.includes('/');
+        const confidence = isSimpleFilename ? 0.6 : 0.9;
+
+        // Extract context (surrounding text for debugging)
+        const matchIndex = match.index || 0;
+        const contextStart = Math.max(0, matchIndex - 20);
+        const contextEnd = Math.min(line.length, matchIndex + filePath.length + 20);
+        const context = line.substring(contextStart, contextEnd).trim();
+
+        // Determine reference type based on extension
+        const ext = path.extname(filePath).toLowerCase();
+        const refType = TYPE_BY_EXTENSION[ext] || 'document';
+
+        refs.push({
+          source: filePath,
+          symbols: [],
+          type: refType,
+          line: lineNum,
+          isLocal: true,
+          confidence,
+          context,
+        });
+      }
+    }
+  }
+
+  return refs;
+}
+
+/**
+ * Extract generic references (URLs + loose file paths) from any document content
+ * Called for all non-code documents (markdown, pdf, docx, txt, etc.)
+ */
+export function extractGenericReferences(content: string): ExtractedReference[] {
+  const refs: ExtractedReference[] = [];
+
+  // Extract web URLs
+  refs.push(...extractWebUrls(content));
+
+  // Extract loose file paths
+  refs.push(...extractLooseFilePaths(content));
+
+  return refs;
+}
+
+// ============================================
+// Fuzzy Resolution Heuristics
+// ============================================
+
+/**
+ * Levenshtein distance for fuzzy matching
+ */
+function levenshteinDistance(a: string, b: string): number {
+  const matrix: number[][] = [];
+
+  for (let i = 0; i <= b.length; i++) {
+    matrix[i] = [i];
+  }
+  for (let j = 0; j <= a.length; j++) {
+    matrix[0][j] = j;
+  }
+
+  for (let i = 1; i <= b.length; i++) {
+    for (let j = 1; j <= a.length; j++) {
+      if (b.charAt(i - 1) === a.charAt(j - 1)) {
+        matrix[i][j] = matrix[i - 1][j - 1];
+      } else {
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j - 1] + 1, // substitution
+          matrix[i][j - 1] + 1,     // insertion
+          matrix[i - 1][j] + 1      // deletion
+        );
+      }
+    }
+  }
+
+  return matrix[b.length][a.length];
+}
+
+/**
+ * Calculate similarity score (0-1) between two strings
+ */
+function similarityScore(a: string, b: string): number {
+  const maxLen = Math.max(a.length, b.length);
+  if (maxLen === 0) return 1;
+  const distance = levenshteinDistance(a.toLowerCase(), b.toLowerCase());
+  return 1 - distance / maxLen;
+}
+
+export interface FuzzyMatchResult {
+  uuid: string;
+  path: string;
+  name: string;
+  score: number;
+  matchType: 'exact' | 'ends_with' | 'filename' | 'fuzzy';
+  labels: string[];
+}
+
+/**
+ * All node labels that represent files/documents for fuzzy resolution
+ * Includes code files, documents, data files, media, etc.
+ */
+const FILE_NODE_LABELS = [
+  'File',
+  'Scope',
+  // Documents
+  'MarkdownDocument',
+  'MarkdownSection',
+  'PDFDocument',
+  'WordDocument',
+  'SpreadsheetDocument',
+  'DocumentFile',
+  // Data files
+  'DataFile',
+  // Code components
+  'VueSFC',
+  'SvelteComponent',
+  'Stylesheet',
+  // Media
+  'ImageFile',
+  'MediaFile',
+  'ThreeDFile',
+  // Generic
+  'GenericFile',
+];
+
+/**
+ * Build Cypher label condition from FILE_NODE_LABELS
+ * Returns: "(n:File OR n:Scope OR n:MarkdownDocument OR ...)"
+ */
+function buildLabelCondition(varName: string = 'n'): string {
+  return '(' + FILE_NODE_LABELS.map(l => `${varName}:${l}`).join(' OR ') + ')';
+}
+
+/**
+ * Try to resolve a loose file reference using multiple heuristics
+ *
+ * Strategies (in order of preference):
+ * 1. Exact path match (ends with the reference)
+ * 2. Exact filename match
+ * 3. Fuzzy filename match (Levenshtein)
+ *
+ * Searches across ALL file/document types:
+ * - Code: File, Scope, VueSFC, SvelteComponent, Stylesheet
+ * - Documents: MarkdownDocument, PDFDocument, WordDocument, SpreadsheetDocument
+ * - Data: DataFile (JSON, YAML, XML, etc.)
+ * - Media: ImageFile, MediaFile, ThreeDFile
+ *
+ * @param neo4jClient - Neo4j client
+ * @param projectId - Project to search in
+ * @param reference - The loose reference (e.g., "Button.tsx", "src/utils.ts", "config.json", "readme.md")
+ * @param minSimilarity - Minimum similarity score for fuzzy matches (default: 0.7)
+ */
+export async function resolveLooseReference(
+  neo4jClient: Neo4jClient,
+  projectId: string,
+  reference: string,
+  minSimilarity: number = 0.7
+): Promise<FuzzyMatchResult | null> {
+  const fileName = path.basename(reference);
+  const fileNameNoExt = path.basename(reference, path.extname(reference));
+  const ext = path.extname(reference).toLowerCase();
+  const labelCondition = buildLabelCondition('n');
+
+  // Strategy 1: Exact path match (path ends with reference)
+  if (reference.includes('/')) {
+    const exactResult = await neo4jClient.run(`
+      MATCH (n)
+      WHERE n.projectId = $projectId
+        AND (n.absolutePath ENDS WITH $reference
+             OR n.file ENDS WITH $reference
+             OR n.path ENDS WITH $reference)
+        AND ${labelCondition}
+      RETURN n.uuid as uuid, n.absolutePath as path, n.name as name, labels(n) as labels
+      LIMIT 1
+    `, { projectId, reference });
+
+    if (exactResult.records.length > 0) {
+      const record = exactResult.records[0];
+      return {
+        uuid: record.get('uuid'),
+        path: record.get('path') || reference,
+        name: record.get('name') || fileName,
+        score: 1.0,
+        matchType: 'ends_with',
+        labels: record.get('labels') as string[],
+      };
+    }
+  }
+
+  // Strategy 2: Exact filename match
+  const filenameResult = await neo4jClient.run(`
+    MATCH (n)
+    WHERE n.projectId = $projectId
+      AND ${labelCondition}
+      AND (
+        n.name = $fileName
+        OR n.absolutePath ENDS WITH $fileNameWithSlash
+        OR n.file ENDS WITH $fileNameWithSlash
+      )
+    RETURN n.uuid as uuid, n.absolutePath as path, n.name as name, labels(n) as labels
+    LIMIT 5
+  `, {
+    projectId,
+    fileName,
+    fileNameWithSlash: '/' + fileName,
+  });
+
+  if (filenameResult.records.length === 1) {
+    // Single exact match - high confidence
+    const record = filenameResult.records[0];
+    return {
+      uuid: record.get('uuid'),
+      path: record.get('path') || fileName,
+      name: record.get('name') || fileName,
+      score: 0.95,
+      matchType: 'filename',
+      labels: record.get('labels') as string[],
+    };
+  } else if (filenameResult.records.length > 1) {
+    // Multiple matches - return first but with lower confidence
+    const record = filenameResult.records[0];
+    return {
+      uuid: record.get('uuid'),
+      path: record.get('path') || fileName,
+      name: record.get('name') || fileName,
+      score: 0.7, // Lower score due to ambiguity
+      matchType: 'filename',
+      labels: record.get('labels') as string[],
+    };
+  }
+
+  // Strategy 3: Fuzzy filename match
+  // Get all files with the same extension and fuzzy match
+  if (ext) {
+    const fuzzyResult = await neo4jClient.run(`
+      MATCH (n)
+      WHERE n.projectId = $projectId
+        AND ${labelCondition}
+        AND (n.absolutePath ENDS WITH $ext OR n.name ENDS WITH $ext)
+      RETURN n.uuid as uuid, n.absolutePath as path, n.name as name, labels(n) as labels
+      LIMIT 100
+    `, { projectId, ext });
+
+    let bestMatch: FuzzyMatchResult | null = null;
+    let bestScore = 0;
+
+    for (const record of fuzzyResult.records) {
+      const nodePath = record.get('path') as string || '';
+      const nodeName = record.get('name') as string || path.basename(nodePath);
+
+      // Compare filenames
+      const nodeFileName = path.basename(nodePath);
+      const score = similarityScore(fileName, nodeFileName);
+
+      if (score > bestScore && score >= minSimilarity) {
+        bestScore = score;
+        bestMatch = {
+          uuid: record.get('uuid'),
+          path: nodePath,
+          name: nodeName,
+          score,
+          matchType: 'fuzzy',
+          labels: record.get('labels') as string[],
+        };
+      }
+    }
+
+    if (bestMatch) {
+      return bestMatch;
+    }
+  }
+
+  // Strategy 4: Fuzzy match on name without extension (for typos)
+  const allFilesResult = await neo4jClient.run(`
+    MATCH (n)
+    WHERE n.projectId = $projectId
+      AND ${labelCondition}
+    RETURN n.uuid as uuid, n.absolutePath as path, n.name as name, labels(n) as labels
+    LIMIT 200
+  `, { projectId });
+
+  let bestMatch: FuzzyMatchResult | null = null;
+  let bestScore = 0;
+
+  for (const record of allFilesResult.records) {
+    const nodePath = record.get('path') as string || '';
+    const nodeFileName = path.basename(nodePath);
+    const nodeFileNameNoExt = path.basename(nodePath, path.extname(nodePath));
+
+    // Compare both with and without extension
+    const scoreWithExt = similarityScore(fileName, nodeFileName);
+    const scoreNoExt = similarityScore(fileNameNoExt, nodeFileNameNoExt);
+    const score = Math.max(scoreWithExt, scoreNoExt * 0.9); // Slight penalty for no-ext match
+
+    if (score > bestScore && score >= minSimilarity) {
+      bestScore = score;
+      bestMatch = {
+        uuid: record.get('uuid'),
+        path: nodePath,
+        name: record.get('name') || nodeFileName,
+        score,
+        matchType: 'fuzzy',
+        labels: record.get('labels') as string[],
+      };
+    }
+  }
+
+  return bestMatch;
+}
+
+// ============================================
 // Resolution Functions
 // ============================================
 
@@ -778,10 +1262,99 @@ export async function createReferenceRelations(
 
   for (const ref of refs) {
     try {
+      // Handle URL references specially - create WebReference node
+      if (ref.relationType === 'LINKS_TO_URL' && ref.url) {
+        // Create or find WebReference node for this URL
+        const urlDomain = new URL(ref.url).hostname;
+        await neo4jClient.run(`
+          MATCH (source {uuid: $sourceUuid})
+          MERGE (webRef:WebReference {url: $url})
+          ON CREATE SET
+            webRef.uuid = randomUUID(),
+            webRef.domain = $domain,
+            webRef.projectId = $projectId,
+            webRef.createdAt = datetime()
+          MERGE (source)-[r:LINKS_TO_URL]->(webRef)
+          SET r.line = $line,
+              r.context = $context,
+              r.createdAt = datetime()
+        `, {
+          sourceUuid: sourceNodeUuid,
+          url: ref.url,
+          domain: urlDomain,
+          projectId,
+          line: ref.line || null,
+          context: ref.context || null,
+        });
+        created++;
+        continue;
+      }
+
+      // Handle MENTIONS_FILE - use fuzzy resolution to find best match
+      if (ref.relationType === 'MENTIONS_FILE') {
+        // Use fuzzy resolution to find the best matching file
+        const fuzzyMatch = await resolveLooseReference(
+          neo4jClient,
+          projectId,
+          ref.source,
+          0.7 // minSimilarity threshold
+        );
+
+        if (fuzzyMatch) {
+          // Combine confidence scores: original ref confidence * fuzzy match score
+          const combinedConfidence = (ref.confidence || 0.5) * fuzzyMatch.score;
+
+          await neo4jClient.run(`
+            MATCH (source {uuid: $sourceUuid})
+            MATCH (target {uuid: $targetUuid})
+            MERGE (source)-[r:MENTIONS_FILE]->(target)
+            SET r.mentionedAs = $source,
+                r.confidence = $confidence,
+                r.matchType = $matchType,
+                r.matchScore = $matchScore,
+                r.line = $line,
+                r.context = $context,
+                r.resolved = true,
+                r.createdAt = datetime()
+          `, {
+            sourceUuid: sourceNodeUuid,
+            targetUuid: fuzzyMatch.uuid,
+            source: ref.source,
+            confidence: combinedConfidence,
+            matchType: fuzzyMatch.matchType,
+            matchScore: fuzzyMatch.score,
+            line: ref.line || null,
+            context: ref.context || null,
+          });
+          created++;
+        } else {
+          // Create MENTIONS_FILE as self-loop with target info (for future resolution)
+          await neo4jClient.run(`
+            MATCH (source {uuid: $sourceUuid})
+            MERGE (source)-[r:MENTIONS_FILE {mentionedAs: $source}]->(source)
+            SET r.confidence = $confidence,
+                r.line = $line,
+                r.context = $context,
+                r.absolutePath = $absolutePath,
+                r.resolved = false,
+                r.createdAt = datetime()
+          `, {
+            sourceUuid: sourceNodeUuid,
+            source: ref.source,
+            confidence: ref.confidence || 0.5,
+            line: ref.line || null,
+            context: ref.context || null,
+            absolutePath: ref.absolutePath,
+          });
+          pending++;
+        }
+        continue;
+      }
+
       // Build the match condition based on options
       const pathCondition = useAbsolutePath
         ? 'target.absolutePath = $absolutePath'
-        : '(target.file = $relativePath OR target.path = $relativePath)';
+        : '(target.file = $relativePath OR target.path = $relativePath OR target.absolutePath = $absolutePath)';
 
       // Try to find target node - check multiple node types
       const targetResult = await neo4jClient.run(`
@@ -935,6 +1508,99 @@ export async function resolvePendingImports(
   const remaining = remainingResult.records[0]?.get('count')?.toNumber() || 0;
 
   return { resolved, remaining };
+}
+
+/**
+ * Resolve unresolved MENTIONS_FILE relations using fuzzy matching
+ * Call this after ingesting new files to try to resolve loose file mentions
+ */
+export async function resolveUnresolvedMentions(
+  neo4jClient: Neo4jClient,
+  projectId: string,
+  minSimilarity: number = 0.7
+): Promise<{ resolved: number; remaining: number; details: Array<{ mention: string; matchedTo: string; score: number; matchType: string }> }> {
+  let resolved = 0;
+  const details: Array<{ mention: string; matchedTo: string; score: number; matchType: string }> = [];
+
+  // Find all unresolved MENTIONS_FILE relations (self-loops with resolved=false)
+  const unresolvedResult = await neo4jClient.run(`
+    MATCH (source)-[r:MENTIONS_FILE]->(source)
+    WHERE source.projectId = $projectId
+      AND r.resolved = false
+    RETURN source.uuid as sourceUuid, r.mentionedAs as mention,
+           r.confidence as confidence, r.line as line, r.context as context
+  `, { projectId });
+
+  for (const record of unresolvedResult.records) {
+    const sourceUuid = record.get('sourceUuid');
+    const mention = record.get('mention');
+    const originalConfidence = record.get('confidence') || 0.5;
+    const line = record.get('line');
+    const context = record.get('context');
+
+    // Try fuzzy resolution
+    const fuzzyMatch = await resolveLooseReference(
+      neo4jClient,
+      projectId,
+      mention,
+      minSimilarity
+    );
+
+    if (fuzzyMatch) {
+      const combinedConfidence = originalConfidence * fuzzyMatch.score;
+
+      // Delete the self-loop
+      await neo4jClient.run(`
+        MATCH (source {uuid: $sourceUuid})-[r:MENTIONS_FILE {mentionedAs: $mention}]->(source)
+        DELETE r
+      `, { sourceUuid, mention });
+
+      // Create the actual relation to the matched target
+      await neo4jClient.run(`
+        MATCH (source {uuid: $sourceUuid})
+        MATCH (target {uuid: $targetUuid})
+        MERGE (source)-[r:MENTIONS_FILE]->(target)
+        SET r.mentionedAs = $mention,
+            r.confidence = $confidence,
+            r.matchType = $matchType,
+            r.matchScore = $matchScore,
+            r.line = $line,
+            r.context = $context,
+            r.resolved = true,
+            r.resolvedFrom = 'deferred',
+            r.createdAt = datetime()
+      `, {
+        sourceUuid,
+        targetUuid: fuzzyMatch.uuid,
+        mention,
+        confidence: combinedConfidence,
+        matchType: fuzzyMatch.matchType,
+        matchScore: fuzzyMatch.score,
+        line: line || null,
+        context: context || null,
+      });
+
+      resolved++;
+      details.push({
+        mention,
+        matchedTo: fuzzyMatch.path,
+        score: fuzzyMatch.score,
+        matchType: fuzzyMatch.matchType,
+      });
+    }
+  }
+
+  // Count remaining unresolved
+  const remainingResult = await neo4jClient.run(`
+    MATCH (source)-[r:MENTIONS_FILE]->(source)
+    WHERE source.projectId = $projectId
+      AND r.resolved = false
+    RETURN count(r) as count
+  `, { projectId });
+
+  const remaining = remainingResult.records[0]?.get('count')?.toNumber() || 0;
+
+  return { resolved, remaining, details };
 }
 
 // ============================================

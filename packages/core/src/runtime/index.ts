@@ -46,6 +46,7 @@ export { VectorSearch } from './vector/vector-search.js';
 export { LLMReranker } from './reranking/llm-reranker.js';
 export { VertexAIProvider } from './reranking/vertex-ai-provider.js';
 export { GeminiAPIProvider } from './reranking/gemini-api-provider.js';
+export { ClaudeAPIProvider } from './reranking/claude-api-provider.js';
 export { RateLimiter, GlobalRateLimiter } from './reranking/rate-limiter.js';
 export type {
   LLMProvider,
@@ -61,6 +62,7 @@ export type {
 } from './reranking/llm-reranker.js';
 export type { VertexAIConfig } from './reranking/vertex-ai-provider.js';
 export type { GeminiAPIConfig, RateLimitStrategy } from './reranking/gemini-api-provider.js';
+export type { ClaudeAPIConfig } from './reranking/claude-api-provider.js';
 export type { RateLimiterConfig } from './reranking/rate-limiter.js';
 
 // Structured Prompts & LLM

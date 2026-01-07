@@ -16,6 +16,7 @@ export {
   ParseProgress,
   SourceAdapter,
   ValidationResult,
+  VirtualFile,
 } from './types.js';
 export * from './code-source-adapter.js';
 // Document parsing is now handled by document-file-parser.ts (web-compatible)

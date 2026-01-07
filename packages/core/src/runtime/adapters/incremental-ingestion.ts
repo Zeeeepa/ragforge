@@ -20,6 +20,8 @@ import {
   resolveAllReferences,
   createReferenceRelations,
   resolvePendingImports,
+  type ResolvedReference,
+  type RelationType,
 } from '../../brain/reference-extractor.js';
 import {
   FileStateMachine,
@@ -2032,6 +2034,181 @@ export class IncrementalIngestionManager {
     }
 
     // Try to resolve pending imports from previous ingestions
+    const pendingResult = await resolvePendingImports(this.client, projectId);
+    if (verbose && pendingResult.resolved > 0) {
+      console.log(`[References] Resolved ${pendingResult.resolved} pending imports, ${pendingResult.remaining} remaining`);
+    }
+
+    if (verbose) {
+      console.log(`[References] Total: ${processed} files processed, ${totalCreated} relations created, ${totalPending} pending`);
+    }
+
+    return { processed, created: totalCreated, pending: totalPending };
+  }
+
+  /**
+   * Process file references for virtual files (in-memory content)
+   * Same as processFileReferences but works with content already in memory
+   *
+   * Useful for:
+   * - Uploaded files (ZIP extraction)
+   * - Generated content
+   * - Any case where files aren't on disk
+   *
+   * @param projectId - Project ID to process
+   * @param virtualFiles - Array of virtual files with path and content
+   * @param options - Processing options
+   */
+  async processVirtualFileReferences(
+    projectId: string,
+    virtualFiles: Array<{ path: string; content: string }>,
+    options: {
+      /** Verbose logging */
+      verbose?: boolean;
+    } = {}
+  ): Promise<{ processed: number; created: number; pending: number }> {
+    const { verbose = false } = options;
+
+    if (verbose) {
+      console.log(`[References] Processing ${virtualFiles.length} virtual files for project ${projectId}`);
+    }
+
+    let totalCreated = 0;
+    let totalPending = 0;
+    let processed = 0;
+
+    // Map of extension to reference type
+    const TYPE_BY_EXT: Record<string, string> = {
+      '.md': 'document', '.mdx': 'document', '.markdown': 'document',
+      '.pdf': 'document', '.doc': 'document', '.docx': 'document',
+      '.txt': 'document', '.rtf': 'document',
+      '.png': 'asset', '.jpg': 'asset', '.jpeg': 'asset', '.gif': 'asset',
+      '.svg': 'asset', '.webp': 'asset', '.ico': 'asset', '.bmp': 'asset',
+      '.css': 'stylesheet', '.scss': 'stylesheet', '.sass': 'stylesheet', '.less': 'stylesheet',
+      '.json': 'data', '.yaml': 'data', '.yml': 'data', '.xml': 'data', '.csv': 'data',
+    };
+
+    for (const file of virtualFiles) {
+      try {
+        // Extract references from in-memory content
+        const refs = extractReferences(file.content, file.path);
+        if (refs.length === 0) {
+          continue;
+        }
+
+        // For virtual files, resolve paths manually without fs.access checks
+        // since virtual files don't exist on disk
+        const fileDir = pathModule.dirname(file.path);
+        const resolvedRefs: ResolvedReference[] = [];
+
+        // Separate URL refs from file refs
+        const urlRefs: ResolvedReference[] = [];
+
+        for (const ref of refs) {
+          // Handle URL references
+          if (ref.type === 'url' && ref.url) {
+            urlRefs.push({
+              ...ref,
+              absolutePath: ref.url,
+              relativePath: ref.url,
+              relationType: 'LINKS_TO_URL',
+            });
+            continue;
+          }
+
+          if (!ref.isLocal) continue;
+
+          // Resolve relative path to absolute
+          const absolutePath = pathModule.resolve(fileDir, ref.source);
+          const relativePath = ref.source;
+          const targetExt = pathModule.extname(absolutePath).toLowerCase();
+          const targetType = TYPE_BY_EXT[targetExt] || 'code';
+
+          // Determine relation type based on target type and confidence
+          let relationType: RelationType;
+
+          // Low confidence references use MENTIONS_FILE
+          if (ref.confidence !== undefined && ref.confidence < 0.8) {
+            relationType = 'MENTIONS_FILE';
+          } else {
+            switch (targetType) {
+              case 'asset': relationType = 'REFERENCES_ASSET'; break;
+              case 'document': relationType = 'REFERENCES_DOC'; break;
+              case 'stylesheet': relationType = 'REFERENCES_STYLE'; break;
+              case 'data': relationType = 'REFERENCES_DATA'; break;
+              default: relationType = 'CONSUMES';
+            }
+          }
+
+          resolvedRefs.push({
+            ...ref,
+            absolutePath,
+            relativePath,
+            relationType,
+          });
+        }
+
+        // Add URL refs to the resolved refs
+        resolvedRefs.push(...urlRefs);
+
+        if (resolvedRefs.length === 0) {
+          continue;
+        }
+
+        if (verbose) {
+          console.log(`[References] ${file.path}: extracted ${resolvedRefs.length} references`);
+        }
+
+        // Find the source node in Neo4j by path
+        // For virtual files, we match by the file path property
+        const sourceResult = await this.client.run(`
+          MATCH (n)
+          WHERE n.projectId = $projectId
+            AND (n.file = $filePath OR n.path = $filePath OR n.absolutePath = $filePath)
+            AND (n:File OR n:MarkdownDocument OR n:MarkdownSection OR n:Scope)
+          RETURN n.uuid as uuid, labels(n) as labels
+          ORDER BY CASE
+            WHEN 'MarkdownDocument' IN labels(n) THEN 1
+            WHEN 'File' IN labels(n) THEN 2
+            ELSE 3
+          END
+          LIMIT 1
+        `, { projectId, filePath: file.path });
+
+        if (sourceResult.records.length === 0) {
+          if (verbose) {
+            console.warn(`[References] No node found for virtual file: ${file.path}`);
+          }
+          continue;
+        }
+
+        const sourceUuid = sourceResult.records[0].get('uuid');
+
+        // Create reference relations
+        const result = await createReferenceRelations(
+          this.client,
+          sourceUuid,
+          file.path,
+          resolvedRefs,
+          projectId,
+          { createPending: true, useAbsolutePath: false }
+        );
+
+        totalCreated += result.created;
+        totalPending += result.pending;
+        processed++;
+
+        if (verbose && (result.created > 0 || result.pending > 0)) {
+          console.log(`[References] ${file.path}: ${result.created} created, ${result.pending} pending`);
+        }
+      } catch (err) {
+        if (verbose) {
+          console.warn(`[References] Error processing ${file.path}: ${err instanceof Error ? err.message : 'unknown error'}`);
+        }
+      }
+    }
+
+    // Try to resolve pending imports
     const pendingResult = await resolvePendingImports(this.client, projectId);
     if (verbose && pendingResult.resolved > 0) {
       console.log(`[References] Resolved ${pendingResult.resolved} pending imports, ${pendingResult.remaining} remaining`);

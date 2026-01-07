@@ -1,0 +1,24 @@
+services:
+  neo4j:
+    image: neo4j:5.15.0
+    container_name: community-docs-neo4j
+    ports:
+      - "7475:7474"  # Browser (different from CLI's 7474)
+      - "7688:7687"  # Bolt (different from CLI's 7687)
+    environment:
+      - NEO4J_AUTH=neo4j/communitydocs
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_apoc_export_file_enabled=true
+      - NEO4J_apoc_import_file_enabled=true
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7474"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  neo4j_data:
+  neo4j_logs:

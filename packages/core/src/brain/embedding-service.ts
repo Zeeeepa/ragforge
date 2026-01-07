@@ -519,12 +519,11 @@ export const DEFAULT_EMBED_CONFIGS: EmbedNodeTypeConfig[] = [
   },
 ];
 
-/**
- * Embedding provider configuration
- */
-export type EmbeddingProviderConfig =
-  | { type: 'gemini'; apiKey: string; dimension?: number }
-  | { type: 'ollama'; baseUrl?: string; model?: string; batchSize?: number; timeout?: number };
+// EmbeddingProviderConfig is imported from types/config.ts (unified config format)
+import type { EmbeddingProviderConfig } from '../types/config.js';
+
+// Re-export for convenience
+export type { EmbeddingProviderConfig };
 
 /**
  * Embedding Service - generates and caches embeddings for Neo4j nodes
@@ -558,18 +557,20 @@ export class EmbeddingService {
         dimension: 3072,
       });
     } else if (configOrApiKey) {
-      // New: provider config object
-      if (configOrApiKey.type === 'gemini') {
+      // Unified config format from types/config.ts
+      const provider = configOrApiKey.provider.toLowerCase();
+
+      if (provider === 'gemini') {
         this.embeddingProvider = new GeminiEmbeddingProvider({
-          apiKey: configOrApiKey.apiKey,
-          dimension: configOrApiKey.dimension ?? 3072,
+          apiKey: configOrApiKey.api_key!,
+          dimension: configOrApiKey.dimensions ?? 3072,
         });
-      } else if (configOrApiKey.type === 'ollama') {
+      } else if (provider === 'ollama') {
         this.embeddingProvider = new OllamaEmbeddingProvider({
-          baseUrl: configOrApiKey.baseUrl,
+          baseUrl: configOrApiKey.options?.baseUrl ?? configOrApiKey.options?.base_url,
           model: configOrApiKey.model,
-          batchSize: configOrApiKey.batchSize,
-          timeout: configOrApiKey.timeout,
+          batchSize: configOrApiKey.options?.batchSize ?? configOrApiKey.options?.batch_size ?? 10,
+          timeout: configOrApiKey.options?.timeout,
         });
       }
     }
@@ -1400,4 +1401,114 @@ export class EmbeddingService {
     }
     return this.embeddingProvider.embedSingle(query);
   }
+}
+
+// ============================================================================
+// Standalone utility functions (can be used without EmbeddingService instance)
+// ============================================================================
+
+/**
+ * Options for ensuring vector indexes
+ */
+export interface EnsureVectorIndexesOptions {
+  /** Vector dimension (1024 for Ollama mxbai, 3072 for Gemini) */
+  dimension: number;
+  /** Whether to log progress */
+  verbose?: boolean;
+}
+
+/**
+ * Result of ensuring vector indexes
+ */
+export interface EnsureVectorIndexesResult {
+  created: number;
+  skipped: number;
+  errors: number;
+}
+
+/**
+ * Ensure vector indexes exist for semantic search.
+ *
+ * Creates indexes based on MULTI_EMBED_CONFIGS for all node types that support embeddings.
+ * This is a standalone function that can be called without a BrainManager instance.
+ *
+ * @param neo4jClient - Neo4j client to use
+ * @param options - Options including dimension
+ * @returns Stats about created/skipped indexes
+ *
+ * @example
+ * // For Ollama (1024 dimensions)
+ * await ensureVectorIndexes(neo4jClient, { dimension: 1024 });
+ *
+ * // For Gemini (3072 dimensions)
+ * await ensureVectorIndexes(neo4jClient, { dimension: 3072 });
+ */
+export async function ensureVectorIndexes(
+  neo4jClient: Neo4jClient,
+  options: EnsureVectorIndexesOptions
+): Promise<EnsureVectorIndexesResult> {
+  const { dimension, verbose = false } = options;
+
+  if (verbose) {
+    console.log(`[EmbeddingService] Ensuring vector indexes (dimension: ${dimension})...`);
+  }
+
+  let created = 0;
+  let skipped = 0;
+  let errors = 0;
+
+  // Create indexes based on actual embedding configurations
+  for (const config of MULTI_EMBED_CONFIGS) {
+    const label = config.label;
+
+    for (const embeddingConfig of config.embeddings) {
+      const embeddingProp = embeddingConfig.propertyName;
+      const indexName = `${label.toLowerCase()}_${embeddingProp}_vector`;
+
+      try {
+        // Check if index already exists
+        const checkResult = await neo4jClient.run(
+          `SHOW INDEXES YIELD name WHERE name = $indexName RETURN count(name) as count`,
+          { indexName }
+        );
+
+        const exists = checkResult.records[0]?.get('count')?.toNumber() > 0;
+
+        if (!exists) {
+          const createQuery = `
+            CREATE VECTOR INDEX ${indexName} IF NOT EXISTS
+            FOR (n:\`${label}\`)
+            ON n.\`${embeddingProp}\`
+            OPTIONS {
+              indexConfig: {
+                \`vector.dimensions\`: ${dimension},
+                \`vector.similarity_function\`: 'cosine'
+              }
+            }
+          `;
+
+          await neo4jClient.run(createQuery);
+          created++;
+          if (verbose) {
+            console.log(`[EmbeddingService] Created vector index: ${indexName}`);
+          }
+        } else {
+          skipped++;
+        }
+      } catch (err: any) {
+        errors++;
+        if (!err.message?.includes('already exists') && !err.message?.includes('does not exist')) {
+          if (verbose) {
+            console.warn(`[EmbeddingService] Vector index creation warning for ${indexName}: ${err.message}`);
+          }
+        }
+      }
+    }
+  }
+
+  if (verbose) {
+    console.log(`[EmbeddingService] Vector indexes: ${created} created, ${skipped} already existed, ${errors} errors`);
+  }
+
+  return { created, skipped, errors };
 }

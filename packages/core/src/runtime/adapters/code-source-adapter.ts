@@ -55,7 +55,8 @@ import {
   type ParsedRelationship,
   type ParsedGraph,
   type ValidationResult,
-  type ParseProgress
+  type ParseProgress,
+  type VirtualFile
 } from './types.js';
 import { UniqueIDHelper } from '../utils/UniqueIDHelper.js';
 import { ImportResolver } from '../utils/ImportResolver.js';
@@ -376,20 +377,38 @@ export class CodeSourceAdapter extends SourceAdapter {
       percentComplete: 0
     });
 
-    // Discover files to parse
-    let files = await this.discoverFiles(config);
+    // Build contentMap for virtual files (in-memory parsing, no disk I/O)
+    let contentMap: Map<string, string | Buffer> | undefined;
+    let files: string[];
 
-    // Filter out files that should be skipped (incremental ingestion)
-    const rootDir = config.root || process.cwd();
-    if (options.skipFiles && options.skipFiles.size > 0) {
-      const beforeCount = files.length;
-      files = files.filter(f => {
-        const relPath = path.relative(rootDir, f);
-        return !options.skipFiles!.has(relPath);
-      });
-      const skipped = beforeCount - files.length;
-      if (skipped > 0) {
-        console.log(`[CodeSourceAdapter] Skipped ${skipped} unchanged files (incremental)`);
+    if (config.virtualFiles && config.virtualFiles.length > 0) {
+      // Virtual files mode: use in-memory content
+      console.log(`📦 Virtual files mode: ${config.virtualFiles.length} files in memory`);
+      contentMap = new Map();
+      files = [];
+
+      for (const vf of config.virtualFiles) {
+        // Normalize path to absolute-like format for consistency
+        const normalizedPath = vf.path.startsWith('/') ? vf.path : `/${vf.path}`;
+        files.push(normalizedPath);
+        contentMap.set(normalizedPath, vf.content);
+      }
+    } else {
+      // Disk files mode: discover files using fast-glob
+      files = await this.discoverFiles(config);
+
+      // Filter out files that should be skipped (incremental ingestion)
+      const rootDir = config.root || process.cwd();
+      if (options.skipFiles && options.skipFiles.size > 0) {
+        const beforeCount = files.length;
+        files = files.filter(f => {
+          const relPath = path.relative(rootDir, f);
+          return !options.skipFiles!.has(relPath);
+        });
+        const skipped = beforeCount - files.length;
+        if (skipped > 0) {
+          console.log(`[CodeSourceAdapter] Skipped ${skipped} unchanged files (incremental)`);
+        }
       }
     }
 
@@ -418,7 +437,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       percentComplete: 0
     });
 
-    // Parse all files
+    // Parse all files (pass contentMap for virtual files)
     const {
       codeFiles,
       htmlFiles,
@@ -441,7 +460,7 @@ export class CodeSourceAdapter extends SourceAdapter {
         totalFiles: files.length,
         percentComplete: ((files.indexOf(current) + 1) / files.length) * 100
       });
-    });
+    }, contentMap);
 
     // Report progress: building graph
     options.onProgress?.({
@@ -563,11 +582,14 @@ export class CodeSourceAdapter extends SourceAdapter {
   /**
    * Parse all files (code, HTML, CSS, Vue, Svelte, SCSS, Markdown, and package.json)
    * Uses p-limit for parallel processing (10 concurrent files)
+   * 
+   * @param contentMap - Optional map of filePath -> content for in-memory parsing
    */
   private async parseFiles(
     files: string[],
     config: CodeSourceConfig,
-    onProgress: (file: string) => void
+    onProgress: (file: string) => void,
+    contentMap?: Map<string, string | Buffer>
   ): Promise<{
     codeFiles: Map<string, ScopeFileAnalysis>;
     htmlFiles: Map<string, HTMLParseResult>;
@@ -657,18 +679,35 @@ export class CodeSourceAdapter extends SourceAdapter {
           return;
         }
 
-        const fsModule = await import('fs');
-        const [content, stat] = await Promise.all([
-          fsModule.promises.readFile(file, 'utf-8'),
-          fsModule.promises.stat(file)
-        ]);
-        console.log(`   📖 Read ${file} (${content.length} chars)`);
+        // Read file content: from contentMap (virtual) or disk
+        let content: string;
+        let mtime: string | undefined;
 
-        // Pre-compute file metadata (hash + mtime) in parallel with parsing
+        if (contentMap && contentMap.has(file)) {
+          // Virtual file: read from memory
+          const virtualContent = contentMap.get(file)!;
+          content = typeof virtualContent === 'string'
+            ? virtualContent
+            : virtualContent.toString('utf-8');
+          console.log(`   📦 Virtual ${file} (${content.length} chars)`);
+          mtime = formatLocalDate(new Date()); // Use current time for virtual files
+        } else {
+          // Disk file: read from filesystem
+          const fsModule = await import('fs');
+          const [fileContent, stat] = await Promise.all([
+            fsModule.promises.readFile(file, 'utf-8'),
+            fsModule.promises.stat(file)
+          ]);
+          content = fileContent;
+          mtime = formatLocalDate(stat.mtime);
+          console.log(`   📖 Read ${file} (${content.length} chars)`);
+        }
+
+        // Pre-compute file metadata (hash + mtime)
         const rawContentHash = createHash('sha256').update(content).digest('hex');
         fileMetadata.set(file, {
           rawContentHash,
-          mtime: formatLocalDate(stat.mtime)
+          mtime
         });
 
         // Handle package.json files

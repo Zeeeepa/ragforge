@@ -1,0 +1,158 @@
+@import "tailwindcss";
+
+:root {
+  --background: #000811;
+  --foreground: #ededed;
+  --card: #0a1628;
+  --card-foreground: #ededed;
+  --primary: #00ffff;
+  --primary-foreground: #000811;
+  --secondary: #1a1a2e;
+  --secondary-foreground: #a1a1aa;
+  --muted: #16213e;
+  --muted-foreground: #71717a;
+  --accent: #ff00ff;
+  --accent-foreground: #ffffff;
+  --destructive: #ef4444;
+  --destructive-foreground: #ffffff;
+  --border: #1e3a5f;
+  --input: #0f172a;
+  --ring: #00ffff;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  max-width: 100vw;
+  overflow-x: hidden;
+  background: transparent;
+  color: var(--foreground);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+html {
+  background: var(--background);
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+/* Scrollbar styling - cyberpunk */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--background);
+}
+
+::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, #00ffff 0%, #ff00ff 100%);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, #00ffff 0%, #ff00ff 50%, #00ff88 100%);
+}
+
+/* Glow effects */
+.glow-cyan {
+  box-shadow: 0 0 20px rgba(0, 255, 255, 0.3);
+}
+
+.glow-magenta {
+  box-shadow: 0 0 20px rgba(255, 0, 255, 0.3);
+}
+
+.glow-green {
+  box-shadow: 0 0 20px rgba(0, 255, 136, 0.3);
+}
+
+/* Text glow */
+.text-glow-cyan {
+  text-shadow: 0 0 10px rgba(0, 255, 255, 0.5);
+}
+
+.text-glow-magenta {
+  text-shadow: 0 0 10px rgba(255, 0, 255, 0.5);
+}
+
+/* Cyberpunk button styles */
+.cyber-button {
+  position: relative;
+  padding: 0.75rem 1.5rem;
+  background: transparent;
+  border: 1px solid rgba(0, 255, 255, 0.5);
+  color: #00ffff;
+  font-weight: 500;
+  border-radius: 0.5rem;
+  overflow: hidden;
+  transition: all 0.3s ease;
+}
+
+.cyber-button:hover {
+  border-color: #00ffff;
+  box-shadow: 0 0 30px rgba(0, 255, 255, 0.3);
+}
+
+.cyber-button::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, rgba(0, 255, 255, 0.1) 0%, rgba(255, 0, 255, 0.1) 100%);
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.cyber-button:hover::before {
+  opacity: 1;
+}
+
+/* Cyber card */
+.cyber-card {
+  background: rgba(10, 22, 40, 0.8);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(30, 58, 95, 0.5);
+  border-radius: 1rem;
+  transition: all 0.3s ease;
+}
+
+.cyber-card:hover {
+  border-color: rgba(0, 255, 255, 0.5);
+  box-shadow: 0 0 30px rgba(0, 255, 255, 0.1);
+}
+
+/* Input styles */
+input, textarea, select {
+  background: var(--input) !important;
+  border: 1px solid var(--border) !important;
+  color: var(--foreground) !important;
+  transition: all 0.3s ease;
+}
+
+input:focus, textarea:focus, select:focus {
+  border-color: var(--primary) !important;
+  box-shadow: 0 0 15px rgba(0, 255, 255, 0.2) !important;
+  outline: none !important;
+}
+
+/* Selection */
+::selection {
+  background: rgba(0, 255, 255, 0.3);
+  color: #ffffff;
+}

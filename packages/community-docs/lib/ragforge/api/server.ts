@@ -1,0 +1,1505 @@
+/**
+ * Community Docs API Server
+ *
+ * Dedicated HTTP API for community-docs (port 6970).
+ * Inspired by RagForge CLI daemon but specialized for document management.
+ *
+ * Features:
+ * - Document ingestion with metadata (userId, categoryId, documentId)
+ * - Semantic search with filtering
+ * - Document deletion/update
+ * - Ollama embeddings (local)
+ *
+ * @since 2025-01-03
+ */
+
+// Load environment variables FIRST before any other imports
+import dotenv from "dotenv";
+import { existsSync } from "fs";
+import { homedir } from "os";
+import { join as pathJoin } from "path";
+
+// 1. Load community-docs local .env (highest priority)
+const localEnvPath = pathJoin(process.cwd(), ".env");
+if (existsSync(localEnvPath)) {
+  dotenv.config({ path: localEnvPath });
+}
+
+// 2. Load ~/.ragforge/.env as fallback (won't override existing vars)
+const ragforgeEnvPath = pathJoin(homedir(), ".ragforge", ".env");
+if (existsSync(ragforgeEnvPath)) {
+  dotenv.config({ path: ragforgeEnvPath });
+}
+
+import Fastify, { FastifyInstance } from "fastify";
+import cors from "@fastify/cors";
+import multipart from "@fastify/multipart";
+import AdmZip from "adm-zip";
+import { writeFile, unlink, mkdir } from "fs/promises";
+import { join } from "path";
+import { tmpdir } from "os";
+import { randomUUID } from "crypto";
+import { getNeo4jClient, closeNeo4jClient, type Neo4jClient } from "../neo4j-client";
+import { OllamaEmbeddingService, type OllamaEmbeddingConfig } from "../embedding-service";
+import { CommunityOrchestratorAdapter } from "../orchestrator-adapter";
+import { getSupportedExtensions } from "../parsers";
+import { getAPILogger, LOG_FILES } from "../logger";
+import type { CommunityNodeMetadata, SearchResult, SearchFilters } from "../types";
+// Import document parser from ragforge core for binary files (direct import from dist)
+import { parseDocumentFile } from "../../../../core/dist/esm/runtime/adapters/document-file-parser.js";
+// LLM Enrichment Services
+import { EnrichmentService, type EnrichmentOptions, type DocumentContext, type NodeToEnrich } from "../enrichment-service";
+import { EntityResolutionService, type EntityResolutionOptions } from "../entity-resolution-service";
+import { EntityEmbeddingService, type EntitySearchOptions, type EntitySearchResult } from "../entity-embedding-service";
+
+// ============================================================================
+// GitHub API Helpers
+// ============================================================================
+
+interface GitHubTreeItem {
+  path: string;
+  type: "blob" | "tree";
+  sha: string;
+}
+
+interface GitHubTreeResponse {
+  tree: GitHubTreeItem[];
+  truncated: boolean;
+}
+
+interface GitHubBlobResponse {
+  content: string;
+  encoding: string;
+}
+
+async function fetchGitHubTree(owner: string, repo: string, branch = "main"): Promise<GitHubTreeItem[]> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`;
+  const response = await fetch(url, {
+    headers: {
+      Accept: "application/vnd.github.v3+json",
+      "User-Agent": "CommunityDocs-RagForge",
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`GitHub API error: ${response.status} ${response.statusText}`);
+  }
+
+  const data: GitHubTreeResponse = await response.json();
+  if (data.truncated) {
+    logger.warn("GitHub tree response was truncated - some files may be missing");
+  }
+  return data.tree;
+}
+
+async function fetchGitHubFile(owner: string, repo: string, sha: string): Promise<string> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/git/blobs/${sha}`;
+  const response = await fetch(url, {
+    headers: {
+      Accept: "application/vnd.github.v3+json",
+      "User-Agent": "CommunityDocs-RagForge",
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`GitHub blob error: ${response.status}`);
+  }
+
+  const data: GitHubBlobResponse = await response.json();
+  if (data.encoding === "base64") {
+    return Buffer.from(data.content, "base64").toString("utf-8");
+  }
+  return data.content;
+}
+
+// Supported code file extensions for GitHub ingestion
+const CODE_EXTENSIONS = new Set([
+  ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+  ".py", ".pyi",
+  ".vue", ".svelte",
+  ".html", ".css", ".scss", ".sass", ".less",
+  ".json", ".yaml", ".yml",
+  ".md", ".mdx",
+]);
+
+// Binary file extensions that need special parsing (document parser)
+const BINARY_DOCUMENT_EXTENSIONS = new Set([
+  ".pdf", ".docx", ".doc", ".xlsx", ".xls",
+]);
+
+// Image extensions (need OCR or description)
+const IMAGE_EXTENSIONS = new Set([
+  ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
+]);
+
+/**
+ * Check if a file extension is a binary document that needs parsing
+ */
+function isBinaryDocument(ext: string): boolean {
+  return BINARY_DOCUMENT_EXTENSIONS.has(ext.toLowerCase());
+}
+
+/**
+ * Check if a file extension is an image
+ */
+function isImage(ext: string): boolean {
+  return IMAGE_EXTENSIONS.has(ext.toLowerCase());
+}
+
+/**
+ * Parse a binary document (PDF, DOCX, XLSX) and extract text content
+ */
+async function parseBinaryDocument(
+  buffer: Buffer,
+  fileName: string
+): Promise<{ content: string; metadata?: Record<string, any> } | null> {
+  const tempDir = join(tmpdir(), "community-docs-temp");
+  await mkdir(tempDir, { recursive: true });
+
+  const tempPath = join(tempDir, `${randomUUID()}-${fileName}`);
+
+  try {
+    // Write buffer to temp file
+    await writeFile(tempPath, buffer);
+
+    // Parse with ragforge document parser
+    const result = await parseDocumentFile(tempPath) as any;
+
+    if (!result || !result.textContent) {
+      return null;
+    }
+
+    return {
+      content: result.textContent,
+      metadata: {
+        format: result.format,
+        pageCount: result.pageCount,
+        ...(result.metadata || {}),
+      },
+    };
+  } finally {
+    // Clean up temp file
+    try {
+      await unlink(tempPath);
+    } catch {}
+  }
+}
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+const DEFAULT_PORT = 6970;
+
+// ============================================================================
+// Logger
+// ============================================================================
+
+const logger = getAPILogger();
+
+// ============================================================================
+// API Server
+// ============================================================================
+
+export class CommunityAPIServer {
+  private server: FastifyInstance;
+  private neo4j: Neo4jClient | null = null;
+  private embedding: OllamaEmbeddingService | null = null;
+  private orchestrator: CommunityOrchestratorAdapter | null = null;
+  private enrichment: EnrichmentService | null = null;
+  private entityEmbedding: EntityEmbeddingService | null = null;
+  private startTime: Date;
+  private requestCount: number = 0;
+
+  constructor() {
+    this.startTime = new Date();
+    this.server = Fastify({ logger: false });
+  }
+
+  async initialize(): Promise<void> {
+    logger.info( "Initializing Community API...");
+
+    await this.server.register(cors, {
+      origin: true,
+      methods: ["GET", "POST", "DELETE", "PUT", "PATCH"],
+    });
+
+    // Multipart for file uploads
+    await this.server.register(multipart, {
+      limits: { fileSize: 100 * 1024 * 1024 }, // 100MB
+    });
+
+    // Initialize Neo4j
+    this.neo4j = getNeo4jClient();
+    const connected = await this.neo4j.verifyConnectivity();
+    if (!connected) {
+      throw new Error("Failed to connect to Neo4j on port 7688");
+    }
+    logger.info( "Connected to Neo4j (port 7688)");
+
+    await this.neo4j.ensureIndexes();
+
+    // Initialize Ollama embedding service
+    const ollamaConfig: OllamaEmbeddingConfig = {
+      baseUrl: process.env.OLLAMA_BASE_URL || "http://localhost:11434",
+      model: process.env.OLLAMA_EMBEDDING_MODEL || "mxbai-embed-large",
+    };
+    this.embedding = new OllamaEmbeddingService(ollamaConfig);
+
+    const ollamaOk = await this.embedding.checkHealth();
+    if (!ollamaOk) {
+      logger.warn( "Ollama not available - embeddings disabled");
+      this.embedding = null;
+    } else {
+      logger.info( `Ollama connected (model: ${ollamaConfig.model})`);
+    }
+
+    // Initialize orchestrator for all file ingestion (file, batch, GitHub)
+    // Uses ragforge core EmbeddingService with batching for efficiency
+    this.orchestrator = new CommunityOrchestratorAdapter({
+      neo4j: this.neo4j!,
+      embeddingConfig: this.embedding
+        ? {
+            provider: "ollama",
+            model: process.env.OLLAMA_EMBEDDING_MODEL || "mxbai-embed-large",
+            options: {
+              baseUrl: process.env.OLLAMA_BASE_URL || "http://localhost:11434",
+              batchSize: 10,
+            },
+          }
+        : undefined,
+      verbose: false,
+    });
+    await this.orchestrator.initialize();
+    logger.info("Orchestrator initialized for virtual file ingestion (with core EmbeddingService)");
+
+    // Initialize LLM enrichment service (optional - only if ANTHROPIC_API_KEY is set)
+    const anthropicKey = process.env.ANTHROPIC_API_KEY;
+    if (anthropicKey) {
+      this.enrichment = new EnrichmentService(anthropicKey, {
+        model: process.env.ENRICHMENT_MODEL || "claude-3-5-haiku-20241022",
+      });
+      logger.info("EnrichmentService initialized (Claude LLM)");
+    } else {
+      logger.info("EnrichmentService disabled (no ANTHROPIC_API_KEY)");
+    }
+
+    // Initialize EntityEmbeddingService for Entity/Tag embeddings and search
+    if (this.embedding) {
+      this.entityEmbedding = new EntityEmbeddingService({
+        neo4jClient: this.neo4j!,
+        embedFunction: async (texts: string[]) => {
+          // Use Ollama batch embedding (one at a time for compatibility)
+          const embeddings: number[][] = [];
+          for (const text of texts) {
+            const emb = await this.embedding!.embed(text);
+            embeddings.push(emb);
+          }
+          return embeddings;
+        },
+        embedSingle: async (text: string) => {
+          return this.embedding!.embed(text);
+        },
+        dimension: 1024, // mxbai-embed-large dimension
+        verbose: false,
+      });
+
+      // Ensure vector and full-text indexes for Entity/Tag
+      const vectorIndexResult = await this.entityEmbedding.ensureVectorIndexes();
+      const fulltextIndexResult = await this.entityEmbedding.ensureFullTextIndexes();
+      logger.info(`EntityEmbeddingService initialized (vector: ${vectorIndexResult.created} created, fulltext: ${fulltextIndexResult.created} created)`);
+    } else {
+      logger.info("EntityEmbeddingService disabled (no embedding service)");
+    }
+
+    this.setupRoutes();
+    this.server.addHook("onRequest", async () => { this.requestCount++; });
+
+    logger.info( "Community API initialized");
+  }
+
+  private setupRoutes(): void {
+    // Health & Status
+    this.server.get("/health", async () => ({
+      status: "ok",
+      timestamp: new Date().toISOString(),
+    }));
+
+    this.server.get("/status", async () => ({
+      status: "running",
+      port: DEFAULT_PORT,
+      uptime_ms: Date.now() - this.startTime.getTime(),
+      request_count: this.requestCount,
+      neo4j: { connected: !!this.neo4j },
+      embedding: { enabled: !!this.embedding, provider: "ollama" },
+    }));
+
+    // Document Ingestion
+    this.server.post<{
+      Body: {
+        documentId: string;
+        content: string;
+        metadata: CommunityNodeMetadata;
+        generateEmbeddings?: boolean;
+      };
+    }>("/ingest", async (request, reply) => {
+      const { documentId, content, metadata, generateEmbeddings = true } = request.body || {};
+
+      if (!documentId || !content || !metadata) {
+        reply.status(400);
+        return { success: false, error: "Missing documentId, content, or metadata" };
+      }
+
+      logger.info( `Ingesting document: ${documentId}`);
+
+      try {
+        await this.neo4j!.run(
+          `MERGE (n:Scope {documentId: $documentId, type: 'document'})
+           SET n += $props, n.content = $content, n.updatedAt = datetime()`,
+          { documentId, content, props: { ...metadata, type: "document", name: metadata.documentTitle } }
+        );
+
+        let embeddingGenerated = false;
+        if (generateEmbeddings && this.embedding) {
+          try {
+            const embedding = await this.embedding.embed(content);
+            await this.neo4j!.run(
+              `MATCH (n:Scope {documentId: $documentId, type: 'document'})
+               SET n.embedding_content = $embedding`,
+              { documentId, embedding }
+            );
+            embeddingGenerated = true;
+          } catch (err: any) {
+            logger.warn( `Embedding failed: ${err.message}`);
+          }
+        }
+
+        return { success: true, documentId, embeddingGenerated };
+      } catch (err: any) {
+        logger.error( `Ingestion failed: ${err.message}`);
+        reply.status(500);
+        return { success: false, error: err.message };
+      }
+    });
+
+    // Chunk Ingestion
+    this.server.post<{
+      Body: {
+        documentId: string;
+        chunks: Array<{ chunkId: string; content: string; position: number }>;
+        documentMetadata: CommunityNodeMetadata;
+        generateEmbeddings?: boolean;
+      };
+    }>("/ingest/chunks", async (request, reply) => {
+      const { documentId, chunks, documentMetadata, generateEmbeddings = true } = request.body || {};
+
+      if (!documentId || !chunks || !documentMetadata) {
+        reply.status(400);
+        return { success: false, error: "Missing required fields" };
+      }
+
+      logger.info( `Ingesting ${chunks.length} chunks for: ${documentId}`);
+
+      try {
+        let embeddingsGenerated = 0;
+
+        for (const chunk of chunks) {
+          await this.neo4j!.run(
+            `MERGE (n:Scope {documentId: $documentId, chunkId: $chunkId})
+             SET n += $props, n.content = $content, n.position = $position, n.type = 'chunk', n.updatedAt = datetime()`,
+            {
+              documentId,
+              chunkId: chunk.chunkId,
+              content: chunk.content,
+              position: chunk.position,
+              props: { ...documentMetadata, name: `${documentMetadata.documentTitle} - Chunk ${chunk.position}` },
+            }
+          );
+
+          if (generateEmbeddings && this.embedding) {
+            try {
+              const embedding = await this.embedding.embed(chunk.content);
+              await this.neo4j!.run(
+                `MATCH (n:Scope {documentId: $documentId, chunkId: $chunkId})
+                 SET n.embedding_content = $embedding`,
+                { documentId, chunkId: chunk.chunkId, embedding }
+              );
+              embeddingsGenerated++;
+            } catch {}
+          }
+        }
+
+        return { success: true, documentId, chunksIngested: chunks.length, embeddingsGenerated };
+      } catch (err: any) {
+        reply.status(500);
+        return { success: false, error: err.message };
+      }
+    });
+
+    // File Ingestion with Parsing (uses CommunityOrchestratorAdapter → ragforge core)
+    this.server.post<{
+      Body: {
+        filePath: string;
+        content: string; // Base64 encoded content (required for virtual ingestion)
+        metadata: CommunityNodeMetadata;
+        generateEmbeddings?: boolean;
+      };
+    }>("/ingest/file", async (request, reply) => {
+      const { filePath, content, metadata, generateEmbeddings = true } = request.body || {};
+
+      if (!filePath || !content || !metadata) {
+        reply.status(400);
+        return { success: false, error: "Missing filePath, content, or metadata" };
+      }
+
+      if (!this.orchestrator) {
+        reply.status(503);
+        return { success: false, error: "Orchestrator not available" };
+      }
+
+      logger.info(`Ingesting file: ${filePath}`);
+      const startTime = Date.now();
+
+      try {
+        // Decode base64 content
+        const fileContent = Buffer.from(content, "base64").toString("utf-8");
+
+        // Use orchestrator's ingestVirtual (same as GitHub ingestion)
+        const result = await this.orchestrator.ingestVirtual({
+          virtualFiles: [{ path: filePath, content: fileContent }],
+          metadata,
+          sourceIdentifier: "upload",
+        });
+
+        // Generate embeddings if requested
+        let embeddingsGenerated = 0;
+        if (generateEmbeddings && this.orchestrator.hasEmbeddingService()) {
+          embeddingsGenerated = await this.orchestrator.generateEmbeddingsForDocument(metadata.documentId);
+        }
+
+        return {
+          success: true,
+          documentId: metadata.documentId,
+          nodesCreated: result.nodesCreated,
+          relationshipsCreated: result.relationshipsCreated,
+          embeddingsGenerated,
+          totalTimeMs: Date.now() - startTime,
+        };
+      } catch (err: any) {
+        logger.error(`File ingestion failed: ${err.message}`);
+        reply.status(500);
+        return { success: false, error: err.message };
+      }
+    });
+
+    // Batch File Ingestion (multiple files at once, uses CommunityOrchestratorAdapter → ragforge core)
+    this.server.post<{
+      Body: {
+        files: Array<{ filePath: string; content: string }>; // content is base64 encoded
+        metadata: CommunityNodeMetadata;
+        generateEmbeddings?: boolean;
+      };
+    }>("/ingest/batch", async (request, reply) => {
+      const { files, metadata, generateEmbeddings = true } = request.body || {};
+
+      if (!files || files.length === 0 || !metadata) {
+        reply.status(400);
+        return { success: false, error: "Missing files or metadata" };
+      }
+
+      if (!this.orchestrator) {
+        reply.status(503);
+        return { success: false, error: "Orchestrator not available" };
+      }
+
+      logger.info(`Batch ingesting ${files.length} files for document: ${metadata.documentId}`);
+      const startTime = Date.now();
+
+      try {
+        // Decode base64 content for each file
+        const virtualFiles = files.map((f) => ({
+          path: f.filePath,
+          content: Buffer.from(f.content, "base64").toString("utf-8"),
+        }));
+
+        // Use orchestrator's ingestVirtual (same as /ingest/file and /ingest/github)
+        const result = await this.orchestrator.ingestVirtual({
+          virtualFiles,
+          metadata,
+          sourceIdentifier: "batch-upload",
+        });
+
+        // Generate embeddings if requested
+        let embeddingsGenerated = 0;
+        if (generateEmbeddings && this.orchestrator.hasEmbeddingService()) {
+          embeddingsGenerated = await this.orchestrator.generateEmbeddingsForDocument(metadata.documentId);
+        }
+
+        return {
+          success: true,
+          documentId: metadata.documentId,
+          nodesCreated: result.nodesCreated,
+          relationshipsCreated: result.relationshipsCreated,
+          embeddingsGenerated,
+          filesProcessed: virtualFiles.length,
+          totalTimeMs: Date.now() - startTime,
+        };
+      } catch (err: any) {
+        logger.error(`Batch ingestion failed: ${err.message}`);
+        reply.status(500);
+        return { success: false, error: err.message };
+      }
+    });
+
+    // GitHub Repository Ingestion (virtual files - no disk I/O)
+    this.server.post<{
+      Body: {
+        githubUrl: string;
+        metadata: CommunityNodeMetadata;
+        branch?: string;
+        maxFiles?: number;
+        generateEmbeddings?: boolean;
+      };
+    }>("/ingest/github", async (request, reply) => {
+      const { githubUrl, metadata, branch = "main", maxFiles = 100, generateEmbeddings = true } = request.body || {};
+
+      if (!githubUrl || !metadata) {
+        reply.status(400);
+        return { success: false, error: "Missing githubUrl or metadata" };
+      }
+
+      if (!this.orchestrator) {
+        reply.status(503);
+        return { success: false, error: "Orchestrator not available" };
+      }
+
+      // Parse GitHub URL
+      const urlMatch = githubUrl.match(/github\.com\/([^\/]+)\/([^\/\.]+)/);
+      if (!urlMatch) {
+        reply.status(400);
+        return { success: false, error: "Invalid GitHub URL format" };
+      }
+
+      const [, owner, repo] = urlMatch;
+      const sourceIdentifier = `github.com/${owner}/${repo}`;
+
+      logger.info(`GitHub ingestion: ${sourceIdentifier} (branch: ${branch})`);
+
+      try {
+        // Fetch repository tree
+        const tree = await fetchGitHubTree(owner, repo, branch);
+
+        // Filter to code files only
+        const codeFiles = tree.filter((item) => {
+          if (item.type !== "blob") return false;
+          const ext = "." + item.path.split(".").pop()?.toLowerCase();
+          return CODE_EXTENSIONS.has(ext);
+        });
+
+        if (codeFiles.length === 0) {
+          return { success: false, error: "No supported code files found in repository" };
+        }
+
+        // Limit files if needed
+        const filesToFetch = codeFiles.slice(0, maxFiles);
+        logger.info(`Fetching ${filesToFetch.length}/${codeFiles.length} code files`);
+
+        // Fetch file contents in parallel (with concurrency limit)
+        const virtualFiles: Array<{ path: string; content: string }> = [];
+        const concurrency = 5;
+
+        for (let i = 0; i < filesToFetch.length; i += concurrency) {
+          const batch = filesToFetch.slice(i, i + concurrency);
+          const results = await Promise.all(
+            batch.map(async (file) => {
+              try {
+                const content = await fetchGitHubFile(owner, repo, file.sha);
+                return { path: file.path, content };
+              } catch (err) {
+                logger.warn(`Failed to fetch ${file.path}: ${err}`);
+                return null;
+              }
+            })
+          );
+          virtualFiles.push(...results.filter((r): r is { path: string; content: string } => r !== null));
+        }
+
+        logger.info(`Fetched ${virtualFiles.length} files, starting ingestion...`);
+
+        // Ingest using virtual files
+        const result = await this.orchestrator.ingestVirtual({
+          virtualFiles,
+          sourceIdentifier,
+          metadata,
+        });
+
+        // Generate embeddings if requested and embedding service is available
+        let embeddingsGenerated = 0;
+        if (generateEmbeddings && this.orchestrator.hasEmbeddingService()) {
+          logger.info(`Generating embeddings for document: ${metadata.documentId}`);
+          embeddingsGenerated = await this.orchestrator.generateEmbeddingsForDocument(metadata.documentId);
+          logger.info(`Generated ${embeddingsGenerated} embeddings`);
+        }
+
+        return {
+          success: true,
+          documentId: metadata.documentId,
+          sourceIdentifier,
+          filesIngested: virtualFiles.length,
+          nodesCreated: result.nodesCreated,
+          relationshipsCreated: result.relationshipsCreated,
+          embeddingsGenerated,
+        };
+      } catch (err: any) {
+        logger.error(`GitHub ingestion failed: ${err.message}`);
+        reply.status(500);
+        return { success: false, error: err.message };
+      }
+    });
+
+    // Get supported file extensions
+    this.server.get("/parsers/extensions", async () => ({
+      extensions: getSupportedExtensions(),
+      count: getSupportedExtensions().length,
+    }));
+
+    // Semantic Search (uses SearchService from ragforge core via orchestrator)
+    // Supports post-processing: keyword boosting, relationship exploration, summarization, reranking
+    // Supports output formatting: json (default), markdown (human-readable with ASCII graph)
+    this.server.post<{
+      Body: {
+        query: string;
+        filters?: SearchFilters;
+        limit?: number;
+        minScore?: number;
+        semantic?: boolean;
+        hybrid?: boolean;
+        embeddingType?: "name" | "content" | "description" | "all";
+        // Post-processing options
+        boostKeywords?: string[];
+        boostWeight?: number;
+        exploreDepth?: number;
+        summarize?: boolean;
+        summarizeContext?: string;
+        rerank?: boolean;
+        // Output formatting options
+        format?: "json" | "markdown" | "compact";
+        includeSource?: boolean;
+        maxSourceResults?: number;
+      };
+    }>("/search", async (request, reply) => {
+      const {
+        query,
+        filters = {},
+        limit = 20,
+        minScore = 0.3,
+        semantic = true,
+        hybrid = true,
+        embeddingType = "all",
+        // Post-processing
+        boostKeywords,
+        boostWeight,
+        exploreDepth,
+        summarize,
+        summarizeContext,
+        rerank,
+        // Formatting
+        format,
+        includeSource,
+        maxSourceResults,
+      } = request.body || {};
+
+      if (!query) {
+        reply.status(400);
+        return { success: false, error: "Missing query" };
+      }
+
+      if (!this.orchestrator) {
+        reply.status(503);
+        return { success: false, error: "Orchestrator not available" };
+      }
+
+      // Check if semantic search is requested but not available
+      if (semantic && !this.orchestrator.canDoSemanticSearch()) {
+        reply.status(503);
+        return { success: false, error: "Semantic search not available (no embedding service)" };
+      }
+
+      logger.info(`Search: "${query.substring(0, 50)}..." (semantic: ${semantic}, hybrid: ${hybrid})`);
+
+      try {
+        // Use orchestrator's search method which wraps SearchService + post-processing + formatting
+        const searchResult = await this.orchestrator.search({
+          query,
+          categorySlug: filters.categorySlug,
+          userId: filters.userId,
+          documentId: filters.documentId,
+          isPublic: filters.isPublic,
+          semantic,
+          hybrid,
+          embeddingType,
+          limit,
+          minScore,
+          // Post-processing options
+          boostKeywords,
+          boostWeight,
+          exploreDepth,
+          summarize,
+          summarizeContext,
+          rerank,
+          // Formatting options
+          format,
+          includeSource,
+          maxSourceResults,
+        });
+
+        // Map to API response format
+        const searchResults: SearchResult[] = searchResult.results.map((r) => ({
+          documentId: r.node.documentId as string,
+          chunkId: r.node.chunkId as string | undefined,
+          content: (r.node.content || r.node.source) as string,
+          score: r.score,
+          metadata: {
+            documentTitle: r.node.documentTitle as string,
+            categoryId: r.node.categoryId as string,
+            categorySlug: r.node.categorySlug as string,
+            userId: r.node.userId as string,
+          },
+          // Include keyword boost info if present
+          keywordBoost: r.keywordBoost,
+        }));
+
+        return {
+          success: true,
+          query,
+          results: searchResults,
+          count: searchResults.length,
+          totalCount: searchResult.totalCount,
+          // Post-processing results
+          reranked: searchResult.reranked,
+          keywordBoosted: searchResult.keywordBoosted,
+          relationshipsExplored: searchResult.relationshipsExplored,
+          summarized: searchResult.summarized,
+          graph: searchResult.graph,
+          summary: searchResult.summary,
+          // Formatted output (if format was specified)
+          formattedOutput: searchResult.formattedOutput,
+        };
+      } catch (err: any) {
+        logger.error(`Search failed: ${err.message}`);
+        reply.status(500);
+        return { success: false, error: err.message };
+      }
+    });
+
+    // =========================================================================
+    // Entity/Tag Semantic Search (uses EntityEmbeddingService with hybrid BM25 + semantic)
+    // =========================================================================
+    this.server.post<{
+      Body: {
+        query: string;
+        entityTypes?: string[];
+        semantic?: boolean;
+        hybrid?: boolean;
+        limit?: number;
+        minScore?: number;
+        projectIds?: string[];
+      };
+    }>("/search/entities", async (request, reply) => {
+      const {
+        query,
+        entityTypes,
+        semantic = true,
+        hybrid = true,
+        limit = 20,
+        minScore = 0.3,
+        projectIds,
+      } = request.body || {};
+
+      if (!query) {
+        reply.status(400);
+        return { success: false, error: "Missing query" };
+      }
+
+      if (!this.entityEmbedding) {
+        reply.status(503);
+        return { success: false, error: "Entity embedding service not available" };
+      }
+
+      logger.info(`[EntitySearch] "${query.substring(0, 50)}..." (semantic: ${semantic}, hybrid: ${hybrid})`);
+
+      try {
+        const results = await this.entityEmbedding.search({
+          query,
+          entityTypes,
+          semantic,
+          hybrid,
+          limit,
+          minScore,
+          projectIds,
+        });
+
+        return {
+          success: true,
+          query,
+          results,
+          count: results.length,
+        };
+      } catch (err: any) {
+        logger.error(`[EntitySearch] Failed: ${err.message}`);
+        reply.status(500);
+        return { success: false, error: err.message };
+      }
+    });
+
+    // =========================================================================
+    // Entity/Tag Stats
+    // =========================================================================
+    this.server.get("/entities/stats", async (request, reply) => {
+      if (!this.entityEmbedding) {
+        reply.status(503);
+        return { success: false, error: "Entity embedding service not available" };
+      }
+
+      try {
+        const stats = await this.entityEmbedding.getStats();
+        return {
+          success: true,
+          ...stats,
+        };
+      } catch (err: any) {
+        reply.status(500);
+        return { success: false, error: err.message };
+      }
+    });
+
+    // =========================================================================
+    // Generate Entity/Tag Embeddings (admin endpoint)
+    // =========================================================================
+    this.server.post("/admin/generate-entity-embeddings", async (request, reply) => {
+      if (!this.entityEmbedding) {
+        reply.status(503);
+        return { success: false, error: "Entity embedding service not available" };
+      }
+
+      logger.info("[Admin] Generating entity/tag embeddings...");
+
+      try {
+        const result = await this.entityEmbedding.generateEmbeddings();
+
+        return {
+          success: true,
+          entitiesEmbedded: result.entitiesEmbedded,
+          tagsEmbedded: result.tagsEmbedded,
+          skipped: result.skipped,
+          durationMs: result.durationMs,
+        };
+      } catch (err: any) {
+        logger.error(`[Admin] Entity embedding failed: ${err.message}`);
+        reply.status(500);
+        return { success: false, error: err.message };
+      }
+    });
+
+    // Delete document
+    this.server.delete<{ Params: { documentId: string } }>("/document/:documentId", async (request, reply) => {
+      const { documentId } = request.params;
+      logger.info( `Deleting document: ${documentId}`);
+
+      try {
+        const deletedCount = await this.neo4j!.deleteDocument(documentId);
+        return { success: true, documentId, deletedNodes: deletedCount };
+      } catch (err: any) {
+        reply.status(500);
+        return { success: false, error: err.message };
+      }
+    });
+
+    // Update document metadata
+    this.server.patch<{ Params: { documentId: string }; Body: Partial<CommunityNodeMetadata> }>(
+      "/document/:documentId",
+      async (request, reply) => {
+        const { documentId } = request.params;
+        const updates = request.body || {};
+
+        try {
+          const updatedCount = await this.neo4j!.updateDocumentMetadata(documentId, updates);
+          return { success: true, documentId, updatedNodes: updatedCount };
+        } catch (err: any) {
+          reply.status(500);
+          return { success: false, error: err.message };
+        }
+      }
+    );
+
+    // Ensure vector index
+    this.server.post("/indexes/ensure-vector", async (request, reply) => {
+      try {
+        await this.neo4j!.run(
+          `CREATE VECTOR INDEX scope_embedding_content_vector IF NOT EXISTS
+           FOR (n:Scope) ON (n.embedding_content)
+           OPTIONS {indexConfig: {\`vector.dimensions\`: 1024, \`vector.similarity_function\`: 'cosine'}}`
+        );
+        return { success: true, message: "Vector index ensured" };
+      } catch (err: any) {
+        reply.status(500);
+        return { success: false, error: err.message };
+      }
+    });
+
+    // Debug: Execute Cypher query directly
+    this.server.post<{
+      Body: {
+        query: string;
+        params?: Record<string, unknown>;
+      };
+    }>("/cypher", async (request, reply) => {
+      const { query, params = {} } = request.body || {};
+
+      if (!query) {
+        reply.status(400);
+        return { success: false, error: "Missing query" };
+      }
+
+      logger.info(`Cypher: ${query.slice(0, 100)}...`);
+
+      try {
+        const result = await this.neo4j!.run(query, params);
+        const records = result.records.map((r: any) => r.toObject ? r.toObject() : r);
+        return {
+          success: true,
+          records,
+          count: records.length,
+        };
+      } catch (err: any) {
+        logger.error(`Cypher failed: ${err.message}`);
+        reply.status(500);
+        return { success: false, error: err.message };
+      }
+    });
+
+    // =========================================================================
+    // DEBUG: File upload without authentication (for testing)
+    // =========================================================================
+    this.server.post("/debug/upload", async (request, reply) => {
+      if (!this.orchestrator) {
+        reply.status(503);
+        return { success: false, error: "Orchestrator not available" };
+      }
+
+      try {
+        const data = await request.file();
+        if (!data) {
+          reply.status(400);
+          return { success: false, error: "No file uploaded" };
+        }
+
+        const buffer = await data.toBuffer();
+        const fileName = data.filename;
+        const documentId = `debug-${Date.now()}`;
+
+        logger.info(`[DEBUG] Upload: ${fileName} (${buffer.length} bytes)`);
+
+        // Default metadata for debug uploads
+        const metadata = {
+          documentId,
+          documentTitle: fileName.replace(/\.[^.]+$/, ""),
+          categorySlug: "debug-uploads",
+          categoryId: "cat-debug",
+          userId: "debug-user",
+          isPublic: true,
+        };
+
+        // Check if it's a ZIP file
+        const isZip = fileName.toLowerCase().endsWith(".zip");
+
+        if (isZip) {
+          // Extract ZIP and ingest all files
+          const zip = new AdmZip(buffer);
+          const entries = zip.getEntries();
+          const virtualFiles: Array<{ path: string; content: string }> = [];
+          const stats = { text: 0, binary: 0, skipped: 0, images: 0 };
+
+          for (const entry of entries) {
+            if (entry.isDirectory) continue;
+            const entryName = entry.entryName;
+            const ext = "." + (entryName.split(".").pop()?.toLowerCase() || "");
+            const entryBuffer = entry.getData();
+
+            // Check if it's a binary document (PDF, DOCX, XLSX)
+            if (isBinaryDocument(ext)) {
+              try {
+                logger.info(`[DEBUG] Parsing binary: ${entryName}`);
+                const parsed = await parseBinaryDocument(entryBuffer, entryName);
+                if (parsed && parsed.content) {
+                  // Create a markdown representation of the parsed document
+                  // Include YAML frontmatter with original file info for proper display/linking
+                  const frontmatter = [
+                    '---',
+                    `originalFileName: "${entryName}"`,
+                    `sourceFormat: "${ext.slice(1)}"`,
+                    `parsedFrom: "binary"`,
+                    '---',
+                    '',
+                  ].join('\n');
+                  const mdContent = `${frontmatter}# ${entryName}\n\n${parsed.content}`;
+                  virtualFiles.push({
+                    path: `${entryName}.md`, // file.pdf → file.pdf.md (avoids collision with file.docx.md)
+                    content: mdContent,
+                  });
+                  stats.binary++;
+                } else {
+                  logger.warn(`[DEBUG] No text extracted from: ${entryName}`);
+                  stats.skipped++;
+                }
+              } catch (err: any) {
+                logger.warn(`[DEBUG] Failed to parse binary ${entryName}: ${err.message}`);
+                stats.skipped++;
+              }
+              continue;
+            }
+
+            // Skip images for now (would need OCR/vision)
+            if (isImage(ext)) {
+              logger.info(`[DEBUG] Skipping image (no OCR): ${entryName}`);
+              stats.images++;
+              continue;
+            }
+
+            // Check if it's a supported text file
+            const supportedExts = getSupportedExtensions();
+            if (!supportedExts.includes(ext)) {
+              logger.info(`[DEBUG] Skipping unsupported: ${entryName}`);
+              stats.skipped++;
+              continue;
+            }
+
+            // Text file - read as UTF-8
+            try {
+              const content = entryBuffer.toString("utf-8");
+              virtualFiles.push({
+                path: entryName,
+                content,
+              });
+              stats.text++;
+            } catch (err) {
+              logger.warn(`[DEBUG] Failed to read ${entryName}: ${err}`);
+              stats.skipped++;
+            }
+          }
+
+          logger.info(`[DEBUG] Extracted: ${stats.text} text, ${stats.binary} binary docs, ${stats.images} images skipped, ${stats.skipped} unsupported`);
+
+          if (virtualFiles.length === 0) {
+            return { success: false, error: "No supported files found in ZIP" };
+          }
+
+          // Ingest via orchestrator
+          const result = await this.orchestrator.ingestVirtual({
+            virtualFiles,
+            metadata,
+            sourceIdentifier: "zip-upload",
+          });
+
+          // Generate embeddings
+          const embeddingsGenerated = await this.orchestrator.generateEmbeddingsForDocument(documentId);
+
+          return {
+            success: true,
+            documentId,
+            fileName,
+            filesExtracted: entries.length,
+            filesIngested: virtualFiles.length,
+            nodesCreated: result.nodesCreated,
+            relationshipsCreated: result.relationshipsCreated,
+            embeddingsGenerated,
+          };
+        } else {
+          // Single file ingestion
+          const content = buffer.toString("utf-8");
+
+          const result = await this.orchestrator.ingestVirtual({
+            virtualFiles: [{ path: fileName, content }],
+            metadata,
+            sourceIdentifier: "file-upload",
+          });
+
+          const embeddingsGenerated = await this.orchestrator.generateEmbeddingsForDocument(documentId);
+
+          return {
+            success: true,
+            documentId,
+            fileName,
+            nodesCreated: result.nodesCreated,
+            relationshipsCreated: result.relationshipsCreated,
+            embeddingsGenerated,
+          };
+        }
+      } catch (err: any) {
+        logger.error(`[DEBUG] Upload failed: ${err.message}`);
+        reply.status(500);
+        return { success: false, error: err.message };
+      }
+    });
+
+    // =========================================================================
+    // Upload with LLM Enrichment Support
+    // =========================================================================
+    this.server.post<{
+      Querystring: {
+        enableEnrichment?: string;
+        extractEntities?: string;
+        extractTags?: string;
+        generateSummary?: string;
+        suggestCategory?: string;
+      };
+    }>("/ingest/upload", async (request, reply) => {
+      if (!this.orchestrator) {
+        reply.status(503);
+        return { success: false, error: "Orchestrator not available" };
+      }
+
+      // Parse enrichment options from query string
+      const enrichmentEnabled = request.query.enableEnrichment === "true";
+      const enrichmentOptions: Partial<EnrichmentOptions> = {
+        enableLLMEnrichment: enrichmentEnabled,
+        extractEntities: request.query.extractEntities !== "false",
+        extractTags: request.query.extractTags !== "false",
+        generateSummary: request.query.generateSummary !== "false",
+        suggestCategory: request.query.suggestCategory !== "false",
+      };
+
+      if (enrichmentEnabled && !this.enrichment) {
+        reply.status(400);
+        return { success: false, error: "Enrichment requested but ANTHROPIC_API_KEY not configured" };
+      }
+
+      try {
+        const data = await request.file();
+        if (!data) {
+          reply.status(400);
+          return { success: false, error: "No file uploaded" };
+        }
+
+        const buffer = await data.toBuffer();
+        const fileName = data.filename;
+        const documentId = `doc-${Date.now()}`;
+        const projectId = `doc-${documentId}`;
+
+        logger.info(`[Upload] ${fileName} (${buffer.length} bytes), enrichment: ${enrichmentEnabled}`);
+
+        // Default metadata
+        const metadata: CommunityNodeMetadata = {
+          documentId,
+          documentTitle: fileName.replace(/\.[^.]+$/, ""),
+          categorySlug: "uploads",
+          categoryId: "cat-uploads",
+          userId: "api-user",
+          isPublic: true,
+        };
+
+        // Check if it's a ZIP file
+        const isZip = fileName.toLowerCase().endsWith(".zip");
+        let virtualFiles: Array<{ path: string; content: string }> = [];
+
+        if (isZip) {
+          // Extract ZIP
+          const zip = new AdmZip(buffer);
+          const entries = zip.getEntries();
+
+          for (const entry of entries) {
+            if (entry.isDirectory) continue;
+            const entryName = entry.entryName;
+            const ext = "." + (entryName.split(".").pop()?.toLowerCase() || "");
+            const entryBuffer = entry.getData();
+
+            // Handle binary documents
+            if (isBinaryDocument(ext)) {
+              try {
+                const parsed = await parseBinaryDocument(entryBuffer, entryName);
+                if (parsed?.content) {
+                  virtualFiles.push({
+                    path: `${entryName}.md`,
+                    content: `# ${entryName}\n\n${parsed.content}`,
+                  });
+                }
+              } catch {}
+              continue;
+            }
+
+            // Skip unsupported files
+            if (isImage(ext)) continue;
+            const supportedExts = getSupportedExtensions();
+            if (!supportedExts.includes(ext)) continue;
+
+            // Text file
+            try {
+              virtualFiles.push({
+                path: entryName,
+                content: entryBuffer.toString("utf-8"),
+              });
+            } catch {}
+          }
+        } else {
+          // Single file
+          virtualFiles.push({
+            path: fileName,
+            content: buffer.toString("utf-8"),
+          });
+        }
+
+        if (virtualFiles.length === 0) {
+          return { success: false, error: "No supported files found" };
+        }
+
+        // Ingest via orchestrator
+        const result = await this.orchestrator.ingestVirtual({
+          virtualFiles,
+          metadata,
+          sourceIdentifier: isZip ? "zip-upload" : "file-upload",
+        });
+
+        // Generate embeddings
+        const embeddingsGenerated = await this.orchestrator.generateEmbeddingsForDocument(documentId);
+
+        // LLM Enrichment (if enabled)
+        let enrichmentResult = null;
+        if (enrichmentEnabled && this.enrichment) {
+          logger.info(`[Upload] Running LLM enrichment for ${documentId}...`);
+
+          // Query ONLY document/text nodes for enrichment (NOT code)
+          // Includes: markdown, documents, web pages, and vision-described media
+          // Excludes: Scope (code), CodeBlock (code in markdown)
+          const nodesResult = await this.neo4j!.run(`
+            MATCH (n)
+            WHERE n.documentId = $documentId
+            AND (
+              n:MarkdownSection OR n:MarkdownDocument OR
+              n:PDFDocument OR n:WordDocument OR n:DataFile OR
+              n:WebPage OR
+              n:ImageFile OR n:ThreeDFile OR n:MediaFile
+            )
+            AND NOT n:CodeBlock
+            RETURN n.uuid AS uuid, labels(n)[0] AS nodeType, n.name AS name,
+                   coalesce(n.content, n.rawContent, n.textContent, n.description, n.visionDescription, n.ocrText, '') AS content
+            LIMIT 50
+          `, { documentId });
+
+          const nodes: NodeToEnrich[] = nodesResult.records.map((r) => ({
+            uuid: r.get("uuid"),
+            nodeType: r.get("nodeType"),
+            name: r.get("name") || "Untitled",
+            content: r.get("content") || "",
+          }));
+
+          if (nodes.length > 0) {
+            const context: DocumentContext = {
+              documentId,
+              title: metadata.documentTitle,
+              projectId,
+              nodes,
+            };
+
+            this.enrichment.updateOptions(enrichmentOptions);
+            enrichmentResult = await this.enrichment.enrichDocument(context);
+
+            // Store entities with CONTAINS_ENTITY relationships to source nodes
+            let entitiesCreated = 0;
+            let containsRelCreated = 0;
+
+            if (enrichmentResult.nodeEnrichments) {
+              for (const nodeEnrich of enrichmentResult.nodeEnrichments) {
+                // Create entities linked to their source node
+                if (nodeEnrich.entities && nodeEnrich.entities.length > 0) {
+                  for (const entity of nodeEnrich.entities) {
+                    await this.neo4j!.run(`
+                      // Create Entity node
+                      CREATE (e:Entity {
+                        uuid: randomUUID(),
+                        name: $name,
+                        normalizedName: toLower($name),
+                        entityType: $type,
+                        confidence: $confidence,
+                        aliases: $aliases,
+                        projectId: $projectId,
+                        documentId: $documentId,
+                        sourceNodeId: $sourceNodeId,
+                        createdAt: datetime()
+                      })
+                      // Link to source node via CONTAINS_ENTITY
+                      WITH e
+                      MATCH (source {uuid: $sourceNodeId})
+                      CREATE (source)-[:CONTAINS_ENTITY {confidence: $confidence}]->(e)
+                    `, {
+                      name: entity.name,
+                      type: entity.type,
+                      confidence: entity.confidence,
+                      aliases: entity.aliases || [],
+                      projectId,
+                      documentId,
+                      sourceNodeId: nodeEnrich.nodeId,
+                    });
+                    entitiesCreated++;
+                    containsRelCreated++;
+                  }
+                }
+
+                // Create HAS_TAG relationships to source nodes
+                if (nodeEnrich.tags && nodeEnrich.tags.length > 0) {
+                  for (const tag of nodeEnrich.tags) {
+                    await this.neo4j!.run(`
+                      // Get or create Tag node
+                      MERGE (t:Tag {name: $name})
+                      ON CREATE SET t.uuid = randomUUID(), t.category = $category,
+                                    t.normalizedName = toLower(replace($name, ' ', '-')),
+                                    t.createdAt = datetime()
+                      SET t.projectIds = CASE
+                        WHEN $projectId IN coalesce(t.projectIds, []) THEN t.projectIds
+                        ELSE coalesce(t.projectIds, []) + $projectId
+                      END,
+                      t.usageCount = coalesce(t.usageCount, 0) + 1
+                      // Link to source node
+                      WITH t
+                      MATCH (source {uuid: $sourceNodeId})
+                      MERGE (source)-[:HAS_TAG]->(t)
+                    `, {
+                      name: tag.name,
+                      category: tag.category || "other",
+                      projectId,
+                      sourceNodeId: nodeEnrich.nodeId,
+                    });
+                  }
+                }
+              }
+            }
+
+            logger.info(`[Upload] Created ${entitiesCreated} Entity nodes, ${containsRelCreated} CONTAINS_ENTITY relations`);
+          }
+        }
+
+        return {
+          success: true,
+          documentId,
+          fileName,
+          filesIngested: virtualFiles.length,
+          nodesCreated: result.nodesCreated,
+          relationshipsCreated: result.relationshipsCreated,
+          embeddingsGenerated,
+          enrichment: enrichmentResult ? {
+            entitiesExtracted: enrichmentResult.entities.length,
+            tagsExtracted: enrichmentResult.tags.length,
+            suggestedCategory: enrichmentResult.suggestedCategory,
+            processingTimeMs: enrichmentResult.metadata.processingTimeMs,
+          } : null,
+        };
+      } catch (err: any) {
+        logger.error(`[Upload] Failed: ${err.message}`);
+        reply.status(500);
+        return { success: false, error: err.message };
+      }
+    });
+
+    // =========================================================================
+    // Admin: Entity Resolution (cross-document deduplication)
+    // =========================================================================
+    this.server.post<{
+      Body: {
+        dryRun?: boolean;
+        minSimilarity?: number;
+        maxEntities?: number;
+      };
+    }>("/admin/resolve-entities", async (request, reply) => {
+      if (!this.enrichment) {
+        reply.status(400);
+        return { success: false, error: "ANTHROPIC_API_KEY not configured - entity resolution requires LLM" };
+      }
+
+      const { dryRun = false, minSimilarity = 0.8, maxEntities = 500 } = request.body || {};
+
+      logger.info(`[Admin] Entity resolution started (dryRun: ${dryRun})`);
+
+      try {
+        const resolutionService = new EntityResolutionService(
+          this.neo4j!,
+          process.env.ANTHROPIC_API_KEY!,
+          { dryRun, minSimilarity, maxEntities }
+        );
+
+        const result = await resolutionService.resolveEntities();
+        const canonicalMergeResult = await resolutionService.mergeCanonicals();
+        const tagResult = await resolutionService.resolveTags();
+
+        // Generate embeddings for Entity/Tag nodes (for hybrid search)
+        let embeddingResult = null;
+        if (this.entityEmbedding && !dryRun) {
+          logger.info("[Admin] Generating embeddings for Entity/Tag nodes...");
+          embeddingResult = await this.entityEmbedding.generateEmbeddings();
+          logger.info(`[Admin] Entity embeddings: ${embeddingResult.entitiesEmbedded} entities, ${embeddingResult.tagsEmbedded} tags`);
+        }
+
+        logger.info(`[Admin] Resolution complete: ${result.merged.length} entities merged, ${result.created.length} created, ${canonicalMergeResult.merged} canonicals deduplicated, ${tagResult.llmMerged} tags LLM-merged`);
+
+        return {
+          success: true,
+          entities: {
+            merged: result.merged.length,
+            created: result.created.length,
+            totalProcessed: result.totalProcessed,
+            canonicalsMerged: canonicalMergeResult.merged,
+          },
+          tags: tagResult,
+          embeddings: embeddingResult ? {
+            entitiesEmbedded: embeddingResult.entitiesEmbedded,
+            tagsEmbedded: embeddingResult.tagsEmbedded,
+            skipped: embeddingResult.skipped,
+            durationMs: embeddingResult.durationMs,
+          } : null,
+          processingTimeMs: result.processingTimeMs,
+          dryRun,
+        };
+      } catch (err: any) {
+        logger.error(`[Admin] Entity resolution failed: ${err.message}`);
+        reply.status(500);
+        return { success: false, error: err.message };
+      }
+    });
+
+    // Shutdown
+    this.server.post("/shutdown", async () => {
+      setTimeout(() => this.shutdown(), 100);
+      return { status: "shutting_down" };
+    });
+  }
+
+  async start(port: number = DEFAULT_PORT): Promise<void> {
+    await this.server.listen({ port, host: "127.0.0.1" });
+    logger.info(`Community API listening on http://127.0.0.1:${port}`);
+    logger.info(`Logs: ${LOG_FILES.dir}`);
+    console.log(`📚 Community Docs API running on http://127.0.0.1:${port}`);
+    console.log(`📝 Logs: ${LOG_FILES.dir}`);
+  }
+
+  async shutdown(): Promise<void> {
+    logger.info( "Shutting down...");
+    if (this.orchestrator) {
+      await this.orchestrator.stop();
+    }
+    await closeNeo4jClient();
+    await this.server.close();
+    process.exit(0);
+  }
+}
+
+export async function startCommunityAPI(options: { port?: number } = {}): Promise<void> {
+  const api = new CommunityAPIServer();
+  await api.initialize();
+  await api.start(options.port);
+}
+
+const isMainModule = process.argv[1]?.includes("community-api") || process.argv[1]?.includes("api/server");
+if (isMainModule) {
+  startCommunityAPI().catch((err) => {
+    console.error("Failed to start:", err);
+    process.exit(1);
+  });
+}

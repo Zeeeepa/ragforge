@@ -1,0 +1,152 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// === Auth Models (NextAuth) ===
+
+model User {
+  id            String    @id @default(cuid())
+  discordId     String    @unique
+  username      String
+  email         String?   @unique
+  avatar        String?
+  role          Role      @default(READ)
+
+  // Relations
+  documents     Document[]
+  sessions      Session[]
+  accounts      Account[]
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// === Application Models ===
+
+model Category {
+  id          String     @id @default(cuid())
+  name        String     @unique
+  slug        String     @unique
+  description String?
+  icon        String?    // Lucide icon name
+
+  documents   Document[]
+
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+}
+
+model Document {
+  id          String      @id @default(cuid())
+  title       String
+  description String?
+  type        DocType
+
+  // Storage abstraction (VFS)
+  storageType StorageType @default(LOCAL)
+  storageRef  String      // UUID or relative path
+  virtualPath String      // "/category/project/README.md" for display
+  sourceUrl   String?     // GitHub URL for GITHUB type
+
+  // Relations
+  categoryId  String
+  category    Category    @relation(fields: [categoryId], references: [id])
+  uploadedById String
+  uploadedBy  User        @relation(fields: [uploadedById], references: [id])
+
+  // Neo4j link
+  projectId   String      // RagForge project ID in Neo4j
+
+  // Status
+  status      DocStatus   @default(PENDING)
+  nodeCount   Int         @default(0)
+  errorMessage String?
+
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+  ingestedAt  DateTime?
+}
+
+// === Enums ===
+
+enum Role {
+  READ
+  WRITE
+  ADMIN
+}
+
+enum StorageType {
+  LOCAL   // Local filesystem (MVP)
+  S3      // S3/R2 (future)
+  GITHUB  // Reference only, no storage
+  INLINE  // Small content in DB
+}
+
+enum DocType {
+  // Repository types
+  GITHUB_REPO
+  ZIP_ARCHIVE
+
+  // Documents
+  PDF
+  DOCX
+  XLSX
+  CSV
+
+  // Code files
+  TYPESCRIPT
+  JAVASCRIPT
+  PYTHON
+  VUE
+  SVELTE
+  HTML
+  CSS
+
+  // Data files
+  MARKDOWN
+  JSON_FILE
+  YAML
+
+  // Media
+  IMAGE
+  THREE_D_MODEL
+}
+
+enum DocStatus {
+  PENDING
+  INGESTING
+  READY
+  ERROR
+}

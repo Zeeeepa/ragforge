@@ -592,7 +592,7 @@ export const FIELD_MAPPING: Record<string, NodeFieldMapping> = {
     title: (n) => n.signature || n.name || null,
     content: (n) => n.source || null,
     description: (n) => n.docstring || null,
-    location: (n) => n.file || null,
+    location: (n) => n.absolutePath || n.file || null,
   },
 
   File: {
@@ -606,7 +606,7 @@ export const FIELD_MAPPING: Record<string, NodeFieldMapping> = {
     title: (n) => n.language ? `${n.language} code block` : 'code block',
     content: (n) => n.code || null,
     description: (n) => null, // Language already in title
-    location: (n) => n.file || null,
+    location: (n) => n.absolutePath || n.file || null,
   },
 
   // === MARKDOWN ===
@@ -614,14 +614,14 @@ export const FIELD_MAPPING: Record<string, NodeFieldMapping> = {
     title: (n) => n.title || n.file || null,
     content: (n) => null, // No distinct content for document node
     description: (n) => n.frontMatter || null,
-    location: (n) => n.file || null,
+    location: (n) => n.absolutePath || n.file || null,
   },
 
   MarkdownSection: {
     title: (n) => n.title || null,
     content: (n) => n.ownContent || n.content || null,
     description: (n) => null, // rawText would duplicate content
-    location: (n) => n.file || null,
+    location: (n) => n.absolutePath || n.file || null,
   },
 
   // === WEB ===
@@ -762,14 +762,27 @@ export function getNodeDescription(node: Record<string, any>, nodeType: string):
 
 /**
  * Get the location (file path, URL) of a node according to its type.
+ * For binary documents parsed to markdown, restores original filename.
  */
 export function getNodeLocation(node: Record<string, any>, nodeType: string): string | null {
   const mapping = FIELD_MAPPING[nodeType];
+  let location: string | null = null;
+
   if (mapping) {
-    return mapping.location(node);
+    location = mapping.location(node);
+  } else {
+    // Fallback: try common fields (prefer absolutePath for virtual files)
+    location = node.absolutePath || node.file || node.path || node.url || null;
   }
-  // Fallback: try common fields
-  return node.file || node.path || node.url || null;
+
+  // For binary documents converted to markdown (e.g., file.pdf.md → file.pdf)
+  // Use originalFileName stored in DB if available
+  if (location && typeof location === 'string' && node.originalFileName) {
+    const dir = location.substring(0, location.lastIndexOf('/') + 1);
+    return dir + node.originalFileName;
+  }
+
+  return location;
 }
 
 /**

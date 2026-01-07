@@ -1,0 +1,58 @@
+{
+  "name": "community-docs",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --port 3001",
+    "dev:webpack": "next dev --port 3001 --webpack",
+    "build": "prisma generate && next build --webpack",
+    "build:turbo": "prisma generate && next build --turbopack",
+    "build:standalone": "prisma generate && next build --webpack",
+    "start": "next start",
+    "lint": "eslint",
+    "db:push": "prisma db push",
+    "db:studio": "prisma studio",
+    "db:generate": "prisma generate",
+    "api": "npx tsx lib/ragforge/api/server.ts",
+    "api:dev": "npx tsx --watch lib/ragforge/api/server.ts"
+  },
+  "dependencies": {
+    "@auth/prisma-adapter": "^2.0.0",
+    "@fastify/cors": "^10.0.0",
+    "@fastify/multipart": "^9.3.0",
+    "@luciformresearch/ragforge": "*",
+    "@prisma/client": "^6.0.0",
+    "adm-zip": "^0.5.16",
+    "dotenv": "^17.2.3",
+    "fastify": "^5.0.0",
+    "highlight.js": "^11.11.1",
+    "mammoth": "^1.11.0",
+    "neo4j-driver": "^6.0.1",
+    "next": "16.0.10",
+    "next-auth": "^5.0.0-beta.25",
+    "pdf2json": "^4.0.0",
+    "react": "19.2.1",
+    "react-dom": "19.2.1",
+    "three": "^0.182.0",
+    "xlsx": "^0.18.5",
+    "zod": "^3.23.0"
+  },
+  "pnpm": {
+    "overrides": {
+      "@types/three": "^0.182.0"
+    }
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/adm-zip": "^0.5.7",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@types/three": "^0.182.0",
+    "eslint": "^9",
+    "eslint-config-next": "16.0.10",
+    "prisma": "^6.0.0",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}

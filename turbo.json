@@ -3,7 +3,12 @@
   "pipeline": {
     "build": {
       "dependsOn": ["^build"],
-      "outputs": ["dist/**"]
+      "outputs": ["dist/**", ".next/**"],
+      "inputs": ["src/**", "app/**", "lib/**", "components/**", "package.json", "tsconfig*.json"]
+    },
+    "build:standalone": {
+      "outputs": ["dist/**", ".next/**"],
+      "inputs": ["src/**", "app/**", "lib/**", "components/**", "package.json", "tsconfig*.json"]
     },
     "dev": {
       "cache": false,

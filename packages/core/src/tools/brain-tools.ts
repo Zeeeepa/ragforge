@@ -11,6 +11,14 @@
  */
 
 import { BrainManager, type QuickIngestOptions, type BrainSearchOptions, type QuickIngestResult, type UnifiedSearchResult, formatAsMarkdown, formatAsCompact, type BrainSearchOutput } from '../brain/index.js';
+import {
+  applyKeywordBoost,
+  exploreRelationships,
+  summarizeSearchResults,
+  rerankSearchResults,
+  type ExplorationGraph,
+  type SummaryResult,
+} from '../brain/search-post-processor.js';
 import type { GeneratedToolDefinition } from './types/index.js';
 import { getGlobalFetchCache, type CachedFetchResult } from './web-tools.js';
 import { NODE_SCHEMAS, CONTENT_NODE_LABELS, type NodeTypeSchema } from '../utils/node-schema.js';

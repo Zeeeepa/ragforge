@@ -64,6 +64,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.71.2",
     "@google/genai": "^1.28.0",
     "@google/generative-ai": "^0.24.1",
     "@luciformresearch/codeparsers": "file:../../../packages/codeparsers",
@@ -73,10 +74,10 @@
     "chokidar": "^3.5.3",
     "diff": "^8.0.2",
     "dotenv": "^16.3.1",
+    "fast-glob": "^3.3.2",
     "fast-xml-parser": "^4.3.0",
     "fastest-levenshtein": "^1.0.16",
     "glob-to-regexp": "^0.4.1",
-    "fast-glob": "^3.3.2",
     "js-yaml": "^4.1.1",
     "mammoth": "^1.11.0",
     "neo4j-driver": "^5.14.0",

@@ -29,6 +29,7 @@ import { UniversalSourceAdapter } from '../runtime/adapters/universal-source-ada
 import type { ParseResult } from '../runtime/adapters/types.js';
 import { formatLocalDate } from '../runtime/utils/timestamp.js';
 import { EmbeddingService, MULTI_EMBED_CONFIGS, type EmbeddingProviderConfig } from './embedding-service.js';
+import { SearchService, type SearchOptions, type ServiceSearchResult } from './search-service.js';
 import { TouchedFilesWatcher, type ProcessingStats as TouchedFilesStats } from './touched-files-watcher.js';
 import type { FileState } from './file-state-machine.js';
 import { CONTENT_NODE_LABELS } from '../utils/node-schema.js';
@@ -413,6 +414,7 @@ export class BrainManager {
   private sourceAdapter: UniversalSourceAdapter;
   private ingestionManager: IncrementalIngestionManager | null = null;
   private embeddingService: EmbeddingService | null = null;
+  private searchService: SearchService | null = null;
   private touchedFilesWatcher: TouchedFilesWatcher | null = null;
   private ingestionLock: IngestionLock;
   private embeddingLock: IngestionLock;
@@ -1548,6 +1550,14 @@ volumes:
     } else {
       console.log('[Brain] EmbeddingService initialized (no provider configured)');
     }
+
+    // Initialize search service (shared logic with community-docs)
+    this.searchService = new SearchService({
+      neo4jClient: this.neo4jClient,
+      embeddingService: this.embeddingService,
+      verbose: false,
+    });
+    console.log('[Brain] SearchService initialized');
 
     // Initialize touched-files watcher
     this.touchedFilesWatcher = new TouchedFilesWatcher({
@@ -3923,9 +3933,11 @@ volumes:
    * Waits for appropriate locks:
    * - Semantic search: waits for embedding lock (to get fresh embeddings)
    * - Text search: waits for ingestion lock (to get fresh content)
+   *
+   * Delegates to SearchService for the actual search logic (shared with community-docs).
    */
   async search(query: string, options: BrainSearchOptions = {}): Promise<UnifiedSearchResult> {
-    if (!this.neo4jClient) {
+    if (!this.neo4jClient || !this.searchService) {
       throw new Error('Brain not initialized. Call initialize() first.');
     }
 
@@ -3950,22 +3962,14 @@ volumes:
       await this.waitForPendingEdits(30000);
     }
 
-    const limit = Math.max(0, Math.floor(options.limit ?? 20));
-    const offset = Math.max(0, Math.floor(options.offset ?? 0));
-    const embeddingType = options.embeddingType || 'all';
-
-    // Build project filter
-    let projectFilter = '';
-    const params: Record<string, any> = {
-      query,
-      limit: neo4j.int(limit),
-      offset: neo4j.int(offset),
-    };
+    // Build raw filter clause for complex project/touched-files logic
+    let rawFilterClause = '';
+    const rawFilterParams: Record<string, any> = {};
 
     if (options.projects && options.projects.length > 0) {
       // Explicit project list - use exactly what was requested (ignores excluded flag)
-      projectFilter = 'AND n.projectId IN $projectIds';
-      params.projectIds = options.projects;
+      rawFilterClause = 'AND n.projectId IN $projectIds';
+      rawFilterParams.projectIds = options.projects;
     } else {
       // No explicit list - exclude projects marked as excluded
       const excludedProjectIds = Array.from(this.registeredProjects.values())
@@ -3973,106 +3977,69 @@ volumes:
         .map(p => p.id);
 
       if (excludedProjectIds.length > 0) {
-        projectFilter = 'AND NOT n.projectId IN $excludedProjectIds';
-        params.excludedProjectIds = excludedProjectIds;
+        rawFilterClause = 'AND NOT n.projectId IN $excludedProjectIds';
+        rawFilterParams.excludedProjectIds = excludedProjectIds;
       }
 
       // Also include touched-files (orphan files) if touchedFilesBasePath is set
       // Filter to only include files under the specified base path
       if (options.touchedFilesBasePath) {
-        params.touchedFilesBasePath = options.touchedFilesBasePath;
+        rawFilterParams.touchedFilesBasePath = options.touchedFilesBasePath;
         // Append OR condition for touched-files under base path
-        // Need to wrap existing filter and add OR
-        if (projectFilter) {
-          projectFilter = `AND ((n.projectId <> 'touched-files' ${projectFilter.substring(4)}) OR (n.projectId = 'touched-files' AND n.absolutePath STARTS WITH $touchedFilesBasePath))`;
+        if (rawFilterClause) {
+          rawFilterClause = `AND ((n.projectId <> 'touched-files' ${rawFilterClause.substring(4)}) OR (n.projectId = 'touched-files' AND n.absolutePath STARTS WITH $touchedFilesBasePath))`;
         } else {
-          projectFilter = `AND (n.projectId <> 'touched-files' OR (n.projectId = 'touched-files' AND n.absolutePath STARTS WITH $touchedFilesBasePath))`;
+          rawFilterClause = `AND (n.projectId <> 'touched-files' OR (n.projectId = 'touched-files' AND n.absolutePath STARTS WITH $touchedFilesBasePath))`;
         }
       }
     }
 
-    // Build node type filter (uses 'type' property, not labels)
-    let nodeTypeFilter = '';
+    // Build node type filter
     if (options.nodeTypes && options.nodeTypes.length > 0) {
-      // Normalize to lowercase for consistent matching
-      params.nodeTypes = options.nodeTypes.map(t => t.toLowerCase());
-      nodeTypeFilter = `AND n.type IN $nodeTypes`;
+      rawFilterParams.nodeTypes = options.nodeTypes.map(t => t.toLowerCase());
+      rawFilterClause += ' AND n.type IN $nodeTypes';
     }
 
-    // Build base path filter (only return nodes under this directory)
-    let basePathFilter = '';
+    // Build base path filter
     if (options.basePath) {
-      params.basePath = options.basePath;
-      basePathFilter = `AND n.absolutePath STARTS WITH $basePath`;
+      rawFilterParams.basePath = options.basePath;
+      rawFilterClause += ' AND n.absolutePath STARTS WITH $basePath';
     }
 
-    // Execute search
-    let results: BrainSearchResult[];
+    // Delegate to SearchService
+    const searchResult = await this.searchService.search({
+      query,
+      limit: options.limit,
+      offset: options.offset,
+      minScore: options.minScore,
+      semantic: options.semantic,
+      hybrid: options.hybrid,
+      embeddingType: options.embeddingType,
+      fuzzyDistance: options.fuzzyDistance,
+      rrfK: options.rrfK,
+      glob: options.glob,
+      rawFilterClause: rawFilterClause || undefined,
+      rawFilterParams: Object.keys(rawFilterParams).length > 0 ? rawFilterParams : undefined,
+    });
 
-    if (options.hybrid && options.semantic && this.embeddingService?.canGenerateEmbeddings()) {
-      // Hybrid search: combine semantic (vector) + BM25 (full-text) with RRF fusion
-      const minScore = options.minScore ?? 0.3;
-      const rrfK = options.rrfK ?? 60;
-      results = await this.hybridSearch(query, {
-        embeddingType,
-        projectFilter,
-        nodeTypeFilter,
-        basePathFilter,
-        params,
-        limit,
-        minScore,
-        rrfK,
-      });
-    } else if (options.semantic && this.embeddingService?.canGenerateEmbeddings()) {
-      // Semantic search using vector similarity
-      const minScore = options.minScore ?? 0.3; // Default threshold for semantic search
-      results = await this.vectorSearch(query, {
-        embeddingType,
-        projectFilter,
-        nodeTypeFilter,
-        basePathFilter,
-        params,
-        limit,
-        minScore,
-      });
-    } else {
-      // BM25 keyword search using full-text indexes (better than simple CONTAINS)
-      // Provides relevance scoring and fuzzy matching
-      results = await this.fullTextSearch(query, {
-        projectFilter,
-        nodeTypeFilter,
-        basePathFilter,
-        params,
-        limit,
-        minScore: options.minScore,
-        fuzzyDistance: options.fuzzyDistance,
-      });
-    }
+    // Map ServiceSearchResult to BrainSearchResult (enrich with project info)
+    const results: BrainSearchResult[] = searchResult.results.map(r => {
+      const projectId = r.node.projectId || 'unknown';
+      const project = this.registeredProjects.get(projectId);
+      const filePath = r.filePath || r.node.absolutePath || r.node.file || '';
 
-    // Apply glob filter if specified
-    if (options.glob) {
-      const globPattern = options.glob;
-      const beforeCount = results.length;
-      results = results.filter(r => {
-        // Prefer absolutePath for glob matching (supports absolute glob patterns)
-        const filePath = r.node.absolutePath || r.node.file || r.node.path || '';
-        const matches = matchesGlob(filePath, globPattern, true);
-        if (!matches && beforeCount <= 20) {
-          console.log(`[Brain.glob] REJECT: "${filePath}" vs pattern "${globPattern}"`);
-        }
-        return matches;
-      });
-      console.log(`[Brain.glob] Filter: ${beforeCount} -> ${results.length} (pattern: ${globPattern})`);
-    }
-
-    // Apply minScore filter if specified (for text search or post-filtering)
-    if (options.minScore !== undefined) {
-      results = results.filter(r => r.score >= options.minScore!);
-    }
-
-    // Total count is just the number of results returned
-    // (Full-text search doesn't easily provide a total count without a separate query)
-    const totalCount = results.length;
+      return {
+        node: r.node,
+        score: r.score,
+        projectId,
+        projectPath: project?.path || '',
+        projectType: project?.type || 'unknown',
+        filePath,
+        fileLineCount: r.node.lineCount,
+        matchedRange: r.matchedRange,
+        rrfDetails: r.rrfDetails,
+      };
+    });
 
     // Build list of actually searched projects
     const searchedProjects = options.projects
@@ -4083,760 +4050,13 @@ volumes:
 
     return {
       results,
-      totalCount,
+      totalCount: searchResult.totalCount,
       searchedProjects,
     };
   }
 
-  /**
-   * Vector similarity search using embeddings
-   * Uses Neo4j vector indexes for fast semantic search
-   */
-  private async vectorSearch(
-    query: string,
-    options: {
-      embeddingType: 'name' | 'content' | 'description' | 'all';
-      projectFilter: string;
-      nodeTypeFilter: string;
-      basePathFilter?: string;
-      params: Record<string, any>;
-      limit: number;
-      minScore: number;
-    }
-  ): Promise<BrainSearchResult[]> {
-    const { embeddingType, projectFilter, nodeTypeFilter, basePathFilter = '', params, limit, minScore } = options;
-
-    // Get query embedding
-    const queryEmbedding = await this.embeddingService!.getQueryEmbedding(query);
-    if (!queryEmbedding) {
-      console.warn('[BrainManager] Failed to get query embedding, falling back to text search');
-      return [];
-    }
-
-    // Determine which embedding properties to search
-    const embeddingProps: string[] = [];
-    if (embeddingType === 'name' || embeddingType === 'all') {
-      embeddingProps.push('embedding_name');
-    }
-    if (embeddingType === 'content' || embeddingType === 'all') {
-      embeddingProps.push('embedding_content');
-    }
-    if (embeddingType === 'description' || embeddingType === 'all') {
-      embeddingProps.push('embedding_description');
-    }
-
-    // Also include legacy 'embedding' property for backward compatibility
-    if (embeddingType === 'all') {
-      embeddingProps.push('embedding');
-    }
-
-    // Search each embedding type and collect results
-    const allResults: BrainSearchResult[] = [];
-    const seenUuids = new Set<string>();
-
-    // Collect EmbeddingChunk matches separately for normalization to parents
-    // Map: parentUuid -> best chunk match (highest score)
-    const chunkMatches = new Map<string, {
-      chunk: Record<string, any>;
-      score: number;
-      parentLabel: string;
-    }>();
-
-    // Build map of label -> embedding properties
-    const labelEmbeddingMap = new Map<string, Set<string>>();
-    for (const config of MULTI_EMBED_CONFIGS) {
-      const label = config.label;
-      if (!labelEmbeddingMap.has(label)) {
-        labelEmbeddingMap.set(label, new Set());
-      }
-      for (const embeddingConfig of config.embeddings) {
-        labelEmbeddingMap.get(label)!.add(embeddingConfig.propertyName);
-      }
-    }
-
-    // Also add legacy 'embedding' property for common labels
-    const legacyLabels = ['Scope', 'File', 'MarkdownSection', 'CodeBlock', 'MarkdownDocument'];
-    for (const label of legacyLabels) {
-      if (!labelEmbeddingMap.has(label)) {
-        labelEmbeddingMap.set(label, new Set());
-      }
-      labelEmbeddingMap.get(label)!.add('embedding');
-    }
-
-    // Add EmbeddingChunk for chunked content search
-    // EmbeddingChunk nodes are created for large content that was split into chunks
-    if (embeddingType === 'content' || embeddingType === 'all') {
-      labelEmbeddingMap.set('EmbeddingChunk', new Set(['embedding_content']));
-    }
-
-    // Build list of all (label, embeddingProp) combinations to search
-    const searchTasks: Array<{ label: string; embeddingProp: string; indexName: string }> = [];
-    for (const embeddingProp of embeddingProps) {
-      for (const [label, labelProps] of labelEmbeddingMap.entries()) {
-        // Only search if this label has this embedding property
-        if (!labelProps.has(embeddingProp)) continue;
-        const indexName = `${label.toLowerCase()}_${embeddingProp}_vector`;
-        searchTasks.push({ label, embeddingProp, indexName });
-      }
-    }
-
-    // Run all vector index queries in PARALLEL for massive speedup
-    // Previously sequential: 30-40 queries × 0.5-1s each = 15-40s
-    // Now parallel: ~1-2s total
-    const requestTopK = Math.min(limit * 3, 100);
-    const searchPromises = searchTasks.map(async ({ label, embeddingProp, indexName }) => {
-      const results: Array<{ rawNode: any; score: number; label: string }> = [];
-
-      try {
-        const cypher = `
-          CALL db.index.vector.queryNodes($indexName, $requestTopK, $queryEmbedding)
-          YIELD node AS n, score
-          WHERE score >= $minScore ${projectFilter} ${nodeTypeFilter} ${basePathFilter}
-          RETURN n, score
-          ORDER BY score DESC
-          LIMIT $limit
-        `;
-
-        const result = await this.neo4jClient!.run(cypher, {
-          indexName,
-          requestTopK: neo4j.int(requestTopK),
-          queryEmbedding,
-          minScore,
-          ...params,
-          limit: neo4j.int(limit),
-        });
-
-        for (const record of result.records) {
-          results.push({
-            rawNode: record.get('n').properties,
-            score: record.get('score'),
-            label,
-          });
-        }
-      } catch (err: any) {
-        // Vector index might not exist yet, fall back to manual search
-        if (err.message?.includes('does not exist') || err.message?.includes('no such vector')) {
-          try {
-            const fallbackCypher = `
-              MATCH (n:\`${label}\`)
-              WHERE n.\`${embeddingProp}\` IS NOT NULL ${projectFilter} ${nodeTypeFilter}
-              RETURN n
-              LIMIT 500
-            `;
-
-            const fallbackResult = await this.neo4jClient!.run(fallbackCypher, params);
-
-            for (const record of fallbackResult.records) {
-              const rawNode = record.get('n').properties;
-              const nodeEmbedding = rawNode[embeddingProp];
-              if (!nodeEmbedding || !Array.isArray(nodeEmbedding)) continue;
-
-              const score = this.cosineSimilarity(queryEmbedding, nodeEmbedding);
-              if (score < minScore) continue;
-
-              results.push({ rawNode, score, label });
-            }
-          } catch (fallbackErr: any) {
-            console.debug(`[BrainManager] Fallback search failed for ${label}.${embeddingProp}: ${fallbackErr.message}`);
-          }
-        } else {
-          console.debug(`[BrainManager] Vector search failed for ${indexName}: ${err.message}`);
-        }
-      }
-
-      return results;
-    });
-
-    // Wait for all parallel queries to complete
-    const allQueryResults = await Promise.all(searchPromises);
-
-    // Merge results from all queries (deduplicate and handle chunks)
-    for (const queryResults of allQueryResults) {
-      for (const { rawNode, score, label } of queryResults) {
-        const uuid = rawNode.uuid;
-
-        // Handle EmbeddingChunk: collect for later normalization to parent
-        if (label === 'EmbeddingChunk') {
-          const parentUuid = rawNode.parentUuid;
-          const parentLabel = rawNode.parentLabel;
-
-          // Keep only the best match per parent
-          const existing = chunkMatches.get(parentUuid);
-          if (!existing || score > existing.score) {
-            chunkMatches.set(parentUuid, {
-              chunk: rawNode,
-              score,
-              parentLabel,
-            });
-          }
-          continue; // Don't add chunk directly to results
-        }
-
-        // Skip duplicates for regular nodes
-        if (seenUuids.has(uuid)) continue;
-        seenUuids.add(uuid);
-
-        const projectId = rawNode.projectId || 'unknown';
-        const project = this.registeredProjects.get(projectId);
-        const projectPath = project?.path || 'unknown';
-
-        // Build absolute file path: projectPath + "/" + node.file
-        const nodeFile = rawNode.file || rawNode.path || '';
-        const filePath = projectPath !== 'unknown' && nodeFile
-          ? path.join(projectPath, nodeFile)
-          : nodeFile || 'unknown';
-
-        allResults.push({
-          node: this.stripEmbeddingFields(rawNode),
-          score,
-          projectId,
-          projectPath,
-          projectType: project?.type || 'unknown',
-          filePath, // Absolute path to the file
-        });
-      }
-    }
-
-    // Normalize EmbeddingChunk matches to parent nodes
-    if (chunkMatches.size > 0) {
-      // Group by parentLabel for batched fetching
-      const byLabel = new Map<string, string[]>();
-      for (const [parentUuid, match] of chunkMatches.entries()) {
-        const label = match.parentLabel;
-        if (!byLabel.has(label)) {
-          byLabel.set(label, []);
-        }
-        byLabel.get(label)!.push(parentUuid);
-      }
-
-      // Fetch parent nodes in batches by label
-      for (const [label, parentUuids] of byLabel.entries()) {
-        try {
-          const parentResult = await this.neo4jClient!.run(
-            `MATCH (n:\`${label}\`) WHERE n.uuid IN $uuids RETURN n`,
-            { uuids: parentUuids }
-          );
-
-          for (const record of parentResult.records) {
-            const parentNode = record.get('n').properties;
-            const parentUuid = parentNode.uuid;
-
-            // Skip if parent already in results (from direct embedding match)
-            if (seenUuids.has(parentUuid)) continue;
-            seenUuids.add(parentUuid);
-
-            const match = chunkMatches.get(parentUuid)!;
-            const chunk = match.chunk;
-
-            const projectId = parentNode.projectId || 'unknown';
-            const project = this.registeredProjects.get(projectId);
-            const projectPath = project?.path || 'unknown';
-
-            // Build absolute file path
-            const nodeFile = parentNode.file || parentNode.path || '';
-            const filePath = projectPath !== 'unknown' && nodeFile
-              ? path.join(projectPath, nodeFile)
-              : nodeFile || 'unknown';
-
-            allResults.push({
-              node: this.stripEmbeddingFields(parentNode),
-              score: match.score, // Use chunk match score
-              projectId,
-              projectPath,
-              projectType: project?.type || 'unknown',
-              filePath,
-              matchedRange: {
-                startLine: chunk.startLine ?? 1,
-                endLine: chunk.endLine ?? 1,
-                startChar: chunk.startChar ?? 0,
-                endChar: chunk.endChar ?? 0,
-                chunkIndex: chunk.chunkIndex ?? 0,
-                chunkScore: match.score,
-              },
-            });
-          }
-        } catch (err: any) {
-          console.debug(`[BrainManager] Failed to fetch parent nodes for ${label}: ${err.message}`);
-        }
-      }
-    }
-
-    // Sort by score and limit
-    allResults.sort((a, b) => b.score - a.score);
-    const limitedResults = allResults.slice(0, limit);
-
-    // Enrich results with file lineCount (for agent context)
-    // Collect unique file paths and query File nodes for lineCount
-    try {
-      const uniqueFiles = new Map<string, { projectId: string; relPath: string }>();
-      for (const r of limitedResults) {
-        const relPath = r.node.file || r.node.path;
-        if (relPath && r.projectId) {
-          const key = `${r.projectId}:${relPath}`;
-          if (!uniqueFiles.has(key)) {
-            uniqueFiles.set(key, { projectId: r.projectId, relPath });
-          }
-        }
-      }
-
-      if (uniqueFiles.size > 0) {
-        const fileInfos = Array.from(uniqueFiles.values());
-        const lineCountQuery = `
-          UNWIND $files AS f
-          MATCH (file:File {projectId: f.projectId, path: f.relPath})
-          RETURN f.projectId + ':' + f.relPath AS key, file.lineCount AS lineCount
-        `;
-        const lineCountResult = await this.neo4jClient!.run(lineCountQuery, { files: fileInfos });
-
-        const lineCountMap = new Map<string, number>();
-        for (const record of lineCountResult.records) {
-          const key = record.get('key');
-          const lineCount = record.get('lineCount');
-          if (key && lineCount) {
-            lineCountMap.set(key, typeof lineCount === 'object' ? lineCount.toNumber() : lineCount);
-          }
-        }
-
-        // Add lineCount to results
-        for (const r of limitedResults) {
-          const relPath = r.node.file || r.node.path;
-          if (relPath && r.projectId) {
-            const key = `${r.projectId}:${relPath}`;
-            const lineCount = lineCountMap.get(key);
-            if (lineCount) {
-              (r as any).fileLineCount = lineCount;
-            }
-          }
-        }
-      }
-    } catch (err) {
-      // Non-critical: lineCount is for UX, don't fail search
-      console.debug('[BrainManager] Failed to enrich results with lineCount:', err);
-    }
-
-    return limitedResults;
-  }
-
-  /**
-   * Compute cosine similarity between two vectors
-   */
-  private cosineSimilarity(a: number[], b: number[]): number {
-    if (a.length !== b.length) return 0;
-
-    let dotProduct = 0;
-    let normA = 0;
-    let normB = 0;
-
-    for (let i = 0; i < a.length; i++) {
-      dotProduct += a[i] * b[i];
-      normA += a[i] * a[i];
-      normB += b[i] * b[i];
-    }
-
-    if (normA === 0 || normB === 0) return 0;
-    return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
-  }
-
-  /**
-   * Full-text search using Neo4j Lucene indexes (BM25)
-   * Searches across all full-text indexes in PARALLEL and returns results with BM25 scores
-   */
-  private async fullTextSearch(
-    query: string,
-    options: {
-      projectFilter: string;
-      nodeTypeFilter: string;
-      basePathFilter?: string;
-      params: Record<string, any>;
-      limit: number;
-      minScore?: number;
-      fuzzyDistance?: 0 | 1 | 2;
-    }
-  ): Promise<BrainSearchResult[]> {
-    const { projectFilter, nodeTypeFilter, basePathFilter = '', params, limit, minScore, fuzzyDistance = 1 } = options;
-
-    // Full-text index names to search (aligned with ensureFullTextIndexes)
-    const fullTextIndexes = [
-      'scope_fulltext',
-      'file_fulltext',
-      'datafile_fulltext',
-      'document_fulltext',
-      'markdown_fulltext',
-      'media_fulltext',
-      'webpage_fulltext',
-      'codeblock_fulltext',
-    ];
-
-    // Escape special Lucene characters in query
-    const escapedQuery = query.replace(/[+\-&|!(){}[\]^"~*?:\\/]/g, '\\$&');
-
-    // Use Lucene query syntax with fuzzy matching
-    // ~0 = exact match, ~1 = 1 edit distance, ~2 = 2 edit distances
-    const words = escapedQuery.split(/\s+/).filter(w => w.length > 0);
-    const luceneQuery = fuzzyDistance === 0
-      ? words.join(' ')
-      : words.map(w => `${w}~${fuzzyDistance}`).join(' ');
-
-    // Build a single UNION ALL query for all indexes (1 network round-trip instead of 8)
-    const unionClauses = fullTextIndexes.map(indexName => `
-      CALL db.index.fulltext.queryNodes('${indexName}', $luceneQuery)
-      YIELD node AS n, score
-      WHERE true ${projectFilter} ${nodeTypeFilter} ${basePathFilter}
-      RETURN n, score
-    `);
-
-    const cypher = `
-      ${unionClauses.join('\nUNION ALL\n')}
-      ORDER BY score DESC
-      LIMIT $limit
-    `;
-
-    try {
-      const result = await this.neo4jClient!.run(cypher, {
-        luceneQuery,
-        ...params,
-        limit: neo4j.int(limit * 2), // Fetch more to account for deduplication
-      });
-
-      // Process results
-      const allResults: BrainSearchResult[] = [];
-      const seenUuids = new Set<string>();
-
-      for (const record of result.records) {
-        const rawNode = record.get('n').properties;
-        const uuid = rawNode.uuid;
-        const score = record.get('score');
-
-        // Skip duplicates (same node may appear in multiple indexes)
-        if (seenUuids.has(uuid)) continue;
-        seenUuids.add(uuid);
-
-        // Apply minScore filter if specified
-        if (minScore !== undefined && score < minScore) continue;
-
-        const projectId = rawNode.projectId || 'unknown';
-        const project = this.registeredProjects.get(projectId);
-        const projectPath = project?.path || 'unknown';
-
-        const nodeFile = rawNode.file || rawNode.path || '';
-        const filePath = projectPath !== 'unknown' && nodeFile
-          ? path.join(projectPath, nodeFile)
-          : nodeFile || 'unknown';
-
-        allResults.push({
-          node: this.stripEmbeddingFields(rawNode),
-          score,
-          projectId,
-          projectPath,
-          projectType: project?.type || 'unknown',
-          filePath,
-        });
-
-        // Stop if we have enough results
-        if (allResults.length >= limit) break;
-      }
-
-      return allResults;
-    } catch (err: any) {
-      // Fallback: if UNION fails (e.g., some indexes don't exist), try individual queries
-      console.debug(`[BrainManager] UNION ALL query failed, falling back to parallel queries: ${err.message}`);
-      return this.fullTextSearchFallback(luceneQuery, { ...options, basePathFilter });
-    }
-  }
-
-  /**
-   * Fallback method for full-text search when UNION ALL fails
-   * Executes queries in parallel against individual indexes
-   */
-  private async fullTextSearchFallback(
-    luceneQuery: string,
-    options: {
-      projectFilter: string;
-      nodeTypeFilter: string;
-      basePathFilter: string;
-      params: Record<string, any>;
-      limit: number;
-      minScore?: number;
-    }
-  ): Promise<BrainSearchResult[]> {
-    const { projectFilter, nodeTypeFilter, basePathFilter, params, limit, minScore } = options;
-
-    const fullTextIndexes = [
-      'scope_fulltext',
-      'file_fulltext',
-      'datafile_fulltext',
-      'document_fulltext',
-      'markdown_fulltext',
-      'media_fulltext',
-      'webpage_fulltext',
-      'codeblock_fulltext',
-    ];
-
-    const cypher = `
-      CALL db.index.fulltext.queryNodes($indexName, $luceneQuery)
-      YIELD node AS n, score
-      WHERE true ${projectFilter} ${nodeTypeFilter} ${basePathFilter}
-      RETURN n, score
-      ORDER BY score DESC
-      LIMIT $limit
-    `;
-
-    // Execute all index queries in PARALLEL
-    const queryPromises = fullTextIndexes.map(async (indexName) => {
-      try {
-        const result = await this.neo4jClient!.run(cypher, {
-          indexName,
-          luceneQuery,
-          ...params,
-          limit: neo4j.int(limit),
-        });
-        return { records: result.records };
-      } catch (err: any) {
-        if (!err.message?.includes('does not exist')) {
-          console.debug(`[BrainManager] Full-text search failed for ${indexName}: ${err.message}`);
-        }
-        return { records: [] };
-      }
-    });
-
-    const queryResults = await Promise.all(queryPromises);
-
-    // Merge results from all indexes
-    const allResults: BrainSearchResult[] = [];
-    const seenUuids = new Set<string>();
-
-    for (const { records } of queryResults) {
-      for (const record of records) {
-        const rawNode = record.get('n').properties;
-        const uuid = rawNode.uuid;
-        const score = record.get('score');
-
-        if (seenUuids.has(uuid)) continue;
-        seenUuids.add(uuid);
-
-        if (minScore !== undefined && score < minScore) continue;
-
-        const projectId = rawNode.projectId || 'unknown';
-        const project = this.registeredProjects.get(projectId);
-        const projectPath = project?.path || 'unknown';
-
-        const nodeFile = rawNode.file || rawNode.path || '';
-        const filePath = projectPath !== 'unknown' && nodeFile
-          ? path.join(projectPath, nodeFile)
-          : nodeFile || 'unknown';
-
-        allResults.push({
-          node: this.stripEmbeddingFields(rawNode),
-          score,
-          projectId,
-          projectPath,
-          projectType: project?.type || 'unknown',
-          filePath,
-        });
-      }
-    }
-
-    allResults.sort((a, b) => b.score - a.score);
-    return allResults.slice(0, limit);
-  }
-
-  /**
-   * Reciprocal Rank Fusion (RRF) to combine results from multiple search methods
-   * RRF score = sum(1 / (k + rank)) for each search method
-   *
-   * @param resultSets - Array of result sets, each already sorted by their respective scores
-   * @param k - RRF constant (default: 60, from the original RRF paper)
-   * @returns Fused results sorted by RRF score
-   */
-  private rrfFusion(
-    resultSets: BrainSearchResult[][],
-    k: number = 60
-  ): BrainSearchResult[] {
-    // Map: uuid -> { result, rrfScore, ranks: { semantic: number, bm25: number, ... } }
-    const fusedMap = new Map<string, {
-      result: BrainSearchResult;
-      rrfScore: number;
-      ranks: Record<string, number>;
-      originalScores: Record<string, number>;
-    }>();
-
-    // Process each result set
-    resultSets.forEach((results, setIndex) => {
-      const setName = setIndex === 0 ? 'semantic' : 'bm25';
-
-      results.forEach((result, rank) => {
-        const uuid = result.node.uuid;
-        const rrfContribution = 1 / (k + rank + 1); // rank is 0-indexed, so +1
-
-        if (fusedMap.has(uuid)) {
-          const existing = fusedMap.get(uuid)!;
-          existing.rrfScore += rrfContribution;
-          existing.ranks[setName] = rank + 1;
-          existing.originalScores[setName] = result.score;
-        } else {
-          fusedMap.set(uuid, {
-            result,
-            rrfScore: rrfContribution,
-            ranks: { [setName]: rank + 1 },
-            originalScores: { [setName]: result.score },
-          });
-        }
-      });
-    });
-
-    // Convert to array and sort by RRF score
-    const fusedResults = Array.from(fusedMap.values())
-      .sort((a, b) => b.rrfScore - a.rrfScore)
-      .map(item => ({
-        ...item.result,
-        score: item.rrfScore, // Replace original score with RRF score
-        rrfDetails: {
-          ranks: item.ranks,
-          originalScores: item.originalScores,
-        },
-      }));
-
-    return fusedResults;
-  }
-
-  /**
-   * Hybrid search combining semantic (vector) and BM25 (full-text) search
-   * Uses Reciprocal Rank Fusion (RRF) to merge results
-   */
-  private async hybridSearch(
-    query: string,
-    options: {
-      embeddingType: 'name' | 'content' | 'description' | 'all';
-      projectFilter: string;
-      nodeTypeFilter: string;
-      params: Record<string, any>;
-      limit: number;
-      minScore: number;
-      rrfK: number;
-      basePathFilter?: string;
-    }
-  ): Promise<BrainSearchResult[]> {
-    const { embeddingType, projectFilter, nodeTypeFilter, basePathFilter, params, limit, minScore, rrfK } = options;
-
-    // Run semantic and BM25 searches in parallel
-    // Fetch more candidates for better fusion (3x limit)
-    const candidateLimit = Math.min(limit * 3, 150);
-
-    const [semanticResults, bm25Results] = await Promise.all([
-      this.vectorSearch(query, {
-        embeddingType,
-        projectFilter,
-        nodeTypeFilter,
-        basePathFilter,
-        params,
-        limit: candidateLimit,
-        minScore: Math.max(minScore * 0.5, 0.1), // Lower threshold for candidates
-      }),
-      this.fullTextSearch(query, {
-        projectFilter,
-        nodeTypeFilter,
-        basePathFilter,
-        params,
-        limit: candidateLimit,
-        minScore: undefined, // BM25 scores are not normalized, don't filter
-      }),
-    ]);
-
-    console.log(`[Brain.hybridSearch] Semantic: ${semanticResults.length}, BM25: ${bm25Results.length}`);
-
-    // Hybrid strategy: semantic-first with BM25 boost + top BM25-only results
-    // 1. Semantic results are primary
-    // 2. BM25 boosts semantic results that also match keywords
-    // 3. Top BM25-only results are included with reduced score (for exact keyword matches)
-
-    const bm25BoostFactor = 0.3; // Max 30% boost for top BM25 matches
-    const bm25OnlyTopN = 5; // Include top N BM25-only results
-    const bm25OnlyScoreBase = 0.4; // Base score for BM25-only results (below typical semantic)
-
-    // Build maps for lookup
-    const semanticUuids = new Set<string>();
-    semanticResults.forEach(r => {
-      const uuid = r.node.uuid || r.node.path || r.filePath;
-      if (uuid) semanticUuids.add(uuid);
-    });
-
-    const bm25RankMap = new Map<string, number>();
-    bm25Results.forEach((r, idx) => {
-      const uuid = r.node.uuid || r.node.path || r.filePath;
-      if (uuid && !bm25RankMap.has(uuid)) {
-        bm25RankMap.set(uuid, idx + 1);
-      }
-    });
-
-    // Boost semantic results based on BM25 rank
-    const boostedResults: BrainSearchResult[] = semanticResults.map(r => {
-      const uuid = r.node.uuid || r.node.path || r.filePath;
-      const bm25Rank = bm25RankMap.get(uuid);
-
-      let boostedScore = r.score;
-      if (bm25Rank) {
-        // Boost formula: score * (1 + boost_factor / sqrt(rank))
-        // Rank 1 → +30%, Rank 4 → +15%, Rank 9 → +10%, etc.
-        const boost = bm25BoostFactor / Math.sqrt(bm25Rank);
-        boostedScore = r.score * (1 + boost);
-      }
-
-      return {
-        ...r,
-        score: boostedScore,
-        rrfDetails: {
-          searchType: 'semantic' as const,
-          originalSemanticScore: r.score,
-          bm25Rank: bm25Rank || null,
-          boostApplied: bm25Rank ? (boostedScore / r.score - 1) : 0,
-        },
-      };
-    });
-
-    // Add top BM25-only results (not in semantic results)
-    // These are exact keyword matches that might be relevant
-    let bm25OnlyCount = 0;
-    for (const r of bm25Results) {
-      if (bm25OnlyCount >= bm25OnlyTopN) break;
-
-      const uuid = r.node.uuid || r.node.path || r.filePath;
-      if (uuid && !semanticUuids.has(uuid)) {
-        const bm25Rank = bm25RankMap.get(uuid) || bm25OnlyCount + 1;
-        // Score decreases with rank: 0.4, 0.35, 0.3, 0.25, 0.2 for top 5
-        const bm25OnlyScore = bm25OnlyScoreBase - (bm25OnlyCount * 0.05);
-
-        boostedResults.push({
-          ...r,
-          score: bm25OnlyScore,
-          rrfDetails: {
-            searchType: 'bm25-only' as const,
-            bm25Rank,
-            note: 'Exact keyword match (not in semantic results)',
-          },
-        });
-        bm25OnlyCount++;
-      }
-    }
-
-    console.log(`[Brain.hybridSearch] Boosted: ${semanticResults.length} semantic + ${bm25OnlyCount} BM25-only`);
-
-    // Sort by score and return top results
-    boostedResults.sort((a, b) => b.score - a.score);
-    return boostedResults.slice(0, limit);
-  }
-
-  /**
-   * Strip embedding fields from node properties (they're huge and not useful in results)
-   */
-  private stripEmbeddingFields(node: Record<string, any>): Record<string, any> {
-    const result: Record<string, any> = {};
-    for (const [key, value] of Object.entries(node)) {
-      // Skip embedding fields and their hashes
-      if (key.startsWith('embedding') || key.endsWith('_hash')) continue;
-      result[key] = value;
-    }
-    return result;
-  }
+  // NOTE: vectorSearch, fullTextSearch, fullTextSearchFallback, hybridSearch, and stripEmbeddingFields
+  // have been moved to SearchService (search-service.ts) for code sharing with community-docs.
 
   // ============================================
   // Cleanup
@@ -5084,11 +4304,13 @@ volumes:
       // Ollama doesn't require an API key
       const ollamaConfig = this.config.embeddings?.ollama || {};
       return {
-        type: 'ollama',
-        baseUrl: ollamaConfig.baseUrl,
+        provider: 'ollama',
         model: ollamaConfig.model || this.config.embeddings?.model,
-        batchSize: ollamaConfig.batchSize,
-        timeout: ollamaConfig.timeout,
+        options: {
+          baseUrl: ollamaConfig.baseUrl,
+          batchSize: ollamaConfig.batchSize,
+          timeout: ollamaConfig.timeout,
+        },
       };
     }
 
@@ -5098,9 +4320,9 @@ volumes:
       return undefined; // No API key, can't generate embeddings
     }
     return {
-      type: 'gemini',
-      apiKey: geminiKey,
-      dimension: 3072,
+      provider: 'gemini',
+      api_key: geminiKey,
+      dimensions: 3072,
     };
   }
 

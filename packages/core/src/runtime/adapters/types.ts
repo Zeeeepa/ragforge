@@ -6,10 +6,47 @@
  */
 
 /**
+ * A virtual file that exists only in memory (not on disk).
+ * Used for scalable deployments where files are stored in databases/S3.
+ *
+ * @example
+ * const file: VirtualFile = {
+ *   path: '/docs/api.ts',
+ *   content: Buffer.from('export function hello() {}'),
+ * };
+ */
+export interface VirtualFile {
+  /**
+   * Virtual path for the file (used for naming and import resolution).
+   * Should look like a real path, e.g., '/project/src/utils.ts'
+   */
+  path: string;
+
+  /**
+   * File content as a Buffer or string.
+   * Buffer is preferred for binary files (images, PDFs).
+   * String is fine for text files (code, markdown).
+   */
+  content: Buffer | string;
+
+  /**
+   * Optional MIME type hint.
+   * If not provided, will be inferred from the file extension.
+   */
+  mimeType?: string;
+
+  /**
+   * Optional file metadata (e.g., upload timestamp, original filename).
+   */
+  metadata?: Record<string, unknown>;
+}
+
+/**
  * Configuration for a source to be parsed
  *
  * Supports multiple source types with auto-detection:
  * - 'files': Local files (code, documents, media) - parser auto-detected by extension
+ * - 'virtual': In-memory files (for scalable/serverless deployments)
  * - 'database': Database (PostgreSQL, Neo4j, MongoDB, etc.)
  * - 'api': REST/GraphQL API
  * - 'web': Web pages (crawler)
@@ -17,9 +54,11 @@
 export interface SourceConfig {
   /**
    * Type of source to ingest
+   * - 'files': Local files on disk
+   * - 'virtual': In-memory files (VirtualFile[])
    * Legacy 'code' and 'document' types are mapped to 'files'
    */
-  type: 'files' | 'database' | 'api' | 'web' | 'code' | 'document' | string;
+  type: 'files' | 'virtual' | 'database' | 'api' | 'web' | 'code' | 'document' | string;
 
   /**
    * @deprecated Adapter is now auto-detected based on file extension.
@@ -27,14 +66,21 @@ export interface SourceConfig {
    */
   adapter?: string;
 
-  /** Root directory or path to source */
+  /** Root directory or path to source (for type: 'files') */
   root?: string;
 
-  /** Glob patterns to include */
+  /** Glob patterns to include (for type: 'files') */
   include?: string[];
 
-  /** Glob patterns to exclude */
+  /** Glob patterns to exclude (for type: 'files') */
   exclude?: string[];
+
+  /**
+   * Virtual files to parse (for type: 'virtual').
+   * Each file contains its path and content in memory.
+   * No disk I/O - ideal for serverless/scalable deployments.
+   */
+  virtualFiles?: VirtualFile[];
 
   /** Track changes and store diffs in Neo4j (default: false) */
   track_changes?: boolean;

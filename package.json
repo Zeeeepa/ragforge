@@ -20,6 +20,7 @@
     "setup": "bash scripts/setup.sh",
     "prebuild": "npx tsx scripts/stop-daemon.ts || true",
     "build": "turbo run build",
+    "build:all": "turbo run build",
     "dev": "turbo run dev",
     "dev:link": "node scripts/use-local-deps.js",
     "dev:unlink": "node scripts/use-npm-deps.js",
@@ -27,8 +28,21 @@
     "lint": "turbo run lint",
     "format": "turbo run format",
     "clean": "turbo run clean",
-    "cli:build": "npm run build --workspace=@luciformresearch/ragforge-cli",
+
+    "core:build": "npm run build -w @luciformresearch/ragforge",
+    "core:dev": "npm run dev -w @luciformresearch/ragforge",
+    "core:clean": "npm run clean -w @luciformresearch/ragforge",
+
+    "cli:build": "npm run build -w @luciformresearch/ragforge-cli",
+    "cli:dev": "npm run dev -w @luciformresearch/ragforge-cli",
+    "cli:clean": "npm run clean -w @luciformresearch/ragforge-cli",
     "cli:init": "node packages/cli/dist/index.js init",
+
+    "hub:build": "npm run build -w community-docs",
+    "hub:dev": "npm run dev -w community-docs",
+    "hub:api": "npm run api -w community-docs",
+    "hub:api:dev": "npm run api:dev -w community-docs",
+
     "test:vertex": "tsx test-vertex-ai.ts",
     "test:gemini": "tsx test-gemini-complete.ts",
     "create-indexes": "tsx scripts/create-vector-indexes.ts",

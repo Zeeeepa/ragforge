@@ -3019,9 +3019,16 @@ Keep excerpts brief but informative.`,
       if (fieldName === 'uuid' && hasUuidField) {
         continue;
       }
-      
-      const required = fieldSchema.required ? ' (REQUIRED)' : '';
-      instructions.push(`    <${fieldName}>${fieldSchema.description}${required}</${fieldName}>`);
+
+      // Use generateXMLSchemaExample for complex types (arrays, objects)
+      if (fieldSchema.type === 'array' || fieldSchema.type === 'object') {
+        const exampleLines = this.generateXMLSchemaExample(fieldName, fieldSchema as OutputFieldSchema, 2);
+        instructions.push(...exampleLines);
+      } else {
+        // Simple types: just show description
+        const required = fieldSchema.required ? ' (REQUIRED)' : '';
+        instructions.push(`    <${fieldName}>${fieldSchema.description}${required}</${fieldName}>`);
+      }
 
       if (fieldSchema.prompt) {
         instructions.push(`    <!-- ${fieldSchema.prompt} -->`);
@@ -3033,7 +3040,10 @@ Keep excerpts brief but informative.`,
     
     if (hasUuidField && uuidField) {
       instructions.push('');
-      instructions.push(`IMPORTANT: Replace "UUID_VALUE" with the actual UUID from the input item (shown after "uuid: " in the item header).`);
+      instructions.push(`CRITICAL: The uuid attribute MUST be copied EXACTLY from the input item's "uuid" field.`);
+      instructions.push(`- Copy the COMPLETE value including any prefixes (e.g., "section:", "scope:", "file:")`);
+      instructions.push(`- Example: if input has "uuid: section:ABC-123", use uuid="section:ABC-123" (NOT "ABC-123")`);
+      instructions.push(`- Do NOT strip, modify, or reformat the UUID in any way`);
     }
 
     // Add global metadata instructions if provided

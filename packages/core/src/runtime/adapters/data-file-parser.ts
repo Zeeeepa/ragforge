@@ -339,13 +339,26 @@ function extractReferencesFromValue(
 
 /**
  * Parse JSON content
+ * Handles both standard JSON and JSON with comments (JSONC)
  */
 function parseJSON(content: string): any {
-  // Strip comments (using strip-json-comments or simple regex)
-  const withoutComments = content
-    .replace(/\/\*[\s\S]*?\*\//g, '') // Block comments
-    .replace(/\/\/.*$/gm, '');        // Line comments
-  return JSON.parse(withoutComments);
+  // Try standard JSON first (most common case)
+  try {
+    return JSON.parse(content);
+  } catch {
+    // If that fails, try stripping comments
+    // Use a safer approach that doesn't break URLs
+  }
+
+  // Strip block comments first (safe, can't be inside strings in valid JSON)
+  let stripped = content.replace(/\/\*[\s\S]*?\*\//g, '');
+
+  // For line comments, we need to be careful not to strip // inside strings
+  // Simple heuristic: only strip // at the start of a line (with optional whitespace)
+  // This won't catch all cases but avoids breaking URLs
+  stripped = stripped.replace(/^\s*\/\/.*$/gm, '');
+
+  return JSON.parse(stripped);
 }
 
 /**

@@ -10,7 +10,7 @@
 /**
  * Supported OCR providers
  */
-export type OCRProviderType = 'gemini' | 'replicate-deepseek' | 'tesseract';
+export type OCRProviderType = 'gemini' | 'replicate-deepseek' | 'tesseract' | 'claude';
 
 /**
  * Result of OCR extraction

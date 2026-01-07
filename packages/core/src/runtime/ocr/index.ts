@@ -10,4 +10,5 @@
 export * from './types.js';
 export { GeminiOCRProvider } from './GeminiOCRProvider.js';
 export { ReplicateOCRProvider } from './ReplicateOCRProvider.js';
+export { ClaudeOCRProvider } from './ClaudeOCRProvider.js';
 export { OCRService, getOCRService, type OCRServiceOptions } from './OCRService.js';

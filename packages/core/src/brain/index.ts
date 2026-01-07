@@ -24,6 +24,8 @@ export {
   hashContent,
   DEFAULT_EMBED_CONFIGS,
   MULTI_EMBED_CONFIGS,
+  // Standalone utility for ensuring vector indexes
+  ensureVectorIndexes,
   type EmbeddingType,
   type EmbeddingFieldConfig,
   type MultiEmbedNodeTypeConfig,
@@ -32,6 +34,9 @@ export {
   type GenerateEmbeddingsOptions,
   type GenerateMultiEmbeddingsOptions,
   type MultiEmbeddingResult,
+  type EnsureVectorIndexesOptions,
+  type EnsureVectorIndexesResult,
+  // EmbeddingProviderConfig is now unified - re-exported from types/config.ts
 } from './embedding-service.js';
 
 export {
@@ -62,15 +67,19 @@ export {
 
 export {
   extractReferences,
+  extractGenericReferences,
   resolveReference,
   resolveAllReferences,
+  resolveLooseReference,
   createReferenceRelations,
   resolvePendingImports,
+  resolveUnresolvedMentions,
   type ReferenceType,
   type RelationType,
   type ExtractedReference,
   type ResolvedReference,
   type ReferenceCreationResult,
+  type FuzzyMatchResult,
 } from './reference-extractor.js';
 
 export {
@@ -98,6 +107,17 @@ export {
   type EmbedProjectOptions,
 } from './embedding-coordinator.js';
 
+// SearchService (reusable search logic for brain_search and community-docs)
+export {
+  SearchService,
+  type SearchServiceConfig,
+  type SearchOptions,
+  type SearchFilter,
+  type FilterOperator,
+  type ServiceSearchResult,
+  type ServiceSearchResultSet,
+} from './search-service.js';
+
 // Formatters
 export {
   formatAsMarkdown,
@@ -105,3 +125,25 @@ export {
   type BrainSearchOutput,
   type FormatOptions,
 } from './formatters/index.js';
+
+// Search Post-Processor (shared post-processing logic for brain_search and community-docs)
+export {
+  applyKeywordBoost,
+  exploreRelationships,
+  summarizeSearchResults,
+  rerankSearchResults,
+  postProcessSearchResults,
+  type ProcessableSearchResult,
+  type KeywordBoostOptions,
+  type KeywordBoostResult,
+  type ExploreRelationshipsOptions,
+  type GraphNode,
+  type GraphEdge,
+  type ExplorationGraph,
+  type SummarizeOptions,
+  type SummaryResult,
+  type RerankOptions,
+  type RerankResult,
+  type PostProcessOptions,
+  type PostProcessResult,
+} from './search-post-processor.js';
