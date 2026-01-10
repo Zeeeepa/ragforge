@@ -27,6 +27,11 @@ export interface CommunityNodeMetadata {
 
   // Tags (future)
   tags?: string[];
+
+  // Media files (images, PDFs, 3D models)
+  mediaType?: "image" | "pdf" | "3d";
+  originalFile?: string;
+  renderedViews?: string[];
 }
 
 /**
@@ -46,14 +51,52 @@ export interface SearchFilters {
 export interface SearchResult {
   documentId: string;
   chunkId?: string;
+  /** Content snippet (truncated or chunk text for agent-friendly output) */
   content: string;
   score: number;
+  /** Source file path (e.g., "document.pdf", "image.png") */
+  sourcePath?: string;
+  /** Node type (e.g., "MarkdownSection", "MediaFile") */
+  nodeType?: string;
+  /** Matched range info (when a chunk matched instead of full content) */
+  matchedRange?: {
+    startLine: number;
+    endLine: number;
+    startChar: number;
+    endChar: number;
+    chunkIndex: number;
+    chunkScore: number;
+    /** Page number from parent document (for PDFs/Word docs) */
+    pageNum?: number | null;
+  };
+  /** Position info from the node (pageNum for docs, startLine for code) */
+  position?: {
+    pageNum?: number;
+    sectionIndex?: number;
+    startLine?: number;
+    endLine?: number;
+  };
   metadata: {
     documentTitle: string;
     categoryId: string;
     categorySlug: string;
     userId: string;
   };
+  /** Keyword boost info (if boostKeywords was used) */
+  keywordBoost?: {
+    keyword: string;
+    similarity: number;
+    boost: number;
+  };
+  /** Entity/tag boost applied (if entityBoost was used) */
+  entityBoostApplied?: number;
+  /** Matched entities/tags (if includeMatchedEntities: true) */
+  matchedEntities?: Array<{
+    uuid: string;
+    name: string;
+    type: 'Tag' | 'CanonicalEntity';
+    matchScore: number;
+  }>;
 }
 
 /**

@@ -283,6 +283,8 @@ export interface ImageToolsContext {
   projectRoot: string;
   /** OCR Service instance (from ragforge) */
   ocrService?: any;
+  /** Vision provider to use for image/PDF analysis: 'gemini' | 'claude' | 'replicate-deepseek' */
+  visionProvider?: 'gemini' | 'claude' | 'replicate-deepseek';
   /** Callback to ingest a created/modified file */
   onFileCreated?: (filePath: string, fileType: 'image' | '3d' | 'document') => Promise<void>;
   /** Callback to update extracted content in brain (OCR text, descriptions, etc.) */
@@ -472,14 +474,15 @@ export function generateDescribeImageHandler(ctx: ImageToolsContext): (args: any
     const descriptionPrompt = prompt ||
       'Describe this image in detail. What do you see? Include any text, UI elements, diagrams, or notable features.';
 
-    // Try to use Gemini for description (best at visual understanding)
+    // Use configured vision provider for description
+    const provider = ctx.visionProvider || 'gemini';
     try {
       const { getOCRService } = await import('../runtime/index.js');
-      const ocrService = getOCRService({ primaryProvider: 'gemini' });
+      const ocrService = getOCRService({ primaryProvider: provider });
 
       if (!ocrService.isAvailable()) {
         return {
-          error: 'No vision provider available. Set GEMINI_API_KEY environment variable.',
+          error: `No vision provider available. Set GEMINI_API_KEY, ANTHROPIC_API_KEY, or REPLICATE_API_TOKEN.`,
         };
       }
 
@@ -1314,14 +1317,79 @@ export function generateAnalyzeVisualHandler(ctx: ImageToolsContext): (args: any
     let imageToAnalyze = absolutePath;
     let tempFile: string | null = null;
 
-    // If PDF, convert the specified page to an image first
-    let targetPageBuffer: Buffer | null = null;
+    // For PDFs: try text extraction first (free), then Tesseract, then Vision
+    const OCR_CONFIDENCE_THRESHOLD = 60;
+    const MIN_TEXT_LENGTH = 50; // Minimum chars to consider text extraction successful
+
     if (isPdf) {
+      // Step 1: Try pdfjs-dist text extraction (free, works for PDFs with selectable text)
+      try {
+        const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs');
+        const pdfData = new Uint8Array(await fs.readFile(absolutePath));
+
+        const loadingTask = pdfjsLib.getDocument({
+          data: pdfData,
+          useWorkerFetch: false,
+          isEvalSupported: false,
+          useSystemFonts: true,
+        });
+
+        const pdfDocument = await loadingTask.promise;
+        const numPages = pdfDocument.numPages;
+
+        if (page > numPages) {
+          return { error: `Page ${page} not found in PDF (document has ${numPages} pages)` };
+        }
+
+        const startTime = Date.now();
+        const pdfPage = await pdfDocument.getPage(page);
+        const textContent = await pdfPage.getTextContent();
+        const pageText = textContent.items.map((item: any) => item.str).join(' ').trim();
+        const processingTimeMs = Date.now() - startTime;
+
+        if (pageText.length >= MIN_TEXT_LENGTH) {
+          // PDF has selectable text - use it directly (free)
+          console.log(`[analyze_visual] PDF text extraction successful (${pageText.length} chars)`);
+
+          let ingested = false;
+          if (ctx.onContentExtracted && pageText) {
+            try {
+              const ingestResult = await ctx.onContentExtracted({
+                filePath: absolutePath,
+                textContent: pageText,
+                extractionMethod: 'pdf-text',
+                generateEmbeddings: true,
+              });
+              ingested = ingestResult.updated;
+            } catch (ingestError: any) {
+              console.warn(`[analyze_visual] Failed to ingest content: ${ingestError.message}`);
+            }
+          }
+
+          return {
+            path: filePath,
+            page,
+            prompt,
+            response: pageText,
+            provider: 'pdf-text',
+            processing_time_ms: processingTimeMs,
+            ingested,
+          };
+        }
+
+        // Text too short - PDF is likely image-only, continue to OCR
+        console.log(`[analyze_visual] PDF text extraction found only ${pageText.length} chars, trying OCR...`);
+      } catch (pdfTextErr: any) {
+        console.warn(`[analyze_visual] PDF text extraction failed: ${pdfTextErr.message}, trying OCR...`);
+      }
+
+      // Step 2: Convert PDF page to image for OCR
       try {
         const { pdf } = await import('pdf-to-img');
         const document = await pdf(absolutePath, { scale: 2.0 });
 
         let pageIndex = 0;
+        let targetPageBuffer: Buffer | null = null;
 
         for await (const pageImage of document) {
           pageIndex++;
@@ -1340,6 +1408,57 @@ export function generateAnalyzeVisualHandler(ctx: ImageToolsContext): (args: any
         await fs.writeFile(tempFile, targetPageBuffer);
         imageToAnalyze = tempFile;
 
+        // Step 3: Try Tesseract OCR (free)
+        try {
+          const { createWorker } = await import('tesseract.js');
+          const worker = await createWorker('eng');
+          const startTime = Date.now();
+
+          const { data } = await worker.recognize(targetPageBuffer);
+          await worker.terminate();
+
+          const processingTimeMs = Date.now() - startTime;
+
+          if (data.confidence >= OCR_CONFIDENCE_THRESHOLD) {
+            // Good Tesseract result - use it (free)
+            if (tempFile) await fs.unlink(tempFile).catch(() => {});
+
+            let ingested = false;
+            if (ctx.onContentExtracted && data.text) {
+              try {
+                const ingestResult = await ctx.onContentExtracted({
+                  filePath: absolutePath,
+                  textContent: data.text,
+                  ocrConfidence: data.confidence,
+                  extractionMethod: 'ocr-tesseract',
+                  generateEmbeddings: true,
+                });
+                ingested = ingestResult.updated;
+              } catch (ingestError: any) {
+                console.warn(`[analyze_visual] Failed to ingest content: ${ingestError.message}`);
+              }
+            }
+
+            return {
+              path: filePath,
+              page,
+              prompt,
+              response: data.text,
+              provider: 'tesseract',
+              confidence: data.confidence,
+              processing_time_ms: processingTimeMs,
+              ingested,
+            };
+          }
+
+          // Low confidence - fall through to Vision provider
+          const visionProvider = ctx.visionProvider || 'gemini';
+          console.log(`[analyze_visual] Tesseract confidence ${data.confidence.toFixed(1)}% < ${OCR_CONFIDENCE_THRESHOLD}%, using ${visionProvider} Vision`);
+        } catch (tesseractErr: any) {
+          const visionProvider = ctx.visionProvider || 'gemini';
+          console.warn(`[analyze_visual] Tesseract failed, using ${visionProvider} Vision: ${tesseractErr.message}`);
+        }
+
       } catch (pdfErr: any) {
         return { error: `Failed to convert PDF page to image: ${pdfErr.message}` };
       }
@@ -1347,68 +1466,16 @@ export function generateAnalyzeVisualHandler(ctx: ImageToolsContext): (args: any
       return { error: `Unsupported format: ${ext}. Supported: ${imageExtensions.join(', ')}, .pdf` };
     }
 
-    // For PDFs: try Tesseract first (free), fallback to Gemini if confidence < 60%
-    const OCR_CONFIDENCE_THRESHOLD = 60;
-
-    if (isPdf && targetPageBuffer) {
-      try {
-        const { createWorker } = await import('tesseract.js');
-        const worker = await createWorker('eng');
-        const startTime = Date.now();
-
-        const { data } = await worker.recognize(targetPageBuffer);
-        await worker.terminate();
-
-        const processingTimeMs = Date.now() - startTime;
-
-        if (data.confidence >= OCR_CONFIDENCE_THRESHOLD && data.text.trim().length > 20) {
-          // Good Tesseract result - use it (free)
-          if (tempFile) await fs.unlink(tempFile).catch(() => {});
-
-          // Auto-ingest extracted content to brain if callback provided
-          let ingested = false;
-          if (ctx.onContentExtracted && data.text) {
-            try {
-              const ingestResult = await ctx.onContentExtracted({
-                filePath: absolutePath,
-                textContent: data.text,
-                ocrConfidence: data.confidence,
-                extractionMethod: 'ocr-tesseract',
-                generateEmbeddings: true,
-              });
-              ingested = ingestResult.updated;
-            } catch (ingestError: any) {
-              console.warn(`[analyze_visual] Failed to ingest content: ${ingestError.message}`);
-            }
-          }
-
-          return {
-            path: filePath,
-            page,
-            prompt,
-            response: data.text,
-            provider: 'tesseract',
-            confidence: data.confidence,
-            processing_time_ms: processingTimeMs,
-            ingested,
-          };
-        }
-        // Low confidence - fall through to Gemini Vision
-        console.log(`[analyze_visual] Tesseract confidence ${data.confidence.toFixed(1)}% < ${OCR_CONFIDENCE_THRESHOLD}%, using Gemini Vision`);
-      } catch (tesseractErr: any) {
-        console.warn(`[analyze_visual] Tesseract failed, using Gemini Vision: ${tesseractErr.message}`);
-      }
-    }
-
-    // Use Gemini Vision to analyze (for images, or PDF with low OCR confidence)
+    // Use Vision provider to analyze (for images, or PDF with low OCR confidence)
+    const visionProvider = ctx.visionProvider || 'gemini';
     try {
       const { getOCRService } = await import('../runtime/index.js');
-      const ocrService = getOCRService({ primaryProvider: 'gemini' });
+      const ocrService = getOCRService({ primaryProvider: visionProvider });
 
       if (!ocrService.isAvailable()) {
         if (tempFile) await fs.unlink(tempFile).catch(() => {});
         return {
-          error: 'Gemini Vision not available. Set GEMINI_API_KEY environment variable.',
+          error: `Vision provider '${visionProvider}' not available. Set GEMINI_API_KEY, ANTHROPIC_API_KEY, or REPLICATE_API_TOKEN.`,
         };
       }
 
@@ -1436,7 +1503,7 @@ export function generateAnalyzeVisualHandler(ctx: ImageToolsContext): (args: any
           const ingestResult = await ctx.onContentExtracted({
             filePath: absolutePath,
             textContent: result.text,
-            extractionMethod: 'gemini-vision',
+            extractionMethod: `${visionProvider}-vision`,
             generateEmbeddings: true,
           });
           ingested = ingestResult.updated;
@@ -1450,7 +1517,7 @@ export function generateAnalyzeVisualHandler(ctx: ImageToolsContext): (args: any
         page: isPdf ? page : undefined,
         prompt,
         response: result.text,
-        provider: 'gemini-vision',
+        provider: `${visionProvider}-vision`,
         processing_time_ms: processingTimeMs,
         ingested,
       };

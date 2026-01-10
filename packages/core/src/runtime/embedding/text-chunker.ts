@@ -138,9 +138,12 @@ function splitIntoSegments(text: string, strategy: 'paragraph' | 'sentence' | 'f
 }
 
 /**
- * Split text into sentences
+ * Split text into sentences.
+ * Handles: . ! ? followed by space or newline.
+ * Avoids splitting on: abbreviations, decimals, URLs.
+ * Combines very short sentences (< 100 chars).
  */
-function splitIntoSentences(text: string): string[] {
+export function splitIntoSentences(text: string): string[] {
   // Regex to split on sentence boundaries while preserving the delimiter
   // Handles: . ! ? followed by space or newline
   // Avoids splitting on: abbreviations (Mr., Dr., etc.), decimals, URLs

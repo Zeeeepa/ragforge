@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { auth } from "@/lib/auth";
+import { getAuthUser, hasWritePermission } from "@/lib/auth-helper";
 import { prisma } from "@/lib/db";
 import { writeFile, mkdir, readFile } from "fs/promises";
 import { join } from "path";
@@ -80,15 +80,16 @@ function getDocTypeFromExtension(ext: string): DocType | null {
 }
 
 export async function POST(request: NextRequest) {
-  const session = await auth();
-  if (!session?.user) {
-    return NextResponse.json({ error: "Non autorisé" }, { status: 401 });
+  // Auth with DEBUG_MODE support
+  const authResult = await getAuthUser();
+  if (!authResult.authenticated || !authResult.user) {
+    return NextResponse.json({ error: authResult.error || "Non autorisé" }, { status: 401 });
   }
 
-  const user = session.user as { id: string; role?: string };
+  const user = authResult.user;
 
   // Check write permission
-  if (user.role === "READ") {
+  if (!hasWritePermission(user)) {
     return NextResponse.json(
       { error: "Permission insuffisante" },
       { status: 403 }
@@ -156,11 +157,34 @@ export async function POST(request: NextRequest) {
     // Generate project ID for Neo4j
     const projectId = `upload-${fileId}`;
 
-    // Get user for metadata
-    const dbUser = await prisma.user.findUnique({
-      where: { id: user.id },
-      select: { username: true },
-    });
+    // Get or create user for metadata (handle debug user)
+    let dbUser: { id: string; username: string } | null = null;
+    if (user.isDebugUser) {
+      // For debug mode, ensure debug user exists in DB
+      dbUser = await prisma.user.upsert({
+        where: { id: "debug-user" },
+        update: {},
+        create: {
+          id: "debug-user",
+          username: "debug",
+          email: "debug@localhost",
+          role: "ADMIN",
+        },
+        select: { id: true, username: true },
+      });
+    } else {
+      dbUser = await prisma.user.findUnique({
+        where: { id: user.id },
+        select: { id: true, username: true },
+      });
+    }
+
+    if (!dbUser) {
+      return NextResponse.json(
+        { error: "Utilisateur non trouvé" },
+        { status: 404 }
+      );
+    }
 
     // Create document record
     const document = await prisma.document.create({
@@ -172,7 +196,7 @@ export async function POST(request: NextRequest) {
         storageRef: fileName,
         virtualPath: `/${category.slug}/${title.toLowerCase().replace(/\s+/g, "-")}`,
         categoryId,
-        uploadedById: user.id,
+        uploadedById: dbUser.id,
         projectId,
         status: "PENDING",
       },
@@ -208,10 +232,15 @@ const TEXT_TYPES: DocType[] = [
   "HTML", "CSS", "MARKDOWN", "JSON_FILE", "YAML", "CSV",
 ];
 
+// Binary document types that use the new DocumentParser
+const BINARY_DOC_TYPES: DocType[] = ["PDF", "DOCX", "XLSX"];
+
 /**
  * Trigger async ingestion to RagForge API
- * For text files, extracts content and sends to API
- * For binary files (PDF, DOCX, etc.), will need parsing (TODO)
+ *
+ * For text files, extracts content and sends to API via ingestDocument
+ * For binary documents (PDF, DOCX, etc.), uses ingestFile with the new DocumentParser
+ * which creates proper File + MarkdownDocument + MarkdownSection nodes
  */
 async function triggerIngestion(
   document: {
@@ -249,7 +278,19 @@ async function triggerIngestion(
     const metadata = buildNodeMetadata(document);
     let result;
 
-    if (TEXT_TYPES.includes(document.type)) {
+    if (BINARY_DOC_TYPES.includes(document.type)) {
+      // Binary documents (PDF, DOCX, etc.): use ingestFile with the new DocumentParser
+      // This creates File node with original path + MarkdownDocument + MarkdownSection nodes
+      const fileName = filePath.split("/").pop() || `${document.title}.${document.type.toLowerCase()}`;
+      result = await client.ingestFile({
+        filePath: fileName,
+        content: fileBuffer,
+        metadata,
+        generateEmbeddings: true,
+        enableVision: false, // Can be enabled later for better PDF parsing
+        sectionTitles: 'detect',
+      });
+    } else if (TEXT_TYPES.includes(document.type)) {
       // Text files: read and ingest directly
       const content = fileBuffer.toString("utf-8");
       result = await client.ingestDocument({
@@ -259,8 +300,7 @@ async function triggerIngestion(
         generateEmbeddings: true,
       });
     } else {
-      // Binary files (PDF, DOCX, images, etc.): placeholder for now
-      // TODO: Use RagForge parsers to extract content
+      // Other files (images, 3D models, etc.): placeholder for now
       result = await client.ingestDocument({
         documentId: document.id,
         content: `[Document: ${document.title}] (type: ${document.type})`,

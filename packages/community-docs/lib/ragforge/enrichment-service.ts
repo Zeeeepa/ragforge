@@ -416,10 +416,10 @@ export class EnrichmentService {
       llmProvider: this.llmProvider,
       inputFields: [
         { name: 'uuid', prompt: 'Unique identifier' },
-        { name: 'nodeType', prompt: 'Type of content' },
-        { name: 'name', prompt: 'Name/title' },
-        { name: 'content', prompt: 'Content to analyze', maxLength: 4000 },
-        { name: 'filePath', prompt: 'File path (if code)' },
+        { name: 'nodeType', prompt: 'Type of content (MarkdownSection, ImageFile, ThreeDFile, etc.)' },
+        { name: 'name', prompt: 'Name/title of the content' },
+        { name: 'content', prompt: 'Content to analyze (text or vision description)', maxLength: 4000 },
+        { name: 'filePath', prompt: 'File name/path - may contain entity names, project names, or other identifiers' },
       ],
       systemPrompt: `You are an entity extraction assistant. Analyze the provided content and extract:
 
@@ -428,6 +428,7 @@ export class EnrichmentService {
    - Assign confidence scores between 0 and 1 based on how clearly the entity is mentioned
    - Include relevant metadata (role for people, type for organizations, etc.)
    - Entity types: Person, Organization, Location, Concept, Technology, DateEvent, Product
+   - **IMPORTANT**: Also extract entities from the filename/filePath if provided - filenames often contain project names, people names, product names, or other meaningful identifiers (e.g., "Album Egr3gorr" in a filename suggests "Egr3gorr" as a potential Product/Concept entity)
 
 2. **Tags**: Thematic tags that describe the content
    - Use lowercase, hyphenated format (e.g., "machine-learning", "api-design")
@@ -438,7 +439,7 @@ export class EnrichmentService {
 
 4. **Description**: A brief 1-2 sentence description of what this content is about
 
-Only extract entities that are clearly mentioned. Do not hallucinate or infer entities that aren't present.`,
+Only extract entities that are clearly mentioned in the content OR the filename. Do not hallucinate or infer entities that aren't present.`,
       userTask: 'Extract entities, tags, keywords, and a description from this content.',
       outputSchema: ENTITY_EXTRACTION_SCHEMA,
       outputFormat: 'xml',
@@ -706,6 +707,68 @@ Be accurate and concise. Base your analysis on the actual content provided.`,
 
     const results = await this.executor.executeLLMBatch([input], config);
     return (results as any[])[0];
+  }
+
+  /**
+   * Generate titles for document sections that don't have one.
+   * Uses Claude to analyze section content and generate descriptive titles.
+   * Titles are generated in the same language as the content.
+   *
+   * @param sections - Array of sections with index and content
+   * @returns Array of sections with generated titles
+   */
+  async generateSectionTitles(
+    sections: Array<{ index: number; content: string }>
+  ): Promise<Array<{ index: number; title: string }>> {
+    if (sections.length === 0) return [];
+
+    logger.info('Enrichment', `Generating titles for ${sections.length} sections via Claude batch`);
+
+    // Prepare items for batch processing - all items processed in optimized batches
+    const items = sections.map(s => ({
+      index: s.index,
+      content: s.content.substring(0, 1500), // Limit content per section for LLM
+    }));
+
+    try {
+      const results = await this.executor.executeLLMBatch(items, {
+        inputFields: ['content'],
+        llmProvider: this.llmProvider,
+        systemPrompt: `You are an expert document analyzer. Your task is to generate short, descriptive titles for document sections.
+
+Rules:
+- The title must be short (3-8 words maximum)
+- The title must summarize the main content of the section
+- IMPORTANT: The title must be in the SAME LANGUAGE as the content excerpt (if content is in French, title must be in French; if in English, title must be in English; etc.)
+- Do not use final punctuation (no period at the end)
+- The title should be informative and specific, not generic like "Introduction" or "Conclusion" unless truly appropriate`,
+        userTask: 'Generate a short, descriptive title for this document section based on its content. The title must be in the same language as the content.',
+        outputSchema: {
+          title: {
+            type: 'string',
+            description: 'Short descriptive title for the section (3-8 words, same language as content)',
+            required: true,
+          },
+        },
+        outputFormat: 'xml',
+        caller: 'EnrichmentService.generateSectionTitles',
+        batchSize: 20, // Process up to 20 sections per LLM call
+      });
+
+      // Handle return type (array or LLMBatchResult)
+      const resultItems = Array.isArray(results) ? results : results.items;
+
+      logger.info('Enrichment', `Generated ${resultItems.length} section titles`);
+
+      return resultItems.map((item: any) => ({
+        index: item.index,
+        title: item.title || `Section ${item.index}`,
+      }));
+    } catch (error) {
+      logger.warn('Enrichment', `Failed to generate section titles: ${error}`);
+      // Fallback: return empty array, sections will get default "Section X" titles
+      return [];
+    }
   }
 
   /**

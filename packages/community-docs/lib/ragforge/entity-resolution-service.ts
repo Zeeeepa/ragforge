@@ -30,6 +30,34 @@ import {
 } from './entity-types';
 import { logger } from './logger';
 
+// ===== BIGINT CONVERSION HELPER =====
+
+/**
+ * Convert Neo4j Integer or native BigInt to a safe JavaScript number.
+ * Neo4j driver 5.x returns BigInt for integers, which can't be used directly as numbers.
+ */
+function toSafeNumber(value: unknown): number {
+  if (value === null || value === undefined) return 0;
+
+  // Handle native BigInt
+  if (typeof value === 'bigint') {
+    return Number(value);
+  }
+
+  // Handle Neo4j Integer (has toNumber method)
+  if (value && typeof value === 'object' && 'toNumber' in value && typeof (value as any).toNumber === 'function') {
+    return (value as any).toNumber();
+  }
+
+  // Handle regular numbers
+  if (typeof value === 'number') {
+    return value;
+  }
+
+  // Fallback: try to convert to number
+  return Number(value) || 0;
+}
+
 // ===== CANONICAL FORM SELECTION =====
 
 /**
@@ -626,47 +654,105 @@ Examples of non-matches:
   }
 
   /**
-   * Create a new canonical entity in Neo4j
+   * Create a new canonical entity in Neo4j (or merge with existing)
+   * Uses MERGE with unique constraint to handle concurrent creation attempts.
    */
   private async createCanonicalEntity(entity: UnresolvedEntity): Promise<Entity> {
     const uuid = `canonical-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const normalizedName = entity.name.toLowerCase().trim();
 
-    await this.neo4jClient.run(`
-      CREATE (c:CanonicalEntity {
-        uuid: $uuid,
-        name: $name,
-        normalizedName: $normalizedName,
-        entityType: $entityType,
-        aliases: $aliases,
-        projectIds: [$projectId],
-        documentIds: [$documentId],
-        createdAt: datetime(),
-        updatedAt: datetime()
-      })
-      WITH c
-      MATCH (e:Entity {uuid: $entityUuid})
-      CREATE (e)-[:CANONICAL_IS]->(c)
-    `, {
-      uuid,
-      name: entity.name,
-      normalizedName,
-      entityType: entity.entityType,
-      aliases: entity.aliases || [],
-      projectId: entity.projectId,
-      documentId: entity.documentId,
-      entityUuid: entity.uuid,
-    });
+    try {
+      // Use MERGE to avoid creating duplicates if same normalizedName+entityType already exists
+      // The unique constraint on (normalizedName, entityType) ensures atomicity
+      const result = await this.neo4jClient.run(`
+        MERGE (c:CanonicalEntity {normalizedName: $normalizedName, entityType: $entityType})
+        ON CREATE SET
+          c.uuid = $uuid,
+          c.name = $name,
+          c.aliases = $aliases,
+          c.projectIds = [$projectId],
+          c.documentIds = [$documentId],
+          c.createdAt = datetime(),
+          c.updatedAt = datetime()
+        ON MATCH SET
+          c.aliases = CASE WHEN $name IN c.aliases THEN c.aliases ELSE c.aliases + $name END,
+          c.projectIds = CASE WHEN $projectId IN c.projectIds THEN c.projectIds ELSE c.projectIds + $projectId END,
+          c.documentIds = CASE WHEN $documentId IN c.documentIds THEN c.documentIds ELSE c.documentIds + $documentId END,
+          c.updatedAt = datetime()
+        WITH c
+        MATCH (e:Entity {uuid: $entityUuid})
+        MERGE (e)-[:CANONICAL_IS]->(c)
+        RETURN c.uuid as canonicalUuid, c.name as canonicalName
+      `, {
+        uuid,
+        name: entity.name,
+        normalizedName,
+        entityType: entity.entityType,
+        aliases: entity.aliases || [],
+        projectId: entity.projectId,
+        documentId: entity.documentId,
+        entityUuid: entity.uuid,
+      });
 
-    logger.info('EntityResolution', `Created canonical entity: ${entity.name} (${entity.entityType})`);
+      const wasCreated = result.records.length > 0 && result.records[0].get('canonicalUuid') === uuid;
+      const canonicalName = result.records.length > 0 ? result.records[0].get('canonicalName') : entity.name;
 
-    return {
-      id: uuid,
-      name: entity.name,
-      type: entity.entityType,
-      aliases: entity.aliases,
-      confidence: entity.confidence,
-    } as Entity;
+      if (wasCreated) {
+        logger.info('EntityResolution', `Created canonical entity: ${entity.name} (${entity.entityType})`);
+      } else {
+        logger.info('EntityResolution', `Merged entity "${entity.name}" into existing canonical "${canonicalName}" (${entity.entityType})`);
+      }
+
+      return {
+        id: uuid,
+        name: entity.name,
+        type: entity.entityType,
+        aliases: entity.aliases,
+        confidence: entity.confidence,
+      } as Entity;
+    } catch (error: any) {
+      // Handle constraint violation (rare race condition where two threads try MERGE simultaneously)
+      if (error.message?.includes('ConstraintValidationFailed') || error.code === 'Neo.ClientError.Schema.ConstraintValidationFailed') {
+        logger.warn('EntityResolution', `Constraint violation for "${entity.name}", fetching existing canonical`);
+
+        // Fetch existing and link to it
+        const existingResult = await this.neo4jClient.run(`
+          MATCH (c:CanonicalEntity {normalizedName: $normalizedName, entityType: $entityType})
+          SET c.aliases = CASE WHEN $name IN c.aliases THEN c.aliases ELSE c.aliases + $name END,
+              c.projectIds = CASE WHEN $projectId IN c.projectIds THEN c.projectIds ELSE c.projectIds + $projectId END,
+              c.documentIds = CASE WHEN $documentId IN c.documentIds THEN c.documentIds ELSE c.documentIds + $documentId END,
+              c.updatedAt = datetime()
+          WITH c
+          MATCH (e:Entity {uuid: $entityUuid})
+          MERGE (e)-[:CANONICAL_IS]->(c)
+          RETURN c.uuid as canonicalUuid, c.name as canonicalName
+        `, {
+          name: entity.name,
+          normalizedName,
+          entityType: entity.entityType,
+          projectId: entity.projectId,
+          documentId: entity.documentId,
+          entityUuid: entity.uuid,
+        });
+
+        const canonicalName = existingResult.records.length > 0
+          ? existingResult.records[0].get('canonicalName')
+          : entity.name;
+
+        logger.info('EntityResolution', `Linked entity "${entity.name}" to existing canonical "${canonicalName}"`);
+
+        return {
+          id: existingResult.records[0]?.get('canonicalUuid') || uuid,
+          name: entity.name,
+          type: entity.entityType,
+          aliases: entity.aliases,
+          confidence: entity.confidence,
+        } as Entity;
+      }
+
+      // Re-throw other errors
+      throw error;
+    }
   }
 
   /**
@@ -829,7 +915,7 @@ Examples of non-matches:
       SET t.normalizedName = toLower(replace(t.name, ' ', '-'))
       RETURN count(t) AS normalized
     `);
-    const normalized = normalizeResult.records[0]?.get('normalized')?.toNumber() || 0;
+    const normalized = toSafeNumber(normalizeResult.records[0]?.get('normalized'));
 
     // 2. Simple merge (exact normalizedName match)
     const mergeResult = await this.neo4jClient.run(`
@@ -848,7 +934,7 @@ Examples of non-matches:
       DETACH DELETE t2
       RETURN count(t2) AS merged
     `);
-    const merged = mergeResult.records[0]?.get('merged')?.toNumber() || 0;
+    const merged = toSafeNumber(mergeResult.records[0]?.get('merged'));
 
     // 3. LLM-based semantic deduplication
     const llmMerged = await this.resolveTagsWithLLM();
@@ -879,7 +965,7 @@ Examples of non-matches:
         normalizedName: props.normalizedName || props.name.toLowerCase().replace(/ /g, '-'),
         category: props.category || 'other',
         projectIds: props.projectIds || [],
-        usageCount: props.usageCount || 1,
+        usageCount: toSafeNumber(props.usageCount) || 1,
       };
     });
   }
@@ -1005,20 +1091,26 @@ If a tag has no equivalent, include it as a single-item group.`,
         if (variantTag.uuid === targetTag.uuid) continue;
 
         // Transfer relationships and merge
+        // First: transfer HAS_TAG relationships (separate query to handle when no relationships exist)
         await this.neo4jClient.run(`
           MATCH (target:Tag {uuid: $targetUuid})
           MATCH (variant:Tag {uuid: $variantUuid})
-          // Transfer HAS_TAG relationships
-          OPTIONAL MATCH (n)-[r:HAS_TAG]->(variant)
+          MATCH (n)-[:HAS_TAG]->(variant)
           WHERE NOT (n)-[:HAS_TAG]->(target)
           CREATE (n)-[:HAS_TAG]->(target)
-          WITH target, variant, count(r) AS transferred
-          // Merge projectIds and usageCount
+        `, {
+          targetUuid: targetTag.uuid,
+          variantUuid: variantTag.uuid,
+        });
+
+        // Second: merge the variant into target
+        await this.neo4jClient.run(`
+          MATCH (target:Tag {uuid: $targetUuid})
+          MATCH (variant:Tag {uuid: $variantUuid})
           SET target.projectIds = [x IN coalesce(target.projectIds, []) WHERE NOT x IN coalesce(variant.projectIds, [])] + coalesce(variant.projectIds, []),
               target.usageCount = coalesce(target.usageCount, 0) + coalesce(variant.usageCount, 0),
               target.aliases = coalesce(target.aliases, []) + [$variantName]
           DETACH DELETE variant
-          RETURN transferred
         `, {
           targetUuid: targetTag.uuid,
           variantUuid: variantTag.uuid,

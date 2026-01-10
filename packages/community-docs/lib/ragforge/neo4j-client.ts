@@ -222,11 +222,25 @@ export class Neo4jClient {
       "CREATE INDEX IF NOT EXISTS node_categorySlug FOR (n:Scope) ON (n.categorySlug)",
     ];
 
+    const constraints = [
+      // Unique constraints to prevent race conditions during concurrent ingestion
+      "CREATE CONSTRAINT canonical_entity_unique IF NOT EXISTS FOR (c:CanonicalEntity) REQUIRE (c.normalizedName, c.entityType) IS UNIQUE",
+      "CREATE CONSTRAINT tag_unique IF NOT EXISTS FOR (t:Tag) REQUIRE (t.normalizedName) IS UNIQUE",
+    ];
+
     for (const idx of indexes) {
       try {
         await this.run(idx);
       } catch (e) {
         // Index might already exist, ignore
+      }
+    }
+
+    for (const constraint of constraints) {
+      try {
+        await this.run(constraint);
+      } catch (e) {
+        // Constraint might already exist, ignore
       }
     }
   }

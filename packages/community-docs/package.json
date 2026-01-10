@@ -17,25 +17,29 @@
     "api:dev": "npx tsx --watch lib/ragforge/api/server.ts"
   },
   "dependencies": {
+    "@ai-sdk/anthropic": "^3.0.9",
     "@auth/prisma-adapter": "^2.0.0",
     "@fastify/cors": "^10.0.0",
     "@fastify/multipart": "^9.3.0",
     "@luciformresearch/ragforge": "*",
     "@prisma/client": "^6.0.0",
     "adm-zip": "^0.5.16",
+    "ai": "^6.0.18",
     "dotenv": "^17.2.3",
     "fastify": "^5.0.0",
     "highlight.js": "^11.11.1",
     "mammoth": "^1.11.0",
     "neo4j-driver": "^6.0.1",
     "next": "16.0.10",
+    "pdf2pic": "^3.1.4",
     "next-auth": "^5.0.0-beta.25",
     "pdf2json": "^4.0.0",
     "react": "19.2.1",
     "react-dom": "19.2.1",
+    "tesseract.js": "^5.1.1",
     "three": "^0.182.0",
     "xlsx": "^0.18.5",
-    "zod": "^3.23.0"
+    "zod": "^3.25.76"
   },
   "pnpm": {
     "overrides": {

@@ -28,6 +28,9 @@ import {
   rerankSearchResults,
   // Markdown formatter
   formatAsMarkdown,
+  // Parsers for binary files
+  documentParser,
+  mediaParser,
   type OrchestratorDependencies,
   type FileChange,
   type IngestionStats,
@@ -42,10 +45,17 @@ import {
   // Formatter types
   type BrainSearchOutput,
   type FormatOptions,
+  // Document parse options
+  type DocumentParseOptions,
+  type MediaParseOptions,
 } from "@luciformresearch/ragforge";
 import type { Neo4jClient } from "./neo4j-client";
 import type { CommunityNodeMetadata } from "./types";
 import { getPipelineLogger } from "./logger";
+import type { EntityEmbeddingService, EntitySearchResult } from "./entity-embedding-service";
+import { createEnrichmentService, type EnrichmentService, type DocumentContext } from "./enrichment-service";
+import { EntityResolutionService, type EntityResolutionOptions } from "./entity-resolution-service";
+import type { Entity, ExtractedTag, NodeToEnrich } from "./entity-types";
 
 const logger = getPipelineLogger();
 
@@ -163,12 +173,34 @@ export interface CommunitySearchResult {
   score: number;
   /** File path (if available) */
   filePath?: string;
+  /** Matched range info (when a chunk matched instead of the full node) */
+  matchedRange?: {
+    startLine: number;
+    endLine: number;
+    startChar: number;
+    endChar: number;
+    chunkIndex: number;
+    chunkScore: number;
+    /** Page number from parent document (for PDFs/Word docs) */
+    pageNum?: number | null;
+  };
+  /** Snippet of the matched content (chunk text or truncated content) */
+  snippet?: string;
   /** Keyword boost info (if boost_keywords was used) */
   keywordBoost?: {
     keyword: string;
     similarity: number;
     boost: number;
   };
+  /** Entity/tag boost applied (if entityBoost was used) */
+  entityBoostApplied?: number;
+  /** Matched entities/tags (if includeMatchedEntities: true) */
+  matchedEntities?: Array<{
+    uuid: string;
+    name: string;
+    type: 'Tag' | 'CanonicalEntity';
+    matchScore: number;
+  }>;
 }
 
 /**
@@ -181,6 +213,15 @@ export interface CommunitySearchResultSet {
   reranked?: boolean;
   /** Whether keyword boosting was applied */
   keywordBoosted?: boolean;
+  /** Whether entity/tag boosting was applied */
+  entityBoosted?: boolean;
+  /** Matching entities/tags found (if entityBoost was used) */
+  matchingEntities?: Array<{
+    uuid: string;
+    name: string;
+    type: 'Tag' | 'CanonicalEntity';
+    score: number;
+  }>;
   /** Whether relationships were explored */
   relationshipsExplored?: boolean;
   /** Whether results were summarized */
@@ -224,6 +265,76 @@ export interface CommunityVirtualIngestionOptions {
 }
 
 /**
+ * Unified file ingestion options (handles all file types: text, binary docs, media)
+ */
+export interface UnifiedIngestionOptions {
+  /** Files to ingest (buffer-based, no disk I/O) */
+  files: Array<{
+    /** File name (e.g., "paper.pdf", "image.png", "code.ts") */
+    fileName: string;
+    /** File content as Buffer */
+    buffer: Buffer;
+  }>;
+  /** Community metadata to inject on all nodes */
+  metadata: CommunityNodeMetadata;
+  /** Document ID (used for projectId = `doc-${documentId}`) */
+  documentId: string;
+  /** Enable Vision-based parsing for PDFs and image analysis (default: false) */
+  enableVision?: boolean;
+  /** Vision analyzer function for image descriptions (required if enableVision is true for images) */
+  visionAnalyzer?: (imageBuffer: Buffer, prompt?: string) => Promise<string>;
+  /** 3D render function for model rendering (required if enableVision is true for 3D files) */
+  render3D?: (modelPath: string) => Promise<Array<{ view: string; buffer: Buffer }>>;
+  /** Section title detection mode for documents (default: 'detect') */
+  sectionTitles?: 'none' | 'detect' | 'llm';
+  /** Generate titles for sections without one using LLM (default: true) */
+  generateTitles?: boolean;
+  /** Generate embeddings after ingestion (default: true) */
+  generateEmbeddings?: boolean;
+  /** Extract entities and tags from document content and media descriptions (default: false) */
+  extractEntities?: boolean;
+  /** EnrichmentService instance for entity extraction (required if extractEntities is true) */
+  enrichmentService?: import('./enrichment-service').EnrichmentService;
+  /** EntityResolutionService instance for deduplication (optional, uses default if extractEntities is true) */
+  entityResolutionService?: import('./entity-resolution-service').EntityResolutionService;
+}
+
+/**
+ * Unified ingestion result
+ */
+export interface UnifiedIngestionResult {
+  /** Total nodes created */
+  nodesCreated: number;
+  /** Total relationships created */
+  relationshipsCreated: number;
+  /** Number of embeddings generated */
+  embeddingsGenerated: number;
+  /** Stats by file type */
+  stats: {
+    textFiles: number;
+    binaryDocs: number;
+    mediaFiles: number;
+    skipped: number;
+    textNodes: number;
+    binaryNodes: number;
+    mediaNodes: number;
+  };
+  /** Entity extraction stats (if extractEntities was enabled) */
+  entityStats?: {
+    /** Number of entities extracted */
+    entitiesExtracted: number;
+    /** Number of tags extracted */
+    tagsExtracted: number;
+    /** Number of canonical entities created/updated */
+    canonicalEntitiesCreated: number;
+    /** Number of entity relationships created */
+    entityRelationshipsCreated: number;
+  };
+  /** Warnings from parsing */
+  warnings?: string[];
+}
+
+/**
  * Community Orchestrator Adapter
  *
  * Wraps IngestionOrchestrator with community-specific transformGraph hook
@@ -238,6 +349,9 @@ export class CommunityOrchestratorAdapter {
   private searchService: SearchService | null = null;
   private coreClient: CoreNeo4jClient | null = null;
   private verbose: boolean;
+
+  // Entity/Tag embedding service (for entity boost in search)
+  private entityEmbeddingService: EntityEmbeddingService | null = null;
 
   // Current metadata for transformGraph hook
   private currentMetadata: CommunityNodeMetadata | null = null;
@@ -385,6 +499,20 @@ export class CommunityOrchestratorAdapter {
 
           // Mark as community content
           node.properties.sourceType = "community-upload";
+
+          // Extract sourceFormat from frontMatter if present (for PDF/DOCX parsed via vision)
+          const frontMatter = node.properties.frontMatter as string | undefined;
+          if (frontMatter && typeof frontMatter === 'string') {
+            // Parse YAML frontmatter to extract sourceFormat
+            const sourceFormatMatch = frontMatter.match(/sourceFormat:\s*["']?(\w+)["']?/);
+            if (sourceFormatMatch) {
+              node.properties.sourceFormat = sourceFormatMatch[1];
+            }
+            const parsedFromMatch = frontMatter.match(/parsedFrom:\s*["']?([\w-]+)["']?/);
+            if (parsedFromMatch) {
+              node.properties.parsedFrom = parsedFromMatch[1];
+            }
+          }
         }
 
         return graph;
@@ -400,6 +528,15 @@ export class CommunityOrchestratorAdapter {
 
     await this.orchestrator.initialize();
     logger.info("[CommunityOrchestrator] Initialized with transformGraph hook");
+  }
+
+  /**
+   * Set the EntityEmbeddingService for entity/tag boost in search
+   * This is initialized separately in server.ts
+   */
+  setEntityEmbeddingService(service: EntityEmbeddingService): void {
+    this.entityEmbeddingService = service;
+    logger.info("[CommunityOrchestrator] EntityEmbeddingService set for entity boost");
   }
 
   /**
@@ -537,14 +674,19 @@ export class CommunityOrchestratorAdapter {
         }
         node.properties.sourceType = "community-upload";
 
-        // Extract originalFileName for binary documents converted to markdown
-        // e.g., file.pdf.md -> file.pdf, report.docx.md -> report.docx
+        // Extract originalFileName and sourceFormat for binary documents converted to markdown
+        // e.g., file.pdf.md -> file.pdf (originalFileName), pdf (sourceFormat)
         const filePath = node.properties.file as string | undefined;
         if (filePath && binaryDocPattern.test(filePath)) {
           // Remove the .md extension to get the original filename
           const originalFileName = filePath.replace(/\.md$/, '').split('/').pop();
           if (originalFileName) {
             node.properties.originalFileName = originalFileName;
+            // Extract format from extension: file.pdf -> pdf, report.docx -> docx
+            const formatMatch = originalFileName.match(/\.(\w+)$/);
+            if (formatMatch) {
+              node.properties.sourceFormat = formatMatch[1].toLowerCase();
+            }
           }
         }
       }
@@ -590,6 +732,837 @@ export class CommunityOrchestratorAdapter {
     } finally {
       // Clear metadata after ingestion
       this.currentMetadata = null;
+    }
+  }
+
+  // ==========================================================================
+  // File Type Detection Helpers
+  // ==========================================================================
+
+  private static readonly BINARY_DOC_EXTENSIONS = new Set(['.pdf', '.docx', '.doc', '.xlsx', '.xls', '.pptx', '.ppt', '.odt', '.rtf']);
+  private static readonly IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.ico']);
+  private static readonly THREED_EXTENSIONS = new Set(['.glb', '.gltf', '.obj', '.fbx', '.stl', '.3ds']);
+  private static readonly TEXT_EXTENSIONS = new Set([
+    '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+    '.py', '.pyi',
+    '.md', '.mdx', '.markdown',
+    '.json', '.yaml', '.yml', '.toml',
+    '.html', '.htm', '.css', '.scss', '.less',
+    '.vue', '.svelte',
+    '.java', '.kt', '.scala',
+    '.go', '.rs', '.c', '.cpp', '.h', '.hpp',
+    '.rb', '.php', '.swift', '.m',
+    '.sql', '.graphql', '.prisma',
+    '.sh', '.bash', '.zsh', '.fish',
+    '.xml', '.csv', '.txt', '.env', '.gitignore',
+  ]);
+
+  private isBinaryDocument(ext: string): boolean {
+    return CommunityOrchestratorAdapter.BINARY_DOC_EXTENSIONS.has(ext.toLowerCase());
+  }
+
+  private isMediaFile(ext: string): boolean {
+    const extLower = ext.toLowerCase();
+    return CommunityOrchestratorAdapter.IMAGE_EXTENSIONS.has(extLower) ||
+           CommunityOrchestratorAdapter.THREED_EXTENSIONS.has(extLower);
+  }
+
+  private is3DModel(ext: string): boolean {
+    return CommunityOrchestratorAdapter.THREED_EXTENSIONS.has(ext.toLowerCase());
+  }
+
+  private isTextFile(ext: string): boolean {
+    return CommunityOrchestratorAdapter.TEXT_EXTENSIONS.has(ext.toLowerCase());
+  }
+
+  // ==========================================================================
+  // Unified File Ingestion
+  // ==========================================================================
+
+  /**
+   * Unified file ingestion - handles all file types in a single batch operation.
+   *
+   * This method:
+   * 1. Classifies files by type (binary document, media, text)
+   * 2. Parses each file with the appropriate parser
+   * 3. Collects all nodes/relationships
+   * 4. Performs a SINGLE ingestGraph operation
+   * 5. Generates embeddings in batch at the end
+   *
+   * Use this for all ingestion operations to ensure consistent behavior
+   * and optimal performance (single DB write, batch embedding generation).
+   */
+  async ingestFiles(options: UnifiedIngestionOptions): Promise<UnifiedIngestionResult> {
+    await this.initialize();
+
+    const {
+      files,
+      metadata,
+      documentId,
+      enableVision = false,
+      visionAnalyzer,
+      render3D,
+      sectionTitles = 'detect',
+      generateTitles = true,
+      generateEmbeddings = true,
+      extractEntities = false,
+      enrichmentService,
+      entityResolutionService,
+    } = options;
+
+    const projectId = `doc-${documentId}`;
+    const virtualRoot = `/virtual/${documentId}/upload`;
+
+    // Stats tracking
+    const stats = {
+      textFiles: 0,
+      binaryDocs: 0,
+      mediaFiles: 0,
+      skipped: 0,
+      textNodes: 0,
+      binaryNodes: 0,
+      mediaNodes: 0,
+    };
+    const allWarnings: string[] = [];
+
+    // Collected nodes and relationships from all parsers
+    const allNodes: Array<{ labels: string[]; id: string; properties: Record<string, any> }> = [];
+    const allRelationships: Array<{ type: string; from: string; to: string; properties?: Record<string, any> }> = [];
+
+    // Virtual files for text content (will be parsed together)
+    const virtualTextFiles: Array<{ path: string; content: string }> = [];
+
+    logger.info(`[UnifiedIngestion] Processing ${files.length} files for document: ${documentId}`);
+
+    // Process each file
+    for (const { fileName, buffer } of files) {
+      const ext = '.' + (fileName.split('.').pop()?.toLowerCase() || '');
+
+      // 1. Binary documents (PDF, DOCX, etc.)
+      if (this.isBinaryDocument(ext)) {
+        try {
+          logger.info(`[UnifiedIngestion] Parsing binary document: ${fileName}`);
+
+          // Create title generator if needed
+          let titleGenerator: ((sections: Array<{ index: number; content: string }>) => Promise<Array<{ index: number; title: string }>>) | undefined;
+          if (generateTitles) {
+            titleGenerator = this.createDefaultTitleGenerator();
+          }
+
+          const parseResult = await documentParser.parse({
+            filePath: fileName,
+            binaryContent: buffer,
+            projectId,
+            options: {
+              enableVision,
+              sectionTitles,
+              generateTitles,
+              titleGenerator,
+            },
+          });
+
+          // Collect nodes and relationships
+          for (const node of parseResult.nodes) {
+            allNodes.push({
+              labels: node.labels,
+              id: node.id,
+              properties: node.properties,
+            });
+          }
+          for (const rel of parseResult.relationships) {
+            allRelationships.push({
+              type: rel.type,
+              from: rel.from,
+              to: rel.to,
+              properties: rel.properties || {},
+            });
+          }
+
+          stats.binaryDocs++;
+          stats.binaryNodes += parseResult.nodes.length;
+          if (parseResult.warnings) {
+            allWarnings.push(...parseResult.warnings);
+          }
+          logger.info(`[UnifiedIngestion] Binary parsed: ${fileName} -> ${parseResult.nodes.length} nodes`);
+        } catch (err: any) {
+          logger.warn(`[UnifiedIngestion] Binary failed ${fileName}: ${err.message}`);
+          stats.skipped++;
+        }
+        continue;
+      }
+
+      // 2. Media files (images, 3D models)
+      if (this.isMediaFile(ext)) {
+        try {
+          logger.info(`[UnifiedIngestion] Parsing media file: ${fileName}`);
+
+          // Write to temp file for media parser
+          const fs = await import('fs');
+          const path = await import('path');
+          const os = await import('os');
+          const tempPath = path.join(os.tmpdir(), `ragforge-media-${Date.now()}-${path.basename(fileName)}`);
+          fs.writeFileSync(tempPath, buffer);
+
+          try {
+            // Build parse options for core media parser
+            const mediaParseOptions: MediaParseOptions = {
+              enableVision,
+              visionAnalyzer,
+              render3D,
+            };
+
+            const parseResult = await mediaParser.parse({
+              filePath: tempPath,
+              projectId,
+              options: mediaParseOptions,
+            });
+
+            // Update file paths to use original path instead of temp
+            for (const node of parseResult.nodes) {
+              if (node.properties.file === tempPath) {
+                node.properties.file = fileName;
+              }
+              if (node.properties.sourcePath === tempPath) {
+                node.properties.sourcePath = fileName;
+              }
+              allNodes.push({
+                labels: node.labels,
+                id: node.id,
+                properties: node.properties,
+              });
+            }
+            for (const rel of parseResult.relationships) {
+              allRelationships.push({
+                type: rel.type,
+                from: rel.from,
+                to: rel.to,
+                properties: rel.properties || {},
+              });
+            }
+
+            stats.mediaFiles++;
+            stats.mediaNodes += parseResult.nodes.length;
+            if (parseResult.warnings) {
+              allWarnings.push(...parseResult.warnings);
+            }
+
+            // Check if vision description was generated
+            const hasDescription = parseResult.nodes.some(n => n.properties.description);
+            logger.info(`[UnifiedIngestion] Media parsed: ${fileName} -> ${parseResult.nodes.length} nodes${hasDescription ? ' (with vision description)' : ''}`);
+          } finally {
+            // Clean up temp file
+            try { fs.unlinkSync(tempPath); } catch {}
+          }
+        } catch (err: any) {
+          logger.warn(`[UnifiedIngestion] Media failed ${fileName}: ${err.message}`);
+          stats.skipped++;
+        }
+        continue;
+      }
+
+      // 3. Text files - collect for batch parsing
+      if (this.isTextFile(ext) || ext === '') {
+        try {
+          const content = buffer.toString('utf-8');
+          virtualTextFiles.push({
+            path: `${virtualRoot}/${fileName}`,
+            content,
+          });
+          stats.textFiles++;
+        } catch (err: any) {
+          logger.warn(`[UnifiedIngestion] Failed to read ${fileName}: ${err.message}`);
+          stats.skipped++;
+        }
+        continue;
+      }
+
+      // Unknown file type
+      logger.info(`[UnifiedIngestion] Skipping unsupported file: ${fileName}`);
+      stats.skipped++;
+    }
+
+    // Parse all text files together in one batch
+    if (virtualTextFiles.length > 0) {
+      logger.info(`[UnifiedIngestion] Parsing ${virtualTextFiles.length} text files`);
+
+      const parseResult = await this.sourceAdapter.parse({
+        source: {
+          type: 'virtual',
+          virtualFiles: virtualTextFiles,
+        },
+        projectId,
+      });
+
+      for (const node of parseResult.graph.nodes) {
+        allNodes.push({
+          labels: node.labels,
+          id: node.id,
+          properties: node.properties,
+        });
+      }
+      for (const rel of parseResult.graph.relationships) {
+        allRelationships.push({
+          type: rel.type,
+          from: rel.from,
+          to: rel.to,
+          properties: rel.properties || {},
+        });
+      }
+      stats.textNodes = parseResult.graph.nodes.length;
+      logger.info(`[UnifiedIngestion] Text parsed: ${virtualTextFiles.length} files -> ${parseResult.graph.nodes.length} nodes`);
+    }
+
+    // Inject community metadata on ALL nodes
+    logger.info(`[UnifiedIngestion] Injecting metadata on ${allNodes.length} nodes`);
+    for (const node of allNodes) {
+      node.properties.projectId = projectId;
+      node.properties.documentId = metadata.documentId;
+      node.properties.documentTitle = metadata.documentTitle;
+      node.properties.userId = metadata.userId;
+      if (metadata.userUsername) {
+        node.properties.userUsername = metadata.userUsername;
+      }
+      node.properties.categoryId = metadata.categoryId;
+      node.properties.categorySlug = metadata.categorySlug;
+      if (metadata.categoryName) {
+        node.properties.categoryName = metadata.categoryName;
+      }
+      if (metadata.isPublic !== undefined) {
+        node.properties.isPublic = metadata.isPublic;
+      }
+      if (metadata.tags && metadata.tags.length > 0) {
+        node.properties.tags = metadata.tags;
+      }
+      node.properties.sourceType = 'community-upload';
+    }
+
+    // Single batch ingest into Neo4j
+    if (allNodes.length > 0) {
+      logger.info(`[UnifiedIngestion] Ingesting ${allNodes.length} nodes, ${allRelationships.length} relationships`);
+      await this.ingestionManager!.ingestGraph(
+        { nodes: allNodes, relationships: allRelationships },
+        { projectId, markDirty: true }
+      );
+    }
+
+    // Process cross-file references for text files
+    if (virtualTextFiles.length > 0) {
+      try {
+        const refResult = await this.ingestionManager!.processVirtualFileReferences(
+          projectId,
+          virtualTextFiles,
+          { verbose: this.verbose }
+        );
+        if (refResult.created > 0 || refResult.pending > 0) {
+          logger.info(`[UnifiedIngestion] Reference linking: ${refResult.created} created, ${refResult.pending} pending`);
+        }
+      } catch (err) {
+        logger.warn(`[UnifiedIngestion] Reference linking failed: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+
+    // Entity extraction for non-code content
+    let entityStats: UnifiedIngestionResult['entityStats'] | undefined;
+    if (extractEntities && enrichmentService && allNodes.length > 0) {
+      try {
+        logger.info(`[UnifiedIngestion] Extracting entities and tags...`);
+
+        // Collect nodes with enrichable content
+        // - MarkdownSection nodes (document sections)
+        // - MediaFile/ImageFile/ThreeDFile nodes with descriptions
+        const nodesToEnrich: NodeToEnrich[] = [];
+
+        for (const node of allNodes) {
+          const labels = node.labels;
+          const props = node.properties;
+
+          // Document sections have content
+          if (labels.includes('MarkdownSection') && props.content) {
+            nodesToEnrich.push({
+              uuid: props.uuid || node.id,
+              nodeType: 'MarkdownSection',
+              name: props.title as string || 'Untitled Section',
+              content: props.content as string,
+              filePath: props.sourcePath as string | undefined,
+            });
+          }
+          // Media files use their vision description as content
+          else if (
+            (labels.includes('MediaFile') || labels.includes('ImageFile') || labels.includes('ThreeDFile')) &&
+            props.description
+          ) {
+            const fullPath = props.file as string | undefined;
+            const fileName = fullPath ? fullPath.split('/').pop() : undefined;
+            nodesToEnrich.push({
+              uuid: props.uuid || node.id,
+              nodeType: labels[0], // ImageFile, ThreeDFile, or MediaFile
+              name: fileName || 'Media File',
+              content: props.description as string,
+              filePath: fullPath, // Full filename for entity extraction
+            });
+          }
+        }
+
+        if (nodesToEnrich.length > 0) {
+          logger.info(`[UnifiedIngestion] Enriching ${nodesToEnrich.length} nodes (sections + media descriptions)`);
+
+          // Build document context for enrichment
+          const docContext: DocumentContext = {
+            documentId,
+            projectId,
+            nodes: nodesToEnrich,
+          };
+
+          // Extract entities and tags
+          const enrichResult = await enrichmentService.enrichDocument(docContext);
+
+          logger.info(`[UnifiedIngestion] Extracted ${enrichResult.entities.length} entities, ${enrichResult.tags.length} tags`);
+
+          // Store entities and tags in Neo4j, linked to source nodes
+          let entitiesCreated = 0;
+          let tagsCreated = 0;
+          let entityRelsCreated = 0;
+
+          if (enrichResult.nodeEnrichments) {
+            for (const nodeEnrich of enrichResult.nodeEnrichments) {
+              // Create Entity nodes linked to source
+              if (nodeEnrich.entities && nodeEnrich.entities.length > 0) {
+                for (const entity of nodeEnrich.entities) {
+                  await this.neo4j.run(`
+                    CREATE (e:Entity {
+                      uuid: randomUUID(),
+                      name: $name,
+                      normalizedName: toLower($name),
+                      entityType: $type,
+                      confidence: $confidence,
+                      aliases: $aliases,
+                      projectId: $projectId,
+                      documentId: $documentId,
+                      sourceNodeId: $sourceNodeId,
+                      createdAt: datetime()
+                    })
+                    WITH e
+                    MATCH (source {uuid: $sourceNodeId})
+                    CREATE (source)-[:CONTAINS_ENTITY {confidence: $confidence}]->(e)
+                  `, {
+                    name: entity.name,
+                    type: entity.type,
+                    confidence: entity.confidence,
+                    aliases: entity.aliases || [],
+                    projectId,
+                    documentId,
+                    sourceNodeId: nodeEnrich.nodeId,
+                  });
+                  entitiesCreated++;
+                  entityRelsCreated++;
+                }
+              }
+
+              // Create Tag nodes linked to source
+              if (nodeEnrich.tags && nodeEnrich.tags.length > 0) {
+                for (const tag of nodeEnrich.tags) {
+                  // Compute normalizedName in JS to match the constraint key
+                  const normalizedName = tag.name.toLowerCase().replace(/\s+/g, '-');
+                  await this.neo4j.run(`
+                    MERGE (t:Tag {normalizedName: $normalizedName})
+                    ON CREATE SET t.uuid = randomUUID(), t.name = $name, t.category = $category,
+                                  t.createdAt = datetime()
+                    ON MATCH SET t.name = CASE WHEN t.name IS NULL THEN $name ELSE t.name END
+                    SET t.projectIds = CASE
+                      WHEN $projectId IN coalesce(t.projectIds, []) THEN t.projectIds
+                      ELSE coalesce(t.projectIds, []) + $projectId
+                    END,
+                    t.usageCount = coalesce(t.usageCount, 0) + 1
+                    WITH t
+                    MATCH (source {uuid: $sourceNodeId})
+                    MERGE (source)-[:HAS_TAG]->(t)
+                  `, {
+                    name: tag.name,
+                    normalizedName,
+                    category: tag.category || 'other',
+                    projectId,
+                    sourceNodeId: nodeEnrich.nodeId,
+                  });
+                  tagsCreated++;
+                }
+              }
+            }
+          }
+
+          logger.info(`[UnifiedIngestion] Created ${entitiesCreated} Entity nodes, ${tagsCreated} Tag nodes`);
+
+          // Resolve/deduplicate entities and tags
+          let canonicalCreated = 0;
+          if (entitiesCreated > 0 || tagsCreated > 0) {
+            const resolver = entityResolutionService || new EntityResolutionService(
+              this.neo4j,
+              process.env.ANTHROPIC_API_KEY || ''
+            );
+
+            // Resolve entities (merge duplicates into CanonicalEntity nodes)
+            if (entitiesCreated > 0) {
+              const entityResolution = await resolver.resolveEntities();
+              canonicalCreated = entityResolution.created.length + entityResolution.merged.length;
+              logger.info(`[UnifiedIngestion] Entity resolution: ${entityResolution.created.length} created, ${entityResolution.merged.length} merged`);
+            }
+
+            // Resolve tags (merge duplicates)
+            if (tagsCreated > 0) {
+              const tagResolution = await resolver.resolveTags();
+              logger.info(`[UnifiedIngestion] Tag resolution: ${tagResolution.normalized} normalized, ${tagResolution.merged} merged`);
+            }
+          }
+
+          entityStats = {
+            entitiesExtracted: enrichResult.entities.length,
+            tagsExtracted: enrichResult.tags.length,
+            canonicalEntitiesCreated: canonicalCreated,
+            entityRelationshipsCreated: entityRelsCreated,
+          };
+        } else {
+          logger.info(`[UnifiedIngestion] No enrichable content found (no sections or media descriptions)`);
+        }
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        logger.warn(`[UnifiedIngestion] Entity extraction failed: ${errMsg}`);
+        allWarnings.push(`Entity extraction failed: ${errMsg}`);
+      }
+    }
+
+    // Generate embeddings in batch
+    let embeddingsGenerated = 0;
+    if (generateEmbeddings && allNodes.length > 0) {
+      embeddingsGenerated = await this.generateEmbeddingsForDocument(documentId);
+    }
+
+    const entityLogPart = entityStats ? `, ${entityStats.entitiesExtracted} entities, ${entityStats.tagsExtracted} tags` : '';
+    logger.info(`[UnifiedIngestion] Complete: ${allNodes.length} nodes, ${allRelationships.length} rels, ${embeddingsGenerated} embeddings${entityLogPart}`);
+
+    return {
+      nodesCreated: allNodes.length,
+      relationshipsCreated: allRelationships.length,
+      embeddingsGenerated,
+      stats,
+      entityStats,
+      warnings: allWarnings.length > 0 ? allWarnings : undefined,
+    };
+  }
+
+  /**
+   * Ingest a binary document (PDF, DOCX, etc.) using the new DocumentParser.
+   *
+   * This method uses the refactored DocumentParser from core which creates:
+   * - File node with the original path (e.g., "paper.pdf")
+   * - MarkdownDocument node with sourceFormat and parsedWith metadata
+   * - MarkdownSection nodes for each detected section
+   *
+   * @example
+   * await adapter.ingestBinaryDocument({
+   *   filePath: "paper.pdf",
+   *   binaryContent: pdfBuffer,
+   *   metadata: { documentId: "123", ... },
+   *   enableVision: true,
+   *   visionAnalyzer: async (buf, prompt) => { ... },
+   * });
+   */
+  async ingestBinaryDocument(options: {
+    /** Original file path (e.g., "paper.pdf") */
+    filePath: string;
+    /** Binary content of the file */
+    binaryContent: Buffer;
+    /** Community metadata to inject on all nodes */
+    metadata: CommunityNodeMetadata;
+    /** Project ID (derived from documentId if not provided) */
+    projectId?: string;
+    /** Enable Vision-based parsing for better quality (default: false) */
+    enableVision?: boolean;
+    /** Vision analyzer function (required if enableVision is true) */
+    visionAnalyzer?: (imageBuffer: Buffer, prompt?: string) => Promise<string>;
+    /** Section title detection mode (default: 'detect') */
+    sectionTitles?: 'none' | 'detect' | 'llm';
+    /** Maximum pages to process */
+    maxPages?: number;
+    /** Generate titles for sections without one using LLM (default: true for community-docs) */
+    generateTitles?: boolean;
+    /** Custom title generator function (uses default LLM-based one if not provided) */
+    titleGenerator?: (sections: Array<{ index: number; content: string }>) => Promise<Array<{ index: number; title: string }>>;
+  }): Promise<{ nodesCreated: number; relationshipsCreated: number; warnings?: string[] }> {
+    await this.initialize();
+
+    const {
+      filePath,
+      binaryContent,
+      metadata,
+      projectId = `doc-${metadata.documentId}`,
+      enableVision = false,
+      visionAnalyzer,
+      sectionTitles = 'detect',
+      maxPages,
+      generateTitles = true, // Default to true for community-docs
+      titleGenerator,
+    } = options;
+
+    logger.info(`Ingesting binary document: ${filePath} (${binaryContent.length} bytes), generateTitles: ${generateTitles}`);
+
+    try {
+      // Create default title generator using LLM if enabled and not provided
+      let effectiveTitleGenerator = titleGenerator;
+      if (generateTitles && !titleGenerator) {
+        logger.info(`Creating default title generator for ${filePath}`);
+        effectiveTitleGenerator = this.createDefaultTitleGenerator();
+      }
+
+      // Parse document using the new DocumentParser
+      const parseOptions: DocumentParseOptions = {
+        enableVision,
+        visionAnalyzer,
+        sectionTitles,
+        maxPages,
+        generateTitles,
+        titleGenerator: effectiveTitleGenerator,
+      };
+
+      const parseResult = await documentParser.parse({
+        filePath,
+        binaryContent,
+        projectId,
+        options: parseOptions as Record<string, unknown>,
+      });
+
+      logger.info(`Parsed ${filePath}: ${parseResult.nodes.length} nodes, ${parseResult.relationships.length} relationships`);
+
+      // Inject community metadata on all nodes
+      for (const node of parseResult.nodes) {
+        node.properties.projectId = projectId;
+        node.properties.documentId = metadata.documentId;
+        node.properties.documentTitle = metadata.documentTitle;
+        node.properties.userId = metadata.userId;
+        if (metadata.userUsername) {
+          node.properties.userUsername = metadata.userUsername;
+        }
+        node.properties.categoryId = metadata.categoryId;
+        node.properties.categorySlug = metadata.categorySlug;
+        if (metadata.categoryName) {
+          node.properties.categoryName = metadata.categoryName;
+        }
+        if (metadata.isPublic !== undefined) {
+          node.properties.isPublic = metadata.isPublic;
+        }
+        if (metadata.tags && metadata.tags.length > 0) {
+          node.properties.tags = metadata.tags;
+        }
+        node.properties.sourceType = "community-upload";
+      }
+
+      // Convert ParserNode to ingestion format
+      const graphNodes = parseResult.nodes.map((n) => ({
+        labels: n.labels,
+        id: n.id,
+        properties: n.properties,
+      }));
+
+      const graphRelationships = parseResult.relationships.map((r) => ({
+        type: r.type,
+        from: r.from,
+        to: r.to,
+        properties: r.properties || {},
+      }));
+
+      // Ingest graph into Neo4j
+      await this.ingestionManager!.ingestGraph(
+        { nodes: graphNodes, relationships: graphRelationships },
+        { projectId, markDirty: true }
+      );
+
+      logger.info(`Binary document ingested: ${graphNodes.length} nodes, ${graphRelationships.length} relationships`);
+
+      return {
+        nodesCreated: graphNodes.length,
+        relationshipsCreated: graphRelationships.length,
+        warnings: parseResult.warnings,
+      };
+    } catch (err) {
+      logger.error(`Failed to ingest binary document ${filePath}: ${err}`);
+      throw err;
+    }
+  }
+
+  /**
+   * Create a default title generator using EnrichmentService.
+   * Delegates to EnrichmentService.generateSectionTitles for centralized LLM calls.
+   */
+  private createDefaultTitleGenerator(): (sections: Array<{ index: number; content: string }>) => Promise<Array<{ index: number; title: string }>> {
+    return async (sections) => {
+      if (sections.length === 0) return [];
+
+      // Check for API key
+      const apiKey = process.env.ANTHROPIC_API_KEY;
+      if (!apiKey) {
+        logger.warn(`[TitleGenerator] ANTHROPIC_API_KEY not set, skipping title generation`);
+        return [];
+      }
+
+      try {
+        // Use EnrichmentService for centralized LLM calls
+        const enrichmentService = createEnrichmentService();
+        return await enrichmentService.generateSectionTitles(sections);
+      } catch (error) {
+        logger.warn(`[TitleGenerator] Failed to generate titles: ${error}`);
+        return [];
+      }
+    };
+  }
+
+  /**
+   * Ingest a media file (image, 3D model) using the MediaParser.
+   *
+   * This method uses the MediaParser from core which creates:
+   * - ImageFile or ThreeDFile node with optional Vision analysis
+   * - File node for the source file
+   *
+   * @example
+   * await adapter.ingestMedia({
+   *   filePath: "image.png",
+   *   binaryContent: imageBuffer,
+   *   metadata: { documentId: "123", ... },
+   *   enableVision: true,
+   *   visionAnalyzer: async (buf, prompt) => { ... },
+   * });
+   */
+  async ingestMedia(options: {
+    /** Original file path (e.g., "image.png", "model.glb") */
+    filePath: string;
+    /** Binary content of the file */
+    binaryContent: Buffer;
+    /** Community metadata to inject on all nodes */
+    metadata: CommunityNodeMetadata;
+    /** Project ID (derived from documentId if not provided) */
+    projectId?: string;
+    /** Enable Vision-based analysis (default: false) */
+    enableVision?: boolean;
+    /** Vision analyzer function (required if enableVision is true) */
+    visionAnalyzer?: (imageBuffer: Buffer, prompt?: string) => Promise<string>;
+    /** 3D render function (required for 3D models if enableVision is true) */
+    render3D?: (modelPath: string) => Promise<{ view: string; buffer: Buffer }[]>;
+  }): Promise<{ nodesCreated: number; relationshipsCreated: number; warnings?: string[] }> {
+    await this.initialize();
+
+    const {
+      filePath,
+      binaryContent,
+      metadata,
+      projectId = `doc-${metadata.documentId}`,
+      enableVision = false,
+      visionAnalyzer,
+      render3D,
+    } = options;
+
+    logger.info(`Ingesting media file: ${filePath} (${binaryContent.length} bytes)`);
+
+    try {
+      // For media files, we need to write to a temp file for the parser
+      // (the parser reads the file directly for dimensions/GLTF metadata)
+      const fs = await import('fs');
+      const path = await import('path');
+      const os = await import('os');
+
+      const tempDir = os.tmpdir();
+      const tempPath = path.join(tempDir, `ragforge-media-${Date.now()}-${path.basename(filePath)}`);
+
+      // Write buffer to temp file
+      fs.writeFileSync(tempPath, binaryContent);
+
+      try {
+        // Parse media using the MediaParser
+        const parseOptions: MediaParseOptions = {
+          enableVision,
+          visionAnalyzer,
+          render3D,
+        };
+
+        const parseResult = await mediaParser.parse({
+          filePath: tempPath, // Use temp path for parsing
+          projectId,
+          options: parseOptions as Record<string, unknown>,
+        });
+
+        logger.info(`Parsed ${filePath}: ${parseResult.nodes.length} nodes, ${parseResult.relationships.length} relationships`);
+
+        // Update file paths in nodes to use original path instead of temp path
+        for (const node of parseResult.nodes) {
+          if (node.properties.file === tempPath) {
+            node.properties.file = filePath;
+          }
+          if (node.properties.sourcePath === tempPath) {
+            node.properties.sourcePath = filePath;
+          }
+          if (node.properties.absolutePath === tempPath) {
+            node.properties.absolutePath = filePath;
+          }
+          if (node.properties.path === tempPath) {
+            node.properties.path = filePath;
+          }
+
+          // Inject community metadata
+          node.properties.projectId = projectId;
+          node.properties.documentId = metadata.documentId;
+          node.properties.documentTitle = metadata.documentTitle;
+          node.properties.userId = metadata.userId;
+          if (metadata.userUsername) {
+            node.properties.userUsername = metadata.userUsername;
+          }
+          node.properties.categoryId = metadata.categoryId;
+          node.properties.categorySlug = metadata.categorySlug;
+          if (metadata.categoryName) {
+            node.properties.categoryName = metadata.categoryName;
+          }
+          if (metadata.isPublic !== undefined) {
+            node.properties.isPublic = metadata.isPublic;
+          }
+          if (metadata.tags && metadata.tags.length > 0) {
+            node.properties.tags = metadata.tags;
+          }
+          node.properties.sourceType = "community-upload";
+        }
+
+        // Convert ParserNode to ingestion format
+        const graphNodes = parseResult.nodes.map((n) => ({
+          labels: n.labels,
+          id: n.id,
+          properties: n.properties,
+        }));
+
+        const graphRelationships = parseResult.relationships.map((r) => ({
+          type: r.type,
+          from: r.from,
+          to: r.to,
+          properties: r.properties || {},
+        }));
+
+        // Ingest graph into Neo4j
+        await this.ingestionManager!.ingestGraph(
+          { nodes: graphNodes, relationships: graphRelationships },
+          { projectId, markDirty: true }
+        );
+
+        logger.info(`Media file ingested: ${graphNodes.length} nodes, ${graphRelationships.length} relationships`);
+
+        return {
+          nodesCreated: graphNodes.length,
+          relationshipsCreated: graphRelationships.length,
+          warnings: parseResult.warnings,
+        };
+      } finally {
+        // Clean up temp file
+        try {
+          fs.unlinkSync(tempPath);
+        } catch {
+          // Ignore cleanup errors
+        }
+      }
+    } catch (err) {
+      logger.error(`Failed to ingest media file ${filePath}: ${err}`);
+      throw err;
     }
   }
 
@@ -709,16 +1682,47 @@ export class CommunityOrchestratorAdapter {
       filters,
     });
 
-    // Map to community format
-    let communityResults: CommunitySearchResult[] = result.results.map((r) => ({
-      node: r.node,
-      score: r.score,
-      filePath: r.filePath,
-    }));
+    // Map to community format with snippets
+    let communityResults: CommunitySearchResult[] = result.results.map((r) => {
+      const content = (r.node.content || r.node.source || r.node.description || r.node.text || "") as string;
+
+      // Generate snippet: prefer chunkText, fallback to truncated content
+      let snippet: string | undefined;
+      if (r.matchedRange?.chunkText) {
+        // Use the actual chunk text that matched
+        snippet = r.matchedRange.chunkText;
+        if (snippet.length > 800) {
+          snippet = snippet.substring(0, 800) + "...";
+        }
+      } else if (content.length > 500) {
+        // Truncate long content
+        snippet = content.substring(0, 500) + "...";
+      } else {
+        snippet = content;
+      }
+
+      return {
+        node: r.node,
+        score: r.score,
+        filePath: r.filePath,
+        matchedRange: r.matchedRange ? {
+          startLine: r.matchedRange.startLine,
+          endLine: r.matchedRange.endLine,
+          startChar: r.matchedRange.startChar,
+          endChar: r.matchedRange.endChar,
+          chunkIndex: r.matchedRange.chunkIndex,
+          chunkScore: r.matchedRange.chunkScore,
+          pageNum: r.matchedRange.pageNum,
+        } : undefined,
+        snippet,
+      };
+    });
 
     // === Post-processing ===
     let reranked = false;
     let keywordBoosted = false;
+    let entityBoosted = false;
+    let matchingEntities: Array<{ uuid: string; name: string; type: 'Tag' | 'CanonicalEntity'; score: number }> | undefined;
     let relationshipsExplored = false;
     let summarized = false;
     let graph: ExplorationGraph | undefined;
@@ -762,12 +1766,105 @@ export class CommunityOrchestratorAdapter {
       logger.info(`[CommunityOrchestrator] Keyword boost complete`);
     }
 
-    // 3. Apply final limit
+    // 3. Entity/Tag boosting (enabled by default)
+    const entityBoostEnabled = options.entityBoost !== false; // default: true
+    if (entityBoostEnabled && this.entityEmbeddingService && communityResults.length > 0) {
+      const threshold = options.entityMatchThreshold ?? 0.7;
+      const boostWeight = options.entityBoostWeight ?? 0.05;
+
+      try {
+        // 3a. Search for matching entities/tags
+        const entityResults = await this.entityEmbeddingService.search({
+          query: options.query,
+          semantic: true,
+          hybrid: true,
+          limit: 10,
+          minScore: threshold, // Only get strong matches
+        });
+
+        if (entityResults.length > 0) {
+          // Store matching entities for response
+          matchingEntities = entityResults.map(e => ({
+            uuid: e.uuid,
+            name: e.name,
+            type: e.nodeType as 'Tag' | 'CanonicalEntity',
+            score: e.score,  // For matchingEntities in response
+          }));
+
+          // Also create version with matchScore for result.matchedEntities
+          const matchedEntitiesForResults = entityResults.map(e => ({
+            uuid: e.uuid,
+            name: e.name,
+            type: e.nodeType as 'Tag' | 'CanonicalEntity',
+            matchScore: e.score,
+          }));
+
+          logger.info(`[CommunityOrchestrator] Found ${entityResults.length} matching entities/tags (threshold: ${threshold})`);
+
+          // 3b. Get UUIDs of nodes linked to these entities/tags
+          const entityUuids = entityResults.filter(e => e.nodeType === 'CanonicalEntity').map(e => e.uuid);
+          const tagUuids = entityResults.filter(e => e.nodeType === 'Tag').map(e => e.uuid);
+
+          // Query Neo4j to find which result nodes have these entities/tags
+          const linkedNodesQuery = `
+            // Find sections with matching tags
+            OPTIONAL MATCH (section)-[:HAS_TAG]->(tag:Tag)
+            WHERE tag.uuid IN $tagUuids
+            WITH collect(DISTINCT section.uuid) as tagLinkedSections, $tagUuids as tagUuids
+
+            // Find sections with matching entities (via canonical)
+            OPTIONAL MATCH (section)-[:CONTAINS_ENTITY]->(entity:Entity)-[:CANONICAL_IS]->(canonical:CanonicalEntity)
+            WHERE canonical.uuid IN $entityUuids
+            WITH tagLinkedSections, collect(DISTINCT section.uuid) as entityLinkedSections
+
+            // Return all linked section UUIDs
+            RETURN tagLinkedSections + entityLinkedSections as linkedUuids
+          `;
+
+          const linkedResult = await this.neo4j.run(linkedNodesQuery, { tagUuids, entityUuids });
+          const linkedUuids = new Set<string>(
+            linkedResult.records[0]?.get('linkedUuids')?.filter((u: any) => u != null) || []
+          );
+
+          if (linkedUuids.size > 0) {
+            // 3c. Apply boost to results that have matching entities/tags
+            let boostedCount = 0;
+            for (const result of communityResults) {
+              const nodeUuid = result.node.uuid;
+              if (linkedUuids.has(nodeUuid)) {
+                // Find best matching entity/tag for this result
+                const bestMatch = entityResults.reduce((best, e) => e.score > best.score ? e : best, entityResults[0]);
+                const boost = bestMatch.score * boostWeight;
+                result.score += boost;
+                result.entityBoostApplied = boost;
+
+                // Include matched entities if requested
+                if (options.includeMatchedEntities) {
+                  result.matchedEntities = matchedEntitiesForResults;
+                }
+                boostedCount++;
+              }
+            }
+
+            if (boostedCount > 0) {
+              // Re-sort by score
+              communityResults.sort((a, b) => b.score - a.score);
+              entityBoosted = true;
+              logger.info(`[CommunityOrchestrator] Entity boost applied to ${boostedCount} results`);
+            }
+          }
+        }
+      } catch (err: any) {
+        logger.warn(`[CommunityOrchestrator] Entity boost failed: ${err.message}`);
+      }
+    }
+
+    // 4. Apply final limit
     if (communityResults.length > originalLimit) {
       communityResults = communityResults.slice(0, originalLimit);
     }
 
-    // 4. Relationship exploration (if enabled)
+    // 5. Relationship exploration (if enabled)
     if (options.exploreDepth && options.exploreDepth > 0 && communityResults.length > 0 && this.coreClient) {
       logger.info(`[CommunityOrchestrator] Exploring relationships (depth: ${options.exploreDepth})`);
       graph = await exploreRelationships(communityResults, {
@@ -780,7 +1877,7 @@ export class CommunityOrchestratorAdapter {
       }
     }
 
-    // 5. Summarization (if enabled)
+    // 6. Summarization (if enabled)
     if (options.summarize && communityResults.length > 0) {
       const geminiKey = process.env.GEMINI_API_KEY;
       if (geminiKey) {
@@ -803,7 +1900,7 @@ export class CommunityOrchestratorAdapter {
 
     logger.info(`[CommunityOrchestrator] Search returned ${communityResults.length} results`);
 
-    // 6. Format output (if requested)
+    // 7. Format output (if requested)
     let formattedOutput: string | undefined;
     if (options.format === "markdown" || options.format === "compact") {
       // Convert to BrainSearchOutput format for the formatter
@@ -838,6 +1935,8 @@ export class CommunityOrchestratorAdapter {
       totalCount: result.totalCount,
       reranked: reranked || undefined,
       keywordBoosted: keywordBoosted || undefined,
+      entityBoosted: entityBoosted || undefined,
+      matchingEntities: matchingEntities,
       relationshipsExplored: relationshipsExplored || undefined,
       summarized: summarized || undefined,
       graph,

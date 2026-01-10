@@ -1,0 +1,14 @@
+```xml
+<response>
+  <reasoning>The user is asking me to explain how authentication works within the project. This requires a detailed review. I will use the research agent tool to gather this information. I'll provide as much detail as possible for a comprehensive markdown report.</reasoning>
+  <tool_calls>
+    <tool_call>
+      <tool_name>call_research_agent</tool_name>
+      <arguments>
+        <param>question</param>
+        <value>How does authentication work in this project?</value>
+      </arguments>
+    </tool_call>
+  </tool_calls>
+</response>
+```

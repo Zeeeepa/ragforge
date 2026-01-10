@@ -313,10 +313,11 @@ export async function exploreRelationships<T extends ProcessableSearchResult>(
     if (!nodeUuid) continue;
 
     // Add this result to graph nodes
+    // Note: MarkdownSection uses 'title' not 'name', and type comes from labels array
     graphNodes.set(nodeUuid, {
       uuid: nodeUuid,
-      name: r.node?.name || r.node?.signature || 'unnamed',
-      type: r.node?.type || 'unknown',
+      name: r.node?.name || r.node?.title || r.node?.heading || r.node?.signature || 'unnamed',
+      type: r.node?.type || r.node?.nodeType || r.node?.labels?.[0] || 'unknown',
       file: r.node?.file || r.node?.absolutePath,
       startLine: r.node?.startLine,
       endLine: r.node?.endLine,

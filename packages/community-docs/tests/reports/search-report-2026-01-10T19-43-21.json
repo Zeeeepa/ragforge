@@ -1,0 +1,758 @@
+{
+  "timestamp": "2026-01-10T19:43:17.216Z",
+  "apiUrl": "http://127.0.0.1:6970",
+  "searchTests": [
+    {
+      "testCase": {
+        "id": "excel",
+        "description": "Excel Spreadsheet",
+        "expectedFile": "NDA_synth.xlsx",
+        "query": "spreadsheet Excel sheets NDA Aurialink HeliosTrack headers columns rows"
+      },
+      "success": true,
+      "results": [
+        {
+          "documentId": "test-all-documents",
+          "content": "=== Sheet: NDA_Aurialink ===\nHeaders: Section | Content\nRows: 7, Columns: 2\n\n=== Sheet: NDA_HeliosTrack ===\nHeaders: Section | Content\nRows: 7, Columns: 2\n\n",
+          "score": 0.9230958819389343,
+          "sourcePath": "NDA_synth.xlsx",
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "--- Page 1 ---\nAccord de Confidentialité (NDA)\nDate : 14/02/2026\n\nPrestataire : Marion Vautrin\nClient : Aurialink SAS\n\nObjet : Plateforme météo\n\n\n--- Page 2 ---\nAccord de Confidentialité (NDA)\nDate : 22/03/2026\n\nPrestataire : Julien Caradec\nClient : HeliosTrack Technologies\nObjet : Données solaires\n\n\n",
+          "score": 0.7950798273086548,
+          "sourcePath": "image_based.pdf",
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "You can do crazy things with paragraphs, if the urge strikes you. For instance this paragraph is right aligned and has a right border. It has also been given a light gray background.\n\nFor the lovers of poetry amongst you, paragraphs with hanging indents, like this often come in handy. You can use hanging indents to ensure that a line of poetry retains its individual identity as a line even when the screen is  too narrow to display it as a single line. Not only does this paragraph have a hanging indent, it is also has an extra top margin, setting it apart from the preceding paragraph.\n\nTables\n\nITEM\n\nNEEDED\n\nBooks\n\n1\n\nPens\n\n3\n\nPencils\n\n2\n\nHighlighter\n\n2 colors\n\nScissors\n\n1 pair\n\nTables in Word can vary from the extremely simple to the extremely complex. calibre tries to do its best when conv...",
+          "score": 0.7816383838653564,
+          "sourcePath": "docx-with-text-and-images.docx",
+          "matchedRange": {
+            "startLine": 25,
+            "endLine": 201,
+            "startChar": 1676,
+            "endChar": 3616,
+            "chunkIndex": 1,
+            "chunkScore": 0.7816383838653564,
+            "pageNum": 1
+          },
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1,
+            "startLine": 25,
+            "endLine": 201
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "Accord de Confidentialité (NDA)  Date : 14/02/2026  Prestataire : Marion Vautrin  Client : Aurialink SAS  1. Objet du contrat  Collaboration portant sur une plateforme météo. Protection des informations échangées.  2. Définition des informations confidentielles  Documents, code, rapports, spécifications, etc.  3. Obligations  Confidentialité, pas de divulgation, usage exclusif au projet.  4. Exceptions  Informations déjà connues, publiques, obtenues légalement, ou exigées par la loi.  5. Durée  ...",
+          "score": 0.7594055533409119,
+          "sourcePath": "text_only.pdf",
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "arXiv:2506.07647v1 [eess.SP] 9 Jun 2025  1  Foundation Model Empowered Synesthesia of Machines (SoM): AI-native Intelligent Multi-Modal Sensing-Communication Integration  Xiang Cheng,   Fellow, IEEE , Boxun Liu,   Graduate Student Member, IEEE , Xuanyu Liu,   Graduate Student Member, IEEE , Ensong Liu,   Graduate Student Member, IEEE , and Ziwei Huang,   Member, IEEE  Abstract —To support future intelligent multifunctional sixth- generation (6G) wireless communication networks, Synesthesia of Ma...",
+          "score": 0.7370796799659729,
+          "sourcePath": "pdf-with-text-and-images.pdf",
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        }
+      ],
+      "topScore": 0.9230958819389343,
+      "topSourcePath": "NDA_synth.xlsx",
+      "matchedExpected": true
+    },
+    {
+      "testCase": {
+        "id": "3d-model",
+        "description": "3D Model",
+        "expectedFile": "lucie-demon-queen.glb",
+        "query": "demon queen dark figure flowing dress horns"
+      },
+      "success": true,
+      "results": [
+        {
+          "documentId": "test-all-documents",
+          "content": "This is a silhouetted 3D model of a figure wearing a crown, appearing to be a stylized queen or dark monarch character. The figure is rendered entirely in black, creating a stark, shadowy outline against a white background. The design suggests a feminine form with a flowing, voluminous dress or robe that seems to billow or move dramatically at the bottom. \n\nThe character wears a distinctive pointed crown and appears to have long, possibly flowing hair or additional fabric extending from the head...",
+          "score": 0.8947727680206299,
+          "sourcePath": "lucie-demon-queen.glb",
+          "position": {},
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "The image is a hand-drawn sketch in red ink on grid paper, depicting a stylized, symmetrical cross-like figure with several distinctive features:\n\n1. Color: The entire drawing is in a reddish-orange or rust color.\n\n2. Composition: The design is centered on the grid paper and forms a cross shape with additional elements extending from its sides.\n\n3. Central Structure:\n- A vertical column runs down the center with multiple circular eyes or targets\n- The vertical column has a textured or dotted bac...",
+          "score": 0.7768807411193848,
+          "sourcePath": "Symbole macabre sur papier quadrillé - Fond album Egr3gorr.png",
+          "position": {},
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "Five\n\nSix\n\nA Multi-level list with bullets:\n\nOne\n\nTwo\n\nThis bullet uses an image as the bullet item\n\nFour\n\nFive\n\nContinued Lists\n\nOne\n\nTwo\n\nAn interruption in our regularly scheduled listing, for this essential and very relevant public service announcement.\n\nWe now resume our normal programming\n\nFour",
+          "score": 0.694781482219696,
+          "sourcePath": "docx-with-text-and-images.docx",
+          "matchedRange": {
+            "startLine": 613,
+            "endLine": 639,
+            "startChar": 8671,
+            "endChar": 8972,
+            "chunkIndex": 5,
+            "chunkScore": 0.694781482219696,
+            "pageNum": 1
+          },
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1,
+            "startLine": 613,
+            "endLine": 639
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "arXiv:2506.07647v1 [eess.SP] 9 Jun 2025  1  Foundation Model Empowered Synesthesia of Machines (SoM): AI-native Intelligent Multi-Modal Sensing-Communication Integration  Xiang Cheng,   Fellow, IEEE , Boxun Liu,   Graduate Student Member, IEEE , Xuanyu Liu,   Graduate Student Member, IEEE , Ensong Liu,   Graduate Student Member, IEEE , and Ziwei Huang,   Member, IEEE  Abstract —To support future intelligent multifunctional sixth- generation (6G) wireless communication networks, Synesthesia of Ma...",
+          "score": 0.6940227150917053,
+          "sourcePath": "pdf-with-text-and-images.pdf",
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "Accord de Confidentialité (NDA)  Date : 14/02/2026  Prestataire : Marion Vautrin  Client : Aurialink SAS  1. Objet du contrat  Collaboration portant sur une plateforme météo. Protection des informations échangées.  2. Définition des informations confidentielles  Documents, code, rapports, spécifications, etc.  3. Obligations  Confidentialité, pas de divulgation, usage exclusif au projet.  4. Exceptions  Informations déjà connues, publiques, obtenues légalement, ou exigées par la loi.  5. Durée  ...",
+          "score": 0.6940227150917053,
+          "sourcePath": "text_only.pdf",
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        }
+      ],
+      "topScore": 0.8947727680206299,
+      "topSourcePath": "lucie-demon-queen.glb",
+      "matchedExpected": true
+    },
+    {
+      "testCase": {
+        "id": "image",
+        "description": "Image (PNG)",
+        "expectedFile": "Symbole macabre",
+        "query": "macabre symbol red ink graph paper occult sketch"
+      },
+      "success": true,
+      "results": [
+        {
+          "documentId": "test-all-documents",
+          "content": "The image is a hand-drawn sketch in red ink on grid paper, depicting a stylized, symmetrical cross-like figure with several distinctive features:\n\n1. Color: The entire drawing is in a reddish-orange or rust color.\n\n2. Composition: The design is centered on the grid paper and forms a cross shape with additional elements extending from its sides.\n\n3. Central Structure:\n- A vertical column runs down the center with multiple circular eyes or targets\n- The vertical column has a textured or dotted bac...",
+          "score": 0.9258213639259338,
+          "sourcePath": "Symbole macabre sur papier quadrillé - Fond album Egr3gorr.png",
+          "position": {},
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "This is a silhouetted 3D model of a figure wearing a crown, appearing to be a stylized queen or dark monarch character. The figure is rendered entirely in black, creating a stark, shadowy outline against a white background. The design suggests a feminine form with a flowing, voluminous dress or robe that seems to billow or move dramatically at the bottom. \n\nThe character wears a distinctive pointed crown and appears to have long, possibly flowing hair or additional fabric extending from the head...",
+          "score": 0.7985678911209106,
+          "sourcePath": "lucie-demon-queen.glb",
+          "position": {},
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "You can do crazy things with paragraphs, if the urge strikes you. For instance this paragraph is right aligned and has a right border. It has also been given a light gray background.\n\nFor the lovers of poetry amongst you, paragraphs with hanging indents, like this often come in handy. You can use hanging indents to ensure that a line of poetry retains its individual identity as a line even when the screen is  too narrow to display it as a single line. Not only does this paragraph have a hanging indent, it is also has an extra top margin, setting it apart from the preceding paragraph.\n\nTables\n\nITEM\n\nNEEDED\n\nBooks\n\n1\n\nPens\n\n3\n\nPencils\n\n2\n\nHighlighter\n\n2 colors\n\nScissors\n\n1 pair\n\nTables in Word can vary from the extremely simple to the extremely complex. calibre tries to do its best when conv...",
+          "score": 0.7631900310516357,
+          "sourcePath": "docx-with-text-and-images.docx",
+          "matchedRange": {
+            "startLine": 25,
+            "endLine": 201,
+            "startChar": 1676,
+            "endChar": 3616,
+            "chunkIndex": 1,
+            "chunkScore": 0.7631900310516357,
+            "pageNum": 1
+          },
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1,
+            "startLine": 25,
+            "endLine": 201
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "Quek, “Per- sonalizing Semantic Communication: A Foundation Model Approach,” in   IEEE Workshop Signal Process.\n\nAdv. Wireless Commun. (SPAWC) . Lucca, Italy: IEEE, Sep. 2024, pp. 846– 850. [86] X.\n\nCheng   et al. , “M 3 SC: A Generic Dataset for Mixed Multi- Modal   (MMM)   Sensing   and   Communication   Integration,”  China Commun. , vol. 20, no. 11, pp. 13–29, Nov. 2023. [87] D.\n\nYang   et al. , “UniAudio: An Audio Foundation Model Toward   Universal   Audio   Generation,”   arXiv   preprint arXiv:2310.00704 , 2023. [88] H.\n\nChang, H. Zhang, L. Jiang, C. Liu, and W. T.\n\nFreeman, “MaskGIT: Masked Generative Image Transformer,” in   Proc. IEEE Conf. Comput. Vis.\n\nPattern Recognit. (CVPR) , New Orleans, LA, USA, Jun. 2022, pp. 11 315–11 325. [89] C.\n\nBluethgen   et al. , “A Vision-Languag...",
+          "score": 0.7176867723464966,
+          "sourcePath": "pdf-with-text-and-images.pdf",
+          "matchedRange": {
+            "startLine": 19,
+            "endLine": 20,
+            "startChar": 108483,
+            "endChar": 110447,
+            "chunkIndex": 64,
+            "chunkScore": 0.7176867723464966,
+            "pageNum": 1
+          },
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1,
+            "startLine": 19,
+            "endLine": 20
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "=== Sheet: NDA_Aurialink ===\nHeaders: Section | Content\nRows: 7, Columns: 2\n\n=== Sheet: NDA_HeliosTrack ===\nHeaders: Section | Content\nRows: 7, Columns: 2\n\n",
+          "score": 0.7125223875045776,
+          "sourcePath": "NDA_synth.xlsx",
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        }
+      ],
+      "topScore": 0.9258213639259338,
+      "topSourcePath": "Symbole macabre sur papier quadrillé - Fond album Egr3gorr.png",
+      "matchedExpected": true
+    },
+    {
+      "testCase": {
+        "id": "pdf-research",
+        "description": "PDF with text and images",
+        "expectedFile": "pdf-with-text-and-images.pdf",
+        "query": "6G wireless communication foundation models AI cellular networks"
+      },
+      "success": true,
+      "results": [
+        {
+          "documentId": "test-all-documents",
+          "content": "Bai, Z. Huang, M. Sun, X. Cheng, and L.\n\nCui, “Multi-Modal Intelligent Channel Modeling: A New Modeling Paradigm via Synesthesia of Machines,”   IEEE Commun.\n\nSurv. Tutorials , 2025. [8] X.\n\nCheng   et al. , “SynthSoM: A Synthetic Intelligent Multi- Modal   Sensing-Communication   Dataset   for   Synesthesia of Machines (SoM),”   Sci.\n\nData , vol. 12, no. 819, May 2025. [9] M. Sun, L. Bai, Z. Huang, and X.\n\nCheng, “Multi-Modal Sensing Data Based Real-Time Path Loss Prediction for 6G UAV-to-Ground Communications,”   IEEE Wireless Commun. , vol. 13, no. 9, pp. 2462–2466, Sept. 2024.\n\n18  [10] H. Zhang,   S. Gao,   X. Cheng,   and   L.\n\nYang,   “Integrated Sensing and Communications Towards Proactive Beamforming in mmWave V2I via Multi-Modal Feature Fusion (MMFF),”  IEEE Trans.\n\nWireless Comm...",
+          "score": 0.8840650320053101,
+          "sourcePath": "pdf-with-text-and-images.pdf",
+          "matchedRange": {
+            "startLine": 17,
+            "endLine": 18,
+            "startChar": 94321,
+            "endChar": 96275,
+            "chunkIndex": 56,
+            "chunkScore": 0.8840650320053101,
+            "pageNum": 1
+          },
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1,
+            "startLine": 17,
+            "endLine": 18
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "=== Sheet: NDA_Aurialink ===\nHeaders: Section | Content\nRows: 7, Columns: 2\n\n=== Sheet: NDA_HeliosTrack ===\nHeaders: Section | Content\nRows: 7, Columns: 2\n\n",
+          "score": 0.6900849342346191,
+          "sourcePath": "NDA_synth.xlsx",
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "--- Page 1 ---\nAccord de Confidentialité (NDA)\nDate : 14/02/2026\n\nPrestataire : Marion Vautrin\nClient : Aurialink SAS\n\nObjet : Plateforme météo\n\n\n--- Page 2 ---\nAccord de Confidentialité (NDA)\nDate : 22/03/2026\n\nPrestataire : Julien Caradec\nClient : HeliosTrack Technologies\nObjet : Données solaires\n\n\n",
+          "score": 0.6898719072341919,
+          "sourcePath": "image_based.pdf",
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "Accord de Confidentialité (NDA)  Date : 14/02/2026  Prestataire : Marion Vautrin  Client : Aurialink SAS  1. Objet du contrat  Collaboration portant sur une plateforme météo. Protection des informations échangées.  2. Définition des informations confidentielles  Documents, code, rapports, spécifications, etc.  3. Obligations  Confidentialité, pas de divulgation, usage exclusif au projet.  4. Exceptions  Informations déjà connues, publiques, obtenues légalement, ou exigées par la loi.  5. Durée  ...",
+          "score": 0.6883596181869507,
+          "sourcePath": "text_only.pdf",
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "Demonstration of DOCX support in calibre\n\nThis document demonstrates the ability of the calibre DOCX Input plugin to convert the various typographic features in a Microsoft Word (2007 and newer) document. Convert this document to a modern ebook format, such as AZW3 for Kindles or EPUB for other ebook readers, to see it in action.\n\nThere is support for images, tables, lists, footnotes, endnotes, links, dropcaps and various types of text and paragraph level formatting.\n\nTo see the DOCX conversion ...",
+          "score": 0.6852675676345825,
+          "sourcePath": "docx-with-text-and-images.docx",
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        }
+      ],
+      "topScore": 0.8840650320053101,
+      "topSourcePath": "pdf-with-text-and-images.pdf",
+      "matchedExpected": true
+    },
+    {
+      "testCase": {
+        "id": "pdf-text",
+        "description": "PDF text only",
+        "expectedFile": "text_only.pdf",
+        "query": "NDA accord confidentialité Rennes février 2026 objet contrat obligations"
+      },
+      "success": true,
+      "results": [
+        {
+          "documentId": "test-all-documents",
+          "content": "Accord de Confidentialité (NDA)  Date : 14/02/2026  Prestataire : Marion Vautrin  Client : Aurialink SAS  1. Objet du contrat  Collaboration portant sur une plateforme météo. Protection des informations échangées.  2. Définition des informations confidentielles  Documents, code, rapports, spécifications, etc.  3. Obligations  Confidentialité, pas de divulgation, usage exclusif au projet.  4. Exceptions  Informations déjà connues, publiques, obtenues légalement, ou exigées par la loi.  5. Durée  ...",
+          "score": 0.9221420288085938,
+          "sourcePath": "text_only.pdf",
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "--- Page 1 ---\nAccord de Confidentialité (NDA)\nDate : 14/02/2026\n\nPrestataire : Marion Vautrin\nClient : Aurialink SAS\n\nObjet : Plateforme météo\n\n\n--- Page 2 ---\nAccord de Confidentialité (NDA)\nDate : 22/03/2026\n\nPrestataire : Julien Caradec\nClient : HeliosTrack Technologies\nObjet : Données solaires\n\n\n",
+          "score": 0.8790196180343628,
+          "sourcePath": "image_based.pdf",
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "=== Sheet: NDA_Aurialink ===\nHeaders: Section | Content\nRows: 7, Columns: 2\n\n=== Sheet: NDA_HeliosTrack ===\nHeaders: Section | Content\nRows: 7, Columns: 2\n\n",
+          "score": 0.7695646286010742,
+          "sourcePath": "NDA_synth.xlsx",
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "arXiv:2506.07647v1 [eess.SP] 9 Jun 2025  1  Foundation Model Empowered Synesthesia of Machines (SoM): AI-native Intelligent Multi-Modal Sensing-Communication Integration  Xiang Cheng,   Fellow, IEEE , Boxun Liu,   Graduate Student Member, IEEE , Xuanyu Liu,   Graduate Student Member, IEEE , Ensong Liu,   Graduate Student Member, IEEE , and Ziwei Huang,   Member, IEEE  Abstract —To support future intelligent multifunctional sixth- generation (6G) wireless communication networks, Synesthesia of Ma...",
+          "score": 0.725858747959137,
+          "sourcePath": "pdf-with-text-and-images.pdf",
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "Demonstration of DOCX support in calibre\n\nThis document demonstrates the ability of the calibre DOCX Input plugin to convert the various typographic features in a Microsoft Word (2007 and newer) document. Convert this document to a modern ebook format, such as AZW3 for Kindles or EPUB for other ebook readers, to see it in action.\n\nThere is support for images, tables, lists, footnotes, endnotes, links, dropcaps and various types of text and paragraph level formatting.\n\nTo see the DOCX conversion ...",
+          "score": 0.725858747959137,
+          "sourcePath": "docx-with-text-and-images.docx",
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        }
+      ],
+      "topScore": 0.9221420288085938,
+      "topSourcePath": "text_only.pdf",
+      "matchedExpected": true
+    },
+    {
+      "testCase": {
+        "id": "docx",
+        "description": "Word Document",
+        "expectedFile": "docx-with-text-and-images.docx",
+        "query": "Kindle ebook conversion Calibre font embedding EPUB"
+      },
+      "success": true,
+      "results": [
+        {
+          "documentId": "test-all-documents",
+          "content": "Demonstration of DOCX support in calibre\n\nThis document demonstrates the ability of the calibre DOCX Input plugin to convert the various typographic features in a Microsoft Word (2007 and newer) document. Convert this document to a modern ebook format, such as AZW3 for Kindles or EPUB for other ebook readers, to see it in action.\n\nThere is support for images, tables, lists, footnotes, endnotes, links, dropcaps and various types of text and paragraph level formatting.\n\nTo see the DOCX conversion in action, simply add this file to calibre using the “Add Books” button and then click “Convert”.  Set the output format in the top right corner of the conversion dialog to EPUB or AZW3 and click “OK”.\n\nText Formatting\n\nInline formatting\n\nHere, we demonstrate various types of inline text formatting ...",
+          "score": 0.8694312572479248,
+          "sourcePath": "docx-with-text-and-images.docx",
+          "matchedRange": {
+            "startLine": 1,
+            "endLine": 27,
+            "startChar": 0,
+            "endChar": 1858,
+            "chunkIndex": 0,
+            "chunkScore": 0.8694312572479248,
+            "pageNum": 1
+          },
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1,
+            "startLine": 1,
+            "endLine": 27
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "Guo   et al. , “What Indeed Can GPT Models Do In Chem- istry?\n\nA Comprehensive Benchmark On Eight Tasks,”   arXiv preprint arXiv:2305.18365 , 2023. [28] Q.\n\nZhang   et al. , “Scientific Large Language Models: A Survey on Biological & Chemical Domains,”   ACM Comput.\n\nSurv. , vol. 57, no. 6, pp. 1–38, Feb. 2025. [29] X.\n\nHou   et al. , “Large Language Models for Software Engineer- ing: A Systematic Literature Review,”   ACM Trans.\n\nSoftware Eng. Methodol. , vol. 33, no. 8, pp. 1–79, Dec. 2024. [30] Z. Han, C. Gao, J. Liu, J.\n\nZhang, and S. Q.\n\nZhang, “Parameter- Efficient Fine-Tuning for Large Models: A Comprehensive Survey,”   arXiv preprint arXiv:2403.14608 , 2024. [31] P.\n\nSahoo, A. K. Singh, S. Saha, V. Jain, S. Mondal, and A.\n\nChadha, “A Systematic Survey of Prompt Engineering in Large...",
+          "score": 0.7274911999702454,
+          "sourcePath": "pdf-with-text-and-images.pdf",
+          "matchedRange": {
+            "startLine": 18,
+            "endLine": 18,
+            "startChar": 97825,
+            "endChar": 99825,
+            "chunkIndex": 58,
+            "chunkScore": 0.7274911999702454,
+            "pageNum": 1
+          },
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1,
+            "startLine": 18,
+            "endLine": 18
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "=== Sheet: NDA_Aurialink ===\nHeaders: Section | Content\nRows: 7, Columns: 2\n\n=== Sheet: NDA_HeliosTrack ===\nHeaders: Section | Content\nRows: 7, Columns: 2\n\n",
+          "score": 0.7270317077636719,
+          "sourcePath": "NDA_synth.xlsx",
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "This is a silhouetted 3D model of a figure wearing a crown, appearing to be a stylized queen or dark monarch character. The figure is rendered entirely in black, creating a stark, shadowy outline against a white background. The design suggests a feminine form with a flowing, voluminous dress or robe that seems to billow or move dramatically at the bottom. \n\nThe character wears a distinctive pointed crown and appears to have long, possibly flowing hair or additional fabric extending from the head...",
+          "score": 0.6964795589447021,
+          "sourcePath": "lucie-demon-queen.glb",
+          "position": {},
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "The image is a hand-drawn sketch in red ink on grid paper, depicting a stylized, symmetrical cross-like figure with several distinctive features:\n\n1. Color: The entire drawing is in a reddish-orange or rust color.\n\n2. Composition: The design is centered on the grid paper and forms a cross shape with additional elements extending from its sides.\n\n3. Central Structure:\n- A vertical column runs down the center with multiple circular eyes or targets\n- The vertical column has a textured or dotted bac...",
+          "score": 0.695321798324585,
+          "sourcePath": "Symbole macabre sur papier quadrillé - Fond album Egr3gorr.png",
+          "position": {},
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        }
+      ],
+      "topScore": 0.8694312572479248,
+      "topSourcePath": "docx-with-text-and-images.docx",
+      "matchedExpected": true
+    },
+    {
+      "testCase": {
+        "id": "pdf-image",
+        "description": "Image-based PDF (scanned)",
+        "expectedFile": "image_based.pdf",
+        "query": "Julien Caradec HeliosTrack Technologies données solaires NDA",
+        "minScore": 0.5
+      },
+      "success": true,
+      "results": [
+        {
+          "documentId": "test-all-documents",
+          "content": "--- Page 1 ---\nAccord de Confidentialité (NDA)\nDate : 14/02/2026\n\nPrestataire : Marion Vautrin\nClient : Aurialink SAS\n\nObjet : Plateforme météo\n\n\n--- Page 2 ---\nAccord de Confidentialité (NDA)\nDate : 22/03/2026\n\nPrestataire : Julien Caradec\nClient : HeliosTrack Technologies\nObjet : Données solaires\n\n\n",
+          "score": 0.8895652294158936,
+          "sourcePath": "image_based.pdf",
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "Accord de Confidentialité (NDA)  Date : 14/02/2026  Prestataire : Marion Vautrin  Client : Aurialink SAS  1. Objet du contrat  Collaboration portant sur une plateforme météo. Protection des informations échangées.  2. Définition des informations confidentielles  Documents, code, rapports, spécifications, etc.  3. Obligations  Confidentialité, pas de divulgation, usage exclusif au projet.  4. Exceptions  Informations déjà connues, publiques, obtenues légalement, ou exigées par la loi.  5. Durée  ...",
+          "score": 0.8276962041854858,
+          "sourcePath": "text_only.pdf",
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "=== Sheet: NDA_Aurialink ===\nHeaders: Section | Content\nRows: 7, Columns: 2\n\n=== Sheet: NDA_HeliosTrack ===\nHeaders: Section | Content\nRows: 7, Columns: 2\n\n",
+          "score": 0.803909182548523,
+          "sourcePath": "NDA_synth.xlsx",
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "and (b) demonstrate a close agree- ment between the ray-tracing-based path loss map and the generated path loss map via the WiCo-PG scheme through the powerful cross-modal generation ability of FMs.\n\nSpecifically, the generated path loss map via the WiCo-PG scheme accu- rately identifies and reconstructs building contours, and further precisely generates path loss caused by buildings.\n\nCompared with the LLM-based scheme based on GPT-2 in Fig. 7(c), the WiCo-PG scheme achieves over 3% higher accuracy in path loss generation.\n\nFurthermore, a huge difference between the ray-tracing-based path loss map and the generated path loss map via the task-specific model, i.e., GAN, can be observed in Figs. 7(a) and (d), where path loss generation is blurred on building contours.\n\nThe parameter size and...",
+          "score": 0.7355678677558899,
+          "sourcePath": "pdf-with-text-and-images.pdf",
+          "matchedRange": {
+            "startLine": 13,
+            "endLine": 14,
+            "startChar": 70609,
+            "endChar": 72091,
+            "chunkIndex": 42,
+            "chunkScore": 0.7355678677558899,
+            "pageNum": 1
+          },
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1,
+            "startLine": 13,
+            "endLine": 14
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        },
+        {
+          "documentId": "test-all-documents",
+          "content": "Demonstration of DOCX support in calibre\n\nThis document demonstrates the ability of the calibre DOCX Input plugin to convert the various typographic features in a Microsoft Word (2007 and newer) document. Convert this document to a modern ebook format, such as AZW3 for Kindles or EPUB for other ebook readers, to see it in action.\n\nThere is support for images, tables, lists, footnotes, endnotes, links, dropcaps and various types of text and paragraph level formatting.\n\nTo see the DOCX conversion ...",
+          "score": 0.6883901953697205,
+          "sourcePath": "docx-with-text-and-images.docx",
+          "position": {
+            "pageNum": 1,
+            "sectionIndex": 1
+          },
+          "metadata": {
+            "documentTitle": "Test All Document Types",
+            "categoryId": "test-category",
+            "categorySlug": "test"
+          }
+        }
+      ],
+      "topScore": 0.8895652294158936,
+      "topSourcePath": "image_based.pdf",
+      "matchedExpected": true
+    }
+  ],
+  "entityTests": [
+    {
+      "query": "Aurialink",
+      "results": [
+        {
+          "name": "Aurialink SAS",
+          "entityType": "Organization",
+          "score": 0.4
+        }
+      ]
+    },
+    {
+      "query": "Marion Vautrin",
+      "results": [
+        {
+          "name": "Marion Vautrin",
+          "entityType": "Person",
+          "score": 0.4
+        }
+      ]
+    },
+    {
+      "query": "confidentiality",
+      "results": [
+        {
+          "name": "confidentiality-agreement",
+          "score": 0.4
+        },
+        {
+          "name": "Confidentiality Agreement",
+          "entityType": "DateEvent",
+          "score": 0.35000000000000003
+        },
+        {
+          "name": "Confidentiality Agreement Dates",
+          "entityType": "DateEvent",
+          "score": 0.30000000000000004
+        }
+      ]
+    }
+  ],
+  "indexedFiles": [
+    "ragforge-media-1768074052466-lucie-demon-queen.glb.glb",
+    "ragforge-media-1768074060499-Symbole macabre sur papier quadrillé - Fond album Egr3gorr.png.png",
+    "image_based.pdf",
+    "pdf-with-text-and-images.pdf",
+    "text_only.pdf",
+    "docx-with-text-and-images.docx",
+    "NDA_synth.xlsx",
+    "lucie-demon-queen.glb",
+    "Symbole macabre sur papier quadrillé - Fond album Egr3gorr.png"
+  ],
+  "summary": {
+    "total": 7,
+    "passed": 7,
+    "failed": 0,
+    "avgScore": 0.9012705087661743
+  }
+}

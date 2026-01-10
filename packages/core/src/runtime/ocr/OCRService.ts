@@ -10,6 +10,7 @@
 import type { OCRProvider, OCRResult, OCROptions, BatchOCRResult, OCRProviderType } from './types.js';
 import { GeminiOCRProvider } from './GeminiOCRProvider.js';
 import { ReplicateOCRProvider } from './ReplicateOCRProvider.js';
+import { ClaudeOCRProvider } from './ClaudeOCRProvider.js';
 
 export interface OCRServiceOptions {
   /** Primary provider to use */
@@ -33,11 +34,12 @@ export class OCRService {
 
   constructor(options: OCRServiceOptions = {}) {
     this.primaryProvider = options.primaryProvider || 'gemini';
-    this.enableFallback = options.enableFallback ?? true;
+    this.enableFallback = options.enableFallback ?? false; // No fallback by default - use chosen provider only
     this.concurrency = options.concurrency || 3;
 
-    // Initialize providers
+    // Initialize providers (order matters for fallback)
     this.providers.set('gemini', new GeminiOCRProvider());
+    this.providers.set('claude', new ClaudeOCRProvider());
     this.providers.set('replicate-deepseek', new ReplicateOCRProvider());
   }
 
@@ -99,7 +101,7 @@ export class OCRService {
         imagePath,
         text: '',
         provider: this.primaryProvider,
-        error: 'No OCR provider available. Set GEMINI_API_KEY or REPLICATE_API_TOKEN.',
+        error: 'No OCR provider available. Set GEMINI_API_KEY, ANTHROPIC_API_KEY, or REPLICATE_API_TOKEN.',
       };
     }
 
@@ -135,7 +137,7 @@ export class OCRService {
         imagePath: 'inline-image',
         text: '',
         provider: this.primaryProvider,
-        error: 'No OCR provider available. Set GEMINI_API_KEY or REPLICATE_API_TOKEN.',
+        error: 'No OCR provider available. Set GEMINI_API_KEY, ANTHROPIC_API_KEY, or REPLICATE_API_TOKEN.',
       };
     }
 

@@ -57,6 +57,9 @@ export type {
   ParserNode,
   ParserRelationship,
   ParseOutput,
+  // Parse options
+  MediaParseOptions,
+  DocumentParseOptions,
   // Content parser interface
   ContentParser,
   // Utility types

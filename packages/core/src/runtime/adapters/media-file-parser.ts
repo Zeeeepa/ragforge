@@ -128,7 +128,7 @@ export interface MediaAnalysis {
 }
 
 /**
- * Parse options
+ * Parse options (metadata extraction only, vision handled by MediaParser)
  */
 export interface MediaFileParseOptions {
   /** Try to extract image dimensions (requires reading file header) */

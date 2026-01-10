@@ -277,17 +277,104 @@ export interface NodeTypeDefinition {
  * Input to a parser.
  */
 export interface ParseInput {
-  /** Absolute path to the file */
+  /** Absolute path to the file (or virtual path for uploaded files) */
   filePath: string;
 
-  /** File content (if already read) */
+  /** File content as string (if already read - for text files) */
   content?: string;
+
+  /** File content as Buffer (for binary files like PDF, DOCX) */
+  binaryContent?: Buffer;
 
   /** Project ID */
   projectId: string;
 
   /** Parser-specific options */
   options?: Record<string, unknown>;
+}
+
+/**
+ * Options for media parsing (images, 3D models)
+ */
+export interface MediaParseOptions {
+  /**
+   * Enable Vision API for analyzing images and 3D model renders.
+   * - For images: generates a description using vision analysis
+   * - For 3D models: renders views and describes them using vision
+   * @default false
+   */
+  enableVision?: boolean;
+
+  /**
+   * Vision analyzer function (required if enableVision is true).
+   * Takes image buffer and optional prompt, returns description.
+   */
+  visionAnalyzer?: (imageBuffer: Buffer, prompt?: string) => Promise<string>;
+
+  /**
+   * 3D render function (required for 3D models if enableVision is true).
+   * Takes model path, returns rendered image buffers for each view.
+   */
+  render3D?: (modelPath: string) => Promise<{ view: string; buffer: Buffer }[]>;
+}
+
+/**
+ * Options for document parsing (PDF, DOCX, etc.)
+ */
+export interface DocumentParseOptions {
+  /**
+   * Enable Vision API for analyzing images in the document.
+   * When enabled, images are rendered and analyzed with a vision model.
+   * @default false
+   */
+  enableVision?: boolean;
+
+  /**
+   * Vision provider to use when enableVision is true.
+   * @default 'gemini'
+   */
+  visionProvider?: 'gemini' | 'claude';
+
+  /**
+   * Vision analyzer function (required if enableVision is true).
+   * Takes image buffer and optional prompt, returns description.
+   */
+  visionAnalyzer?: (imageBuffer: Buffer, prompt?: string) => Promise<string>;
+
+  /**
+   * Section title detection mode.
+   * - 'none': No section titles, just paragraphs
+   * - 'detect': Heuristic detection of titles (I., A., Abstract, etc.)
+   * - 'llm': Use LLM to analyze document structure
+   * @default 'detect'
+   */
+  sectionTitles?: 'none' | 'detect' | 'llm';
+
+  /**
+   * Maximum number of pages to process (for large documents).
+   * @default undefined (all pages)
+   */
+  maxPages?: number;
+
+  /**
+   * Minimum paragraph length to keep as separate section.
+   * @default 50
+   */
+  minParagraphLength?: number;
+
+  /**
+   * Generate titles for sections that don't have one using LLM.
+   * When enabled, sections without titles will get AI-generated titles
+   * based on their content.
+   * @default false (core), true (community-docs)
+   */
+  generateTitles?: boolean;
+
+  /**
+   * LLM provider for title generation (required if generateTitles is true).
+   * Must implement the LLMProvider interface.
+   */
+  titleGenerator?: (sections: Array<{ index: number; content: string }>) => Promise<Array<{ index: number; title: string }>>;
 }
 
 /**

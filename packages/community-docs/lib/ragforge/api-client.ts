@@ -226,13 +226,23 @@ export class RagForgeAPIClient {
 
   /**
    * Ingest a file with parsing (uses @ragforge/core parsers)
-   * This properly parses TypeScript, Python, Markdown, PDF, DOCX, etc.
+   *
+   * For binary documents (PDF, DOCX, etc.), uses the new DocumentParser which creates:
+   * - File node with original path (e.g., "paper.pdf")
+   * - MarkdownDocument node
+   * - MarkdownSection nodes
+   *
+   * For text files, uses the standard code/markdown parsers.
    */
   async ingestFile(params: {
     filePath: string;
     content?: Buffer;
     metadata: CommunityNodeMetadata;
     generateEmbeddings?: boolean;
+    /** Enable Vision-based parsing for PDF (default: false) */
+    enableVision?: boolean;
+    /** Section title detection mode (default: 'detect') */
+    sectionTitles?: 'none' | 'detect' | 'llm';
   }): Promise<{
     success: boolean;
     documentId: string;
@@ -252,6 +262,8 @@ export class RagForgeAPIClient {
         content: params.content?.toString("base64"),
         metadata: params.metadata,
         generateEmbeddings: params.generateEmbeddings ?? true,
+        enableVision: params.enableVision ?? false,
+        sectionTitles: params.sectionTitles ?? 'detect',
       }),
     });
 
@@ -269,8 +281,8 @@ export class RagForgeAPIClient {
     return {
       success: true,
       documentId: params.metadata.documentId,
-      nodeCount: data.nodeCount,
-      relationshipCount: data.relationshipCount,
+      nodeCount: data.nodesCreated,
+      relationshipCount: data.relationshipsCreated,
       embeddingsGenerated: data.embeddingsGenerated,
       parseTimeMs: data.parseTimeMs,
       totalTimeMs: data.totalTimeMs,

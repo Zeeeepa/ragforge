@@ -51,7 +51,7 @@ export {
 } from './tools/file-tools.js';
 export type { FileToolsContext, FileToolsResult } from './tools/file-tools.js';
 
-// Image Tools (OCR, describe, list, generate images, multiview)
+// Image Tools (OCR, describe, list, generate images, multiview, analyze visual)
 export {
   generateImageTools,
   generateReadImageTool,
@@ -59,11 +59,13 @@ export {
   generateListImagesTool,
   generateGenerateImageTool,
   generateGenerateMultiviewImagesTool,
+  generateAnalyzeVisualTool,
   generateReadImageHandler,
   generateDescribeImageHandler,
   generateListImagesHandler,
   generateGenerateImageHandler,
   generateGenerateMultiviewImagesHandler,
+  generateAnalyzeVisualHandler,
 } from './tools/image-tools.js';
 export type { ImageToolsContext, ImageToolsResult } from './tools/image-tools.js';
 
@@ -339,6 +341,9 @@ export type {
   ContentParser,
   NodeTypeDefinition,
   ChunkingConfig,
+  // Parse options (for Vision-enabled parsing)
+  MediaParseOptions,
+  DocumentParseOptions,
   // Graph types
   MergeNode,
   MergeRelationship,

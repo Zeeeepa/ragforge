@@ -109,6 +109,10 @@ export interface ServiceSearchResult {
     endChar: number;
     chunkIndex: number;
     chunkScore: number;
+    /** The actual chunk text that matched */
+    chunkText?: string;
+    /** Page number from parent document (for PDFs/Word docs) */
+    pageNum?: number | null;
   };
   /** Details about how this result was found in hybrid search */
   rrfDetails?: {
@@ -447,7 +451,7 @@ export class SearchService {
 
     // Merge and deduplicate results
     const allResults: ServiceSearchResult[] = [];
-    const seenUuids = new Set<string>();
+    const uuidToIndex = new Map<string, number>(); // Track uuid -> index for score updates
     const chunkMatches = new Map<string, { chunk: Record<string, any>; score: number; parentLabel: string }>();
 
     for (const queryResults of allQueryResults) {
@@ -468,10 +472,16 @@ export class SearchService {
           continue;
         }
 
-        // Skip duplicates
-        if (seenUuids.has(uuid)) continue;
-        seenUuids.add(uuid);
+        // Check for duplicates - update score if new one is higher
+        const existingIndex = uuidToIndex.get(uuid);
+        if (existingIndex !== undefined) {
+          if (score > allResults[existingIndex].score) {
+            allResults[existingIndex].score = score;
+          }
+          continue;
+        }
 
+        uuidToIndex.set(uuid, allResults.length);
         allResults.push({
           node: this.stripEmbeddingFields(rawNode),
           score,
@@ -482,7 +492,7 @@ export class SearchService {
 
     // Resolve chunk matches to parent nodes
     if (chunkMatches.size > 0) {
-      await this.resolveChunkMatches(chunkMatches, seenUuids, allResults, params);
+      await this.resolveChunkMatches(chunkMatches, uuidToIndex, allResults, params);
     }
 
     // Sort and limit
@@ -495,7 +505,7 @@ export class SearchService {
    */
   private async resolveChunkMatches(
     chunkMatches: Map<string, { chunk: Record<string, any>; score: number; parentLabel: string }>,
-    seenUuids: Set<string>,
+    uuidToIndex: Map<string, number>,
     allResults: ServiceSearchResult[],
     params: Record<string, any>
   ): Promise<void> {
@@ -522,15 +532,33 @@ export class SearchService {
           const parentNode = { ...node.properties, labels: node.labels };
           const parentUuid = parentNode.uuid;
 
-          if (seenUuids.has(parentUuid)) continue;
-          seenUuids.add(parentUuid);
-
           const match = chunkMatches.get(parentUuid)!;
           const chunk = match.chunk;
+          const chunkScore = match.score;
 
+          // Check if parent already exists - update score if chunk score is higher
+          const existingIndex = uuidToIndex.get(parentUuid);
+          if (existingIndex !== undefined) {
+            if (chunkScore > allResults[existingIndex].score) {
+              allResults[existingIndex].score = chunkScore;
+              allResults[existingIndex].matchedRange = {
+                startLine: chunk.startLine ?? 1,
+                endLine: chunk.endLine ?? 1,
+                startChar: chunk.startChar ?? 0,
+                endChar: chunk.endChar ?? 0,
+                chunkIndex: chunk.chunkIndex ?? 0,
+                chunkScore: chunkScore,
+                chunkText: chunk.text as string | undefined,
+                pageNum: chunk.pageNum as number | null | undefined,
+              };
+            }
+            continue;
+          }
+
+          uuidToIndex.set(parentUuid, allResults.length);
           allResults.push({
             node: this.stripEmbeddingFields(parentNode),
-            score: match.score,
+            score: chunkScore,
             filePath: parentNode.absolutePath || parentNode.file || parentNode.path,
             matchedRange: {
               startLine: chunk.startLine ?? 1,
@@ -538,7 +566,9 @@ export class SearchService {
               startChar: chunk.startChar ?? 0,
               endChar: chunk.endChar ?? 0,
               chunkIndex: chunk.chunkIndex ?? 0,
-              chunkScore: match.score,
+              chunkScore: chunkScore,
+              chunkText: chunk.text as string | undefined,
+              pageNum: chunk.pageNum as number | null | undefined,
             },
           });
         }

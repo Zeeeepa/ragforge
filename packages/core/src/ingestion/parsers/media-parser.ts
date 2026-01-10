@@ -11,6 +11,7 @@
  */
 
 import * as path from 'path';
+import * as fs from 'fs';
 import type {
   ContentParser,
   NodeTypeDefinition,
@@ -19,6 +20,7 @@ import type {
   ParserNode,
   ParserRelationship,
   FieldExtractors,
+  MediaParseOptions,
 } from '../parser-types.js';
 import {
   parseMediaFile,
@@ -214,12 +216,20 @@ export class MediaParser implements ContentParser {
 
   /**
    * Parse a media file into nodes and relationships
+   *
+   * Supports Vision analysis for images and 3D models when enableVision=true.
+   * - Images: analyzed directly with visionAnalyzer
+   * - 3D models: rendered to images, then each view analyzed with visionAnalyzer
    */
   async parse(input: ParseInput): Promise<ParseOutput> {
     const startTime = Date.now();
     const nodes: ParserNode[] = [];
     const relationships: ParserRelationship[] = [];
     const warnings: string[] = [];
+
+    // Get parse options
+    const options = (input.options || {}) as MediaParseOptions;
+    const { enableVision = false, visionAnalyzer, render3D } = options;
 
     try {
       const mediaInfo = await parseMediaFile(input.filePath, {
@@ -240,8 +250,45 @@ export class MediaParser implements ContentParser {
         };
       }
 
+      // Vision analysis if enabled
+      let description: string | undefined;
+
+      console.log(`[MediaParser] Vision check: enableVision=${enableVision}, hasVisionAnalyzer=${!!visionAnalyzer}, hasRender3D=${!!render3D}, category=${mediaInfo.category}`);
+
+      if (enableVision && visionAnalyzer) {
+        try {
+          if (mediaInfo.category === 'image') {
+            // Analyze image directly
+            console.log(`[MediaParser] Analyzing image: ${input.filePath}`);
+            const imageBuffer = fs.readFileSync(input.filePath);
+            description = await visionAnalyzer(
+              imageBuffer,
+              'Describe this image in detail. What does it show? Include colors, composition, text if any, and notable features.'
+            );
+            console.log(`[MediaParser] Image vision description generated (${description?.length} chars)`);
+          } else if (mediaInfo.category === '3d' && render3D) {
+            // Render 3D model and analyze the first/main view
+            console.log(`[MediaParser] Rendering 3D model: ${input.filePath}`);
+            const renders = await render3D(input.filePath);
+            console.log(`[MediaParser] Render result: ${renders.length} views`);
+            if (renders.length > 0) {
+              const mainRender = renders[0]; // Use first (perspective) view
+              console.log(`[MediaParser] Analyzing view: ${mainRender.view}, buffer size: ${mainRender.buffer.length}`);
+              description = await visionAnalyzer(
+                mainRender.buffer,
+                `Describe this 3D model. What kind of object or character is it? What are its visual characteristics, style, and notable features?`
+              );
+              console.log(`[MediaParser] 3D vision description generated (${description?.length} chars)`);
+            }
+          }
+        } catch (visionError) {
+          console.error(`[MediaParser] Vision error:`, visionError);
+          warnings.push(`Vision analysis failed: ${visionError}`);
+        }
+      }
+
       // Create node based on category
-      const node = this.createNode(mediaInfo, input.projectId);
+      const node = this.createNode(mediaInfo, input.projectId, description);
       nodes.push(node);
 
       // Create File wrapper node
@@ -273,7 +320,7 @@ export class MediaParser implements ContentParser {
   /**
    * Create a node from media file info
    */
-  private createNode(info: AnyMediaFileInfo, projectId: string): ParserNode {
+  private createNode(info: AnyMediaFileInfo, projectId: string, description?: string): ParserNode {
     const labels = this.getLabels(info);
     const id = this.generateId(info.file, projectId);
 
@@ -290,8 +337,10 @@ export class MediaParser implements ContentParser {
         format: info.format,
         category: info.category,
         sizeBytes: info.sizeBytes,
-        modifiedAt: info.modifiedAt,
-        analyzed: info.analyzed,
+        modifiedAt: info.modifiedAt instanceof Date ? info.modifiedAt.toISOString() : info.modifiedAt,
+        analyzed: description ? true : info.analyzed,
+        // Vision description (if analyzed)
+        ...(description && { description }),
         // Image-specific
         ...((info as ImageFileInfo).dimensions && {
           width: (info as ImageFileInfo).dimensions!.width,
@@ -326,6 +375,7 @@ export class MediaParser implements ContentParser {
         sourcePath: filePath,
         sourceType: 'file',
         contentHash: hashContent(filePath),
+        path: filePath, // Required for IncrementalIngestionManager merge
         absolutePath: filePath,
         name: path.basename(filePath),
         extension: path.extname(filePath).toLowerCase(),

@@ -191,6 +191,8 @@ interface EmbeddingTask {
   endChar?: number;
   startLine?: number;
   endLine?: number;
+  /** For chunks: page number from parent (for documents) */
+  pageNum?: number | null;
   /** Embedding result (filled after embedding) */
   embedding?: number[];
 }
@@ -311,6 +313,7 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
     label: 'MarkdownSection',
     query: `MATCH (s:MarkdownSection {projectId: $projectId})
             RETURN s.uuid AS uuid, s.title AS title, s.content AS content, s.ownContent AS ownContent,
+                   s.startLine AS startLine, s.endLine AS endLine, s.pageNum AS pageNum,
                    s.embedding_name_hash AS embedding_name_hash,
                    s.embedding_content_hash AS embedding_content_hash,
                    s.embedding_provider AS embedding_provider,
@@ -323,6 +326,7 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
     query: `MATCH (c:CodeBlock {projectId: $projectId})
             WHERE c.code IS NOT NULL AND size(c.code) > 10
             RETURN c.uuid AS uuid, c.language AS language, c.code AS code,
+                   c.startLine AS startLine, c.endLine AS endLine,
                    c.embedding_name_hash AS embedding_name_hash,
                    c.embedding_content_hash AS embedding_content_hash,
                    c.embedding_provider AS embedding_provider,
@@ -983,6 +987,7 @@ export class EmbeddingService {
           endChar: t.endChar,
           startLine: t.startLine,
           endLine: t.endLine,
+          pageNum: t.pageNum,
           embedding: t.embedding,
           hash: t.hash,
           provider: providerName,
@@ -1003,6 +1008,7 @@ export class EmbeddingService {
              endChar: chunk.endChar,
              startLine: chunk.startLine,
              endLine: chunk.endLine,
+             pageNum: chunk.pageNum,
              embedding_content: chunk.embedding,
              embedding_content_hash: chunk.hash,
              embedding_provider: chunk.provider,
@@ -1263,7 +1269,20 @@ export class EmbeddingService {
 
           chunkedNodeUuids.add(uuid);
 
+          // Get parent's position info for calculating absolute positions
+          const parentStartLine = getField('startLine') as number | null;
+          const parentPageNum = getField('pageNum') as number | null;
+
           for (const chunk of chunks) {
+            // Calculate absolute line numbers if parent has startLine
+            // chunk.startLine is relative to parent content, so add parent offset
+            const absoluteStartLine = parentStartLine != null
+              ? parentStartLine + chunk.startLine - 1
+              : chunk.startLine;
+            const absoluteEndLine = parentStartLine != null
+              ? parentStartLine + chunk.endLine - 1
+              : chunk.endLine;
+
             tasks.push({
               type: 'chunk',
               uuid: `${uuid}_chunk_${chunk.index}`,
@@ -1276,8 +1295,9 @@ export class EmbeddingService {
               chunkIndex: chunk.index,
               startChar: chunk.startChar,
               endChar: chunk.endChar,
-              startLine: chunk.startLine,
-              endLine: chunk.endLine,
+              startLine: absoluteStartLine,
+              endLine: absoluteEndLine,
+              pageNum: parentPageNum,
             });
           }
 
@@ -1502,6 +1522,47 @@ export async function ensureVectorIndexes(
             console.warn(`[EmbeddingService] Vector index creation warning for ${indexName}: ${err.message}`);
           }
         }
+      }
+    }
+  }
+
+  // Special handling for EmbeddingChunk - embeddings are created at chunk time,
+  // but we still need a vector index for semantic search
+  const chunkIndexName = 'embeddingchunk_embedding_content_vector';
+  try {
+    const checkResult = await neo4jClient.run(
+      `SHOW INDEXES YIELD name WHERE name = $indexName RETURN count(name) as count`,
+      { indexName: chunkIndexName }
+    );
+
+    const exists = checkResult.records[0]?.get('count')?.toNumber() > 0;
+
+    if (!exists) {
+      const createQuery = `
+        CREATE VECTOR INDEX ${chunkIndexName} IF NOT EXISTS
+        FOR (n:EmbeddingChunk)
+        ON n.embedding_content
+        OPTIONS {
+          indexConfig: {
+            \`vector.dimensions\`: ${dimension},
+            \`vector.similarity_function\`: 'cosine'
+          }
+        }
+      `;
+
+      await neo4jClient.run(createQuery);
+      created++;
+      if (verbose) {
+        console.log(`[EmbeddingService] Created vector index: ${chunkIndexName}`);
+      }
+    } else {
+      skipped++;
+    }
+  } catch (err: any) {
+    errors++;
+    if (!err.message?.includes('already exists')) {
+      if (verbose) {
+        console.warn(`[EmbeddingService] Vector index creation warning for ${chunkIndexName}: ${err.message}`);
       }
     }
   }

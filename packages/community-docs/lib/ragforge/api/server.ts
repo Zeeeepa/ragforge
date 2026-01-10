@@ -35,9 +35,7 @@ import Fastify, { FastifyInstance } from "fastify";
 import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
 import AdmZip from "adm-zip";
-import { writeFile, unlink, mkdir } from "fs/promises";
-import { join } from "path";
-import { tmpdir } from "os";
+import { basename } from "path";
 import { randomUUID } from "crypto";
 import { getNeo4jClient, closeNeo4jClient, type Neo4jClient } from "../neo4j-client";
 import { OllamaEmbeddingService, type OllamaEmbeddingConfig } from "../embedding-service";
@@ -45,12 +43,23 @@ import { CommunityOrchestratorAdapter } from "../orchestrator-adapter";
 import { getSupportedExtensions } from "../parsers";
 import { getAPILogger, LOG_FILES } from "../logger";
 import type { CommunityNodeMetadata, SearchResult, SearchFilters } from "../types";
-// Import document parser from ragforge core for binary files (direct import from dist)
-import { parseDocumentFile } from "../../../../core/dist/esm/runtime/adapters/document-file-parser.js";
 // LLM Enrichment Services
 import { EnrichmentService, type EnrichmentOptions, type DocumentContext, type NodeToEnrich } from "../enrichment-service";
 import { EntityResolutionService, type EntityResolutionOptions } from "../entity-resolution-service";
 import { EntityEmbeddingService, type EntitySearchOptions, type EntitySearchResult } from "../entity-embedding-service";
+// Chat Agent Routes (Vercel AI SDK + Claude)
+import { registerChatRoutes } from "./routes/chat";
+// Vision API Routes (image/PDF/3D analysis)
+import { registerVisionRoutes } from "./routes/vision";
+// Core vision tools for ingestion
+import {
+  getOCRService,
+  generateRender3DAssetHandler,
+  type ThreeDToolsContext,
+} from "@luciformresearch/ragforge";
+import * as fs from "fs/promises";
+import * as path from "path";
+import * as os from "os";
 
 // ============================================================================
 // GitHub API Helpers
@@ -122,69 +131,6 @@ const CODE_EXTENSIONS = new Set([
   ".md", ".mdx",
 ]);
 
-// Binary file extensions that need special parsing (document parser)
-const BINARY_DOCUMENT_EXTENSIONS = new Set([
-  ".pdf", ".docx", ".doc", ".xlsx", ".xls",
-]);
-
-// Image extensions (need OCR or description)
-const IMAGE_EXTENSIONS = new Set([
-  ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
-]);
-
-/**
- * Check if a file extension is a binary document that needs parsing
- */
-function isBinaryDocument(ext: string): boolean {
-  return BINARY_DOCUMENT_EXTENSIONS.has(ext.toLowerCase());
-}
-
-/**
- * Check if a file extension is an image
- */
-function isImage(ext: string): boolean {
-  return IMAGE_EXTENSIONS.has(ext.toLowerCase());
-}
-
-/**
- * Parse a binary document (PDF, DOCX, XLSX) and extract text content
- */
-async function parseBinaryDocument(
-  buffer: Buffer,
-  fileName: string
-): Promise<{ content: string; metadata?: Record<string, any> } | null> {
-  const tempDir = join(tmpdir(), "community-docs-temp");
-  await mkdir(tempDir, { recursive: true });
-
-  const tempPath = join(tempDir, `${randomUUID()}-${fileName}`);
-
-  try {
-    // Write buffer to temp file
-    await writeFile(tempPath, buffer);
-
-    // Parse with ragforge document parser
-    const result = await parseDocumentFile(tempPath) as any;
-
-    if (!result || !result.textContent) {
-      return null;
-    }
-
-    return {
-      content: result.textContent,
-      metadata: {
-        format: result.format,
-        pageCount: result.pageCount,
-        ...(result.metadata || {}),
-      },
-    };
-  } finally {
-    // Clean up temp file
-    try {
-      await unlink(tempPath);
-    } catch {}
-  }
-}
-
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -213,7 +159,96 @@ export class CommunityAPIServer {
 
   constructor() {
     this.startTime = new Date();
-    this.server = Fastify({ logger: false });
+    this.server = Fastify({
+      logger: false,
+      bodyLimit: 50 * 1024 * 1024, // 50MB for large documents
+    });
+  }
+
+  /**
+   * Create a vision analyzer function for image/page description
+   * Uses Claude via OCR service
+   */
+  private createVisionAnalyzer(): (imageBuffer: Buffer, prompt?: string) => Promise<string> {
+    const ocrService = getOCRService({ primaryProvider: "claude" });
+    const tempDir = path.join(os.homedir(), ".ragforge", "temp", "vision-ingest");
+
+    return async (imageBuffer: Buffer, prompt?: string): Promise<string> => {
+      // Ensure temp dir exists
+      await fs.mkdir(tempDir, { recursive: true }).catch(() => {});
+
+      const tempPath = path.join(tempDir, `vision-${Date.now()}-${Math.random().toString(36).slice(2)}.png`);
+      await fs.writeFile(tempPath, imageBuffer);
+
+      try {
+        const result = await ocrService.extractText(tempPath, {
+          prompt: prompt || "Describe this image in detail. What does it show? Include any text visible.",
+        });
+        return result.text || "[No description available]";
+      } finally {
+        await fs.unlink(tempPath).catch(() => {});
+      }
+    };
+  }
+
+  /**
+   * Create a 3D render function for model visualization
+   * Renders model to single perspective view and returns buffer
+   */
+  private createRender3DFunction(): (modelPath: string) => Promise<Array<{ view: string; buffer: Buffer }>> {
+    const outputDir = path.join(os.homedir(), ".ragforge", "temp", "3d-renders");
+    const ctx: ThreeDToolsContext = { projectRoot: outputDir };
+    const render3DHandler = generateRender3DAssetHandler(ctx);
+
+    return async (modelPath: string): Promise<Array<{ view: string; buffer: Buffer }>> => {
+      console.log(`[3D Render] Starting render for: ${modelPath}`);
+      console.log(`[3D Render] Output dir: ${outputDir}`);
+
+      // Ensure output dir exists
+      await fs.mkdir(outputDir, { recursive: true }).catch(() => {});
+
+      try {
+        console.log(`[3D Render] Calling render3DHandler...`);
+        const result = await render3DHandler({
+          model_path: modelPath,
+          output_dir: outputDir,
+          views: ["perspective"], // Single view for efficiency
+          width: 512,
+          height: 512,
+        });
+        console.log(`[3D Render] Handler result:`, JSON.stringify(result, null, 2));
+
+        if (!result.renders || result.renders.length === 0) {
+          console.warn(`[3D Render] No renders returned from handler`);
+          return [];
+        }
+
+        // Read rendered images and return as buffers
+        const renders: Array<{ view: string; buffer: Buffer }> = [];
+        for (const render of result.renders) {
+          try {
+            // The handler returns relative paths, join with outputDir's parent to get absolute
+            const renderPath = render.path.startsWith('/')
+              ? render.path
+              : path.join(path.dirname(outputDir), render.path);
+            console.log(`[3D Render] Reading render file: ${renderPath}`);
+            const buffer = await fs.readFile(renderPath);
+            renders.push({ view: render.view, buffer });
+            console.log(`[3D Render] Loaded render: ${render.view}, size: ${buffer.length} bytes`);
+            // Clean up render file
+            await fs.unlink(renderPath).catch(() => {});
+          } catch (readErr) {
+            console.warn(`[3D Render] Failed to read ${render.path}:`, readErr);
+          }
+        }
+
+        console.log(`[3D Render] Returning ${renders.length} renders`);
+        return renders;
+      } catch (err) {
+        console.error(`[3D Render] Failed to render ${modelPath}:`, err);
+        return [];
+      }
+    };
   }
 
   async initialize(): Promise<void> {
@@ -308,6 +343,11 @@ export class CommunityAPIServer {
       const vectorIndexResult = await this.entityEmbedding.ensureVectorIndexes();
       const fulltextIndexResult = await this.entityEmbedding.ensureFullTextIndexes();
       logger.info(`EntityEmbeddingService initialized (vector: ${vectorIndexResult.created} created, fulltext: ${fulltextIndexResult.created} created)`);
+
+      // Connect EntityEmbeddingService to orchestrator for entity boost in search
+      if (this.orchestrator) {
+        this.orchestrator.setEntityEmbeddingService(this.entityEmbedding);
+      }
     } else {
       logger.info("EntityEmbeddingService disabled (no embedding service)");
     }
@@ -437,15 +477,22 @@ export class CommunityAPIServer {
     });
 
     // File Ingestion with Parsing (uses CommunityOrchestratorAdapter → ragforge core)
+    // Supports both text files (via ingestVirtual) and binary documents (via ingestBinaryDocument)
     this.server.post<{
       Body: {
         filePath: string;
         content: string; // Base64 encoded content (required for virtual ingestion)
         metadata: CommunityNodeMetadata;
         generateEmbeddings?: boolean;
+        /** Enable Vision-based parsing for PDF (default: false) */
+        enableVision?: boolean;
+        /** Section title detection mode (default: 'detect') */
+        sectionTitles?: 'none' | 'detect' | 'llm';
+        /** Generate titles for sections without one using LLM (default: true) */
+        generateTitles?: boolean;
       };
     }>("/ingest/file", async (request, reply) => {
-      const { filePath, content, metadata, generateEmbeddings = true } = request.body || {};
+      const { filePath, content, metadata, generateEmbeddings = true, enableVision = false, sectionTitles = 'detect', generateTitles = true } = request.body || {};
 
       if (!filePath || !content || !metadata) {
         reply.status(400);
@@ -461,29 +508,30 @@ export class CommunityAPIServer {
       const startTime = Date.now();
 
       try {
-        // Decode base64 content
-        const fileContent = Buffer.from(content, "base64").toString("utf-8");
+        // Decode base64 content to Buffer
+        const buffer = Buffer.from(content, "base64");
 
-        // Use orchestrator's ingestVirtual (same as GitHub ingestion)
-        const result = await this.orchestrator.ingestVirtual({
-          virtualFiles: [{ path: filePath, content: fileContent }],
+        // Use unified ingestion
+        const result = await this.orchestrator.ingestFiles({
+          files: [{ fileName: filePath, buffer }],
           metadata,
-          sourceIdentifier: "upload",
+          documentId: metadata.documentId,
+          enableVision,
+          visionAnalyzer: enableVision ? this.createVisionAnalyzer() : undefined,
+          render3D: enableVision ? this.createRender3DFunction() : undefined,
+          sectionTitles,
+          generateTitles,
+          generateEmbeddings,
         });
-
-        // Generate embeddings if requested
-        let embeddingsGenerated = 0;
-        if (generateEmbeddings && this.orchestrator.hasEmbeddingService()) {
-          embeddingsGenerated = await this.orchestrator.generateEmbeddingsForDocument(metadata.documentId);
-        }
 
         return {
           success: true,
           documentId: metadata.documentId,
           nodesCreated: result.nodesCreated,
           relationshipsCreated: result.relationshipsCreated,
-          embeddingsGenerated,
+          embeddingsGenerated: result.embeddingsGenerated,
           totalTimeMs: Date.now() - startTime,
+          warnings: result.warnings,
         };
       } catch (err: any) {
         logger.error(`File ingestion failed: ${err.message}`);
@@ -492,15 +540,27 @@ export class CommunityAPIServer {
       }
     });
 
-    // Batch File Ingestion (multiple files at once, uses CommunityOrchestratorAdapter → ragforge core)
+    // Batch File Ingestion (multiple files at once, uses unified ingestFiles)
     this.server.post<{
       Body: {
         files: Array<{ filePath: string; content: string }>; // content is base64 encoded
         metadata: CommunityNodeMetadata;
         generateEmbeddings?: boolean;
+        enableVision?: boolean;
+        extractEntities?: boolean;
+        sectionTitles?: 'none' | 'detect' | 'llm';
+        generateTitles?: boolean;
       };
     }>("/ingest/batch", async (request, reply) => {
-      const { files, metadata, generateEmbeddings = true } = request.body || {};
+      const {
+        files,
+        metadata,
+        generateEmbeddings = true,
+        enableVision = false,
+        extractEntities = false,
+        sectionTitles = 'detect',
+        generateTitles = true,
+      } = request.body || {};
 
       if (!files || files.length === 0 || !metadata) {
         reply.status(400);
@@ -516,33 +576,38 @@ export class CommunityAPIServer {
       const startTime = Date.now();
 
       try {
-        // Decode base64 content for each file
-        const virtualFiles = files.map((f) => ({
-          path: f.filePath,
-          content: Buffer.from(f.content, "base64").toString("utf-8"),
+        // Convert base64 to Buffer for each file
+        const filesToIngest = files.map((f) => ({
+          fileName: f.filePath,
+          buffer: Buffer.from(f.content, "base64"),
         }));
 
-        // Use orchestrator's ingestVirtual (same as /ingest/file and /ingest/github)
-        const result = await this.orchestrator.ingestVirtual({
-          virtualFiles,
+        // Use unified ingestion (handles all file types)
+        const result = await this.orchestrator.ingestFiles({
+          files: filesToIngest,
           metadata,
-          sourceIdentifier: "batch-upload",
+          documentId: metadata.documentId,
+          enableVision,
+          visionAnalyzer: enableVision ? this.createVisionAnalyzer() : undefined,
+          render3D: enableVision ? this.createRender3DFunction() : undefined,
+          sectionTitles,
+          generateTitles,
+          generateEmbeddings,
+          extractEntities,
+          enrichmentService: extractEntities ? this.enrichment : undefined,
         });
-
-        // Generate embeddings if requested
-        let embeddingsGenerated = 0;
-        if (generateEmbeddings && this.orchestrator.hasEmbeddingService()) {
-          embeddingsGenerated = await this.orchestrator.generateEmbeddingsForDocument(metadata.documentId);
-        }
 
         return {
           success: true,
           documentId: metadata.documentId,
           nodesCreated: result.nodesCreated,
           relationshipsCreated: result.relationshipsCreated,
-          embeddingsGenerated,
-          filesProcessed: virtualFiles.length,
+          embeddingsGenerated: result.embeddingsGenerated,
+          entityStats: result.entityStats,
+          filesProcessed: files.length,
+          stats: result.stats,
           totalTimeMs: Date.now() - startTime,
+          warnings: result.warnings,
         };
       } catch (err: any) {
         logger.error(`Batch ingestion failed: ${err.message}`);
@@ -757,16 +822,32 @@ export class CommunityAPIServer {
         const searchResults: SearchResult[] = searchResult.results.map((r) => ({
           documentId: r.node.documentId as string,
           chunkId: r.node.chunkId as string | undefined,
-          content: (r.node.content || r.node.source) as string,
+          // Use snippet for agent-friendly output (truncated or chunk text)
+          content: r.snippet || (r.node.content || r.node.source || r.node.description) as string,
           score: r.score,
+          // Include source file info
+          sourcePath: (r.filePath || r.node.sourcePath || r.node.file) as string | undefined,
+          nodeType: r.node._labels?.[0] as string | undefined,
+          // Matched range info (when a chunk matched)
+          matchedRange: r.matchedRange,
+          // Position info from the node (useful for navigation)
+          // For chunks, prefer matchedRange info which has absolute positions
+          position: {
+            pageNum: (r.matchedRange?.pageNum ?? r.node.pageNum) as number | undefined,
+            sectionIndex: r.node.index as number | undefined,
+            startLine: (r.matchedRange?.startLine ?? r.node.startLine) as number | undefined,
+            endLine: (r.matchedRange?.endLine ?? r.node.endLine) as number | undefined,
+          },
           metadata: {
             documentTitle: r.node.documentTitle as string,
             categoryId: r.node.categoryId as string,
             categorySlug: r.node.categorySlug as string,
             userId: r.node.userId as string,
           },
-          // Include keyword boost info if present
+          // Include boost info if present
           keywordBoost: r.keywordBoost,
+          entityBoostApplied: r.entityBoostApplied,
+          matchedEntities: r.matchedEntities,
         }));
 
         return {
@@ -778,6 +859,8 @@ export class CommunityAPIServer {
           // Post-processing results
           reranked: searchResult.reranked,
           keywordBoosted: searchResult.keywordBoosted,
+          entityBoosted: searchResult.entityBoosted,
+          matchingEntities: searchResult.matchingEntities,
           relationshipsExplored: searchResult.relationshipsExplored,
           summarized: searchResult.summarized,
           graph: searchResult.graph,
@@ -980,12 +1063,24 @@ export class CommunityAPIServer {
 
     // =========================================================================
     // DEBUG: File upload without authentication (for testing)
+    // Supports Vision parsing for PDFs when enableVision=true query param is set
     // =========================================================================
-    this.server.post("/debug/upload", async (request, reply) => {
+    this.server.post<{
+      Querystring: {
+        enableVision?: string;
+        sectionTitles?: string;
+        generateTitles?: string;
+      };
+    }>("/debug/upload", async (request, reply) => {
       if (!this.orchestrator) {
         reply.status(503);
         return { success: false, error: "Orchestrator not available" };
       }
+
+      // Parse options from query string
+      const enableVision = request.query.enableVision === "true";
+      const sectionTitles = (request.query.sectionTitles as 'none' | 'detect' | 'llm') || 'detect';
+      const generateTitles = request.query.generateTitles !== "false"; // Default to true
 
       try {
         const data = await request.file();
@@ -996,145 +1091,81 @@ export class CommunityAPIServer {
 
         const buffer = await data.toBuffer();
         const fileName = data.filename;
-        const documentId = `debug-${Date.now()}`;
 
-        logger.info(`[DEBUG] Upload: ${fileName} (${buffer.length} bytes)`);
+        // Read form fields from multipart data
+        const fields = data.fields as Record<string, { value?: string } | undefined>;
+        const getField = (name: string, defaultValue: string): string => {
+          const field = fields[name];
+          return (field && typeof field === 'object' && 'value' in field) ? (field.value || defaultValue) : defaultValue;
+        };
 
-        // Default metadata for debug uploads
+        // Use form fields or defaults
+        const documentId = getField('documentId', `debug-${Date.now()}`);
+        const documentTitle = getField('documentTitle', fileName.replace(/\.[^.]+$/, ""));
+        const categorySlug = getField('categorySlug', 'debug-uploads');
+        const categoryId = getField('categoryId', 'cat-debug');
+        const userId = getField('userId', 'debug-user');
+
+        logger.info(`[DEBUG] Upload: ${fileName} (${buffer.length} bytes), enableVision: ${enableVision}, documentId: ${documentId}`);
+
+        // Metadata from form fields or defaults
         const metadata = {
           documentId,
-          documentTitle: fileName.replace(/\.[^.]+$/, ""),
-          categorySlug: "debug-uploads",
-          categoryId: "cat-debug",
-          userId: "debug-user",
+          documentTitle,
+          categorySlug,
+          categoryId,
+          userId,
           isPublic: true,
         };
 
-        // Check if it's a ZIP file
+        // Build list of files to ingest (from ZIP or single file)
         const isZip = fileName.toLowerCase().endsWith(".zip");
+        const filesToIngest: Array<{ fileName: string; buffer: Buffer }> = [];
 
         if (isZip) {
-          // Extract ZIP and ingest all files
           const zip = new AdmZip(buffer);
-          const entries = zip.getEntries();
-          const virtualFiles: Array<{ path: string; content: string }> = [];
-          const stats = { text: 0, binary: 0, skipped: 0, images: 0 };
-
-          for (const entry of entries) {
+          for (const entry of zip.getEntries()) {
             if (entry.isDirectory) continue;
-            const entryName = entry.entryName;
-            const ext = "." + (entryName.split(".").pop()?.toLowerCase() || "");
-            const entryBuffer = entry.getData();
-
-            // Check if it's a binary document (PDF, DOCX, XLSX)
-            if (isBinaryDocument(ext)) {
-              try {
-                logger.info(`[DEBUG] Parsing binary: ${entryName}`);
-                const parsed = await parseBinaryDocument(entryBuffer, entryName);
-                if (parsed && parsed.content) {
-                  // Create a markdown representation of the parsed document
-                  // Include YAML frontmatter with original file info for proper display/linking
-                  const frontmatter = [
-                    '---',
-                    `originalFileName: "${entryName}"`,
-                    `sourceFormat: "${ext.slice(1)}"`,
-                    `parsedFrom: "binary"`,
-                    '---',
-                    '',
-                  ].join('\n');
-                  const mdContent = `${frontmatter}# ${entryName}\n\n${parsed.content}`;
-                  virtualFiles.push({
-                    path: `${entryName}.md`, // file.pdf → file.pdf.md (avoids collision with file.docx.md)
-                    content: mdContent,
-                  });
-                  stats.binary++;
-                } else {
-                  logger.warn(`[DEBUG] No text extracted from: ${entryName}`);
-                  stats.skipped++;
-                }
-              } catch (err: any) {
-                logger.warn(`[DEBUG] Failed to parse binary ${entryName}: ${err.message}`);
-                stats.skipped++;
-              }
-              continue;
-            }
-
-            // Skip images for now (would need OCR/vision)
-            if (isImage(ext)) {
-              logger.info(`[DEBUG] Skipping image (no OCR): ${entryName}`);
-              stats.images++;
-              continue;
-            }
-
-            // Check if it's a supported text file
-            const supportedExts = getSupportedExtensions();
-            if (!supportedExts.includes(ext)) {
-              logger.info(`[DEBUG] Skipping unsupported: ${entryName}`);
-              stats.skipped++;
-              continue;
-            }
-
-            // Text file - read as UTF-8
-            try {
-              const content = entryBuffer.toString("utf-8");
-              virtualFiles.push({
-                path: entryName,
-                content,
-              });
-              stats.text++;
-            } catch (err) {
-              logger.warn(`[DEBUG] Failed to read ${entryName}: ${err}`);
-              stats.skipped++;
-            }
+            // Use basename to strip directory path from ZIP entry
+            filesToIngest.push({
+              fileName: basename(entry.entryName),
+              buffer: entry.getData(),
+            });
           }
-
-          logger.info(`[DEBUG] Extracted: ${stats.text} text, ${stats.binary} binary docs, ${stats.images} images skipped, ${stats.skipped} unsupported`);
-
-          if (virtualFiles.length === 0) {
-            return { success: false, error: "No supported files found in ZIP" };
-          }
-
-          // Ingest via orchestrator
-          const result = await this.orchestrator.ingestVirtual({
-            virtualFiles,
-            metadata,
-            sourceIdentifier: "zip-upload",
-          });
-
-          // Generate embeddings
-          const embeddingsGenerated = await this.orchestrator.generateEmbeddingsForDocument(documentId);
-
-          return {
-            success: true,
-            documentId,
-            fileName,
-            filesExtracted: entries.length,
-            filesIngested: virtualFiles.length,
-            nodesCreated: result.nodesCreated,
-            relationshipsCreated: result.relationshipsCreated,
-            embeddingsGenerated,
-          };
+          logger.info(`[DEBUG] ZIP extracted: ${filesToIngest.length} files`);
         } else {
-          // Single file ingestion
-          const content = buffer.toString("utf-8");
-
-          const result = await this.orchestrator.ingestVirtual({
-            virtualFiles: [{ path: fileName, content }],
-            metadata,
-            sourceIdentifier: "file-upload",
-          });
-
-          const embeddingsGenerated = await this.orchestrator.generateEmbeddingsForDocument(documentId);
-
-          return {
-            success: true,
-            documentId,
-            fileName,
-            nodesCreated: result.nodesCreated,
-            relationshipsCreated: result.relationshipsCreated,
-            embeddingsGenerated,
-          };
+          filesToIngest.push({ fileName, buffer });
         }
+
+        // Use unified ingestion from orchestrator
+        const result = await this.orchestrator.ingestFiles({
+          files: filesToIngest,
+          metadata,
+          documentId,
+          enableVision,
+          visionAnalyzer: enableVision ? this.createVisionAnalyzer() : undefined,
+          render3D: enableVision ? this.createRender3DFunction() : undefined,
+          sectionTitles,
+          generateTitles,
+          generateEmbeddings: true,
+        });
+
+        if (result.nodesCreated === 0) {
+          return { success: false, error: "No supported files found" };
+        }
+
+        return {
+          success: true,
+          documentId,
+          fileName,
+          filesExtracted: filesToIngest.length,
+          filesIngested: result.stats.textFiles + result.stats.binaryDocs + result.stats.mediaFiles,
+          stats: result.stats,
+          nodesCreated: result.nodesCreated,
+          relationshipsCreated: result.relationshipsCreated,
+          embeddingsGenerated: result.embeddingsGenerated,
+          warnings: result.warnings,
+        };
       } catch (err: any) {
         logger.error(`[DEBUG] Upload failed: ${err.message}`);
         reply.status(500);
@@ -1198,69 +1229,39 @@ export class CommunityAPIServer {
           isPublic: true,
         };
 
-        // Check if it's a ZIP file
+        // Build list of files to ingest
         const isZip = fileName.toLowerCase().endsWith(".zip");
-        let virtualFiles: Array<{ path: string; content: string }> = [];
+        const filesToIngest: Array<{ fileName: string; buffer: Buffer }> = [];
 
         if (isZip) {
-          // Extract ZIP
           const zip = new AdmZip(buffer);
-          const entries = zip.getEntries();
-
-          for (const entry of entries) {
+          for (const entry of zip.getEntries()) {
             if (entry.isDirectory) continue;
-            const entryName = entry.entryName;
-            const ext = "." + (entryName.split(".").pop()?.toLowerCase() || "");
-            const entryBuffer = entry.getData();
-
-            // Handle binary documents
-            if (isBinaryDocument(ext)) {
-              try {
-                const parsed = await parseBinaryDocument(entryBuffer, entryName);
-                if (parsed?.content) {
-                  virtualFiles.push({
-                    path: `${entryName}.md`,
-                    content: `# ${entryName}\n\n${parsed.content}`,
-                  });
-                }
-              } catch {}
-              continue;
-            }
-
-            // Skip unsupported files
-            if (isImage(ext)) continue;
-            const supportedExts = getSupportedExtensions();
-            if (!supportedExts.includes(ext)) continue;
-
-            // Text file
-            try {
-              virtualFiles.push({
-                path: entryName,
-                content: entryBuffer.toString("utf-8"),
-              });
-            } catch {}
+            filesToIngest.push({
+              fileName: basename(entry.entryName),
+              buffer: entry.getData(),
+            });
           }
         } else {
-          // Single file
-          virtualFiles.push({
-            path: fileName,
-            content: buffer.toString("utf-8"),
-          });
+          filesToIngest.push({ fileName, buffer });
         }
 
-        if (virtualFiles.length === 0) {
+        // Use unified ingestion
+        const result = await this.orchestrator.ingestFiles({
+          files: filesToIngest,
+          metadata,
+          documentId,
+          enableVision: false,
+          sectionTitles: 'detect',
+          generateTitles: true,
+          generateEmbeddings: true,
+        });
+
+        if (result.nodesCreated === 0) {
           return { success: false, error: "No supported files found" };
         }
 
-        // Ingest via orchestrator
-        const result = await this.orchestrator.ingestVirtual({
-          virtualFiles,
-          metadata,
-          sourceIdentifier: isZip ? "zip-upload" : "file-upload",
-        });
-
-        // Generate embeddings
-        const embeddingsGenerated = await this.orchestrator.generateEmbeddingsForDocument(documentId);
+        const embeddingsGenerated = result.embeddingsGenerated;
 
         // LLM Enrichment (if enabled)
         let enrichmentResult = null;
@@ -1347,12 +1348,14 @@ export class CommunityAPIServer {
                 // Create HAS_TAG relationships to source nodes
                 if (nodeEnrich.tags && nodeEnrich.tags.length > 0) {
                   for (const tag of nodeEnrich.tags) {
+                    // Compute normalizedName in JS to match the constraint key
+                    const normalizedName = tag.name.toLowerCase().replace(/\s+/g, '-');
                     await this.neo4j!.run(`
-                      // Get or create Tag node
-                      MERGE (t:Tag {name: $name})
-                      ON CREATE SET t.uuid = randomUUID(), t.category = $category,
-                                    t.normalizedName = toLower(replace($name, ' ', '-')),
+                      // Get or create Tag node using normalizedName as unique key
+                      MERGE (t:Tag {normalizedName: $normalizedName})
+                      ON CREATE SET t.uuid = randomUUID(), t.name = $name, t.category = $category,
                                     t.createdAt = datetime()
+                      ON MATCH SET t.name = CASE WHEN t.name IS NULL THEN $name ELSE t.name END
                       SET t.projectIds = CASE
                         WHEN $projectId IN coalesce(t.projectIds, []) THEN t.projectIds
                         ELSE coalesce(t.projectIds, []) + $projectId
@@ -1364,6 +1367,7 @@ export class CommunityAPIServer {
                       MERGE (source)-[:HAS_TAG]->(t)
                     `, {
                       name: tag.name,
+                      normalizedName,
                       category: tag.category || "other",
                       projectId,
                       sourceNodeId: nodeEnrich.nodeId,
@@ -1381,7 +1385,8 @@ export class CommunityAPIServer {
           success: true,
           documentId,
           fileName,
-          filesIngested: virtualFiles.length,
+          filesIngested: result.stats.textFiles + result.stats.binaryDocs + result.stats.mediaFiles,
+          stats: result.stats,
           nodesCreated: result.nodesCreated,
           relationshipsCreated: result.relationshipsCreated,
           embeddingsGenerated,
@@ -1469,6 +1474,18 @@ export class CommunityAPIServer {
       setTimeout(() => this.shutdown(), 100);
       return { status: "shutting_down" };
     });
+
+    // =========================================================================
+    // Chat Agent Routes (Vercel AI SDK + Claude)
+    // =========================================================================
+    registerChatRoutes(this.server, {
+      orchestrator: this.orchestrator!,
+      neo4j: this.neo4j!,
+    });
+
+    // Vision API Routes (image/PDF/3D analysis)
+    // =========================================================================
+    registerVisionRoutes(this.server);
   }
 
   async start(port: number = DEFAULT_PORT): Promise<void> {

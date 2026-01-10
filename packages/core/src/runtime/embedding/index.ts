@@ -26,6 +26,7 @@ export {
 export {
   chunkText,
   needsChunking,
+  splitIntoSentences,
   type TextChunk,
   type ChunkOptions,
 } from './text-chunker.js';
