@@ -4,6 +4,9 @@
  * Uses Ollama's local API for embeddings - free and private.
  * Requires Ollama to be running locally with an embedding model pulled.
  *
+ * Uses the new /api/embed endpoint which supports batch embeddings natively.
+ * See: https://docs.ollama.com/capabilities/embeddings
+ *
  * Recommended models:
  * - nomic-embed-text (768 dimensions, good quality)
  * - mxbai-embed-large (1024 dimensions, better quality)
@@ -17,23 +20,31 @@ export interface OllamaProviderOptions {
   baseUrl?: string;
   /** Model name (default: nomic-embed-text) */
   model?: string;
-  /** Batch size for parallel requests (default: 10) */
+  /** Batch size for API calls (default: 50 texts per call) */
   batchSize?: number;
-  /** Request timeout in ms (default: 30000) */
+  /** Max concurrent API calls (default: 5) */
+  concurrency?: number;
+  /** Request timeout in ms (default: 60000) */
   timeout?: number;
+  /** Truncate inputs that exceed context length (default: true) */
+  truncate?: boolean;
 }
 
 export class OllamaEmbeddingProvider {
   private baseUrl: string;
   private model: string;
   private batchSize: number;
+  private concurrency: number;
   private timeout: number;
+  private truncate: boolean;
 
   constructor(options: OllamaProviderOptions = {}) {
     this.baseUrl = options.baseUrl || 'http://localhost:11434';
     this.model = options.model || 'nomic-embed-text';
-    this.batchSize = options.batchSize ?? 10;
-    this.timeout = options.timeout ?? 30000;
+    this.batchSize = options.batchSize ?? 50; // Texts per API call
+    this.concurrency = options.concurrency ?? 5; // Parallel API calls
+    this.timeout = options.timeout ?? 60000;
+    this.truncate = options.truncate ?? true;
   }
 
   getProviderName(): string {
@@ -45,19 +56,21 @@ export class OllamaEmbeddingProvider {
   }
 
   /**
-   * Generate embedding for a single text
+   * Generate embeddings for a batch of texts using /api/embed
+   * This is the new batch endpoint that accepts multiple inputs
    */
-  private async embedOne(text: string): Promise<number[]> {
+  private async embedBatch(texts: string[]): Promise<number[][]> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.timeout);
 
     try {
-      const response = await fetch(`${this.baseUrl}/api/embeddings`, {
+      const response = await fetch(`${this.baseUrl}/api/embed`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: this.model,
-          prompt: text,
+          input: texts,
+          truncate: this.truncate,
         }),
         signal: controller.signal,
       });
@@ -67,8 +80,8 @@ export class OllamaEmbeddingProvider {
         throw new Error(`Ollama API error: ${response.status} - ${error}`);
       }
 
-      const data = (await response.json()) as { embedding: number[] };
-      return data.embedding;
+      const data = (await response.json()) as { embeddings: number[][] };
+      return data.embeddings;
     } finally {
       clearTimeout(timeoutId);
     }
@@ -76,7 +89,7 @@ export class OllamaEmbeddingProvider {
 
   /**
    * Generate embeddings for multiple texts
-   * Ollama doesn't support batch embeddings natively, so we parallelize single requests
+   * Uses the new /api/embed batch endpoint for efficiency
    */
   async embed(
     texts: string[],
@@ -88,31 +101,27 @@ export class OllamaEmbeddingProvider {
     }
 
     try {
+      // Split into batches
       const batches: string[][] = [];
       for (let i = 0; i < texts.length; i += this.batchSize) {
         batches.push(texts.slice(i, i + this.batchSize));
       }
 
-      console.log(`[Embedding:Ollama] ${texts.length} texts → ${batches.length} batches (model: ${this.model})`);
       const startTime = Date.now();
+      const limit = pLimit(this.concurrency);
 
-      const limit = pLimit(this.batchSize); // Parallelize within batch size
+      // Run batch API calls in parallel with concurrency limit
+      const batchResults = await Promise.all(
+        batches.map(batch => limit(() => this.embedBatch(batch)))
+      );
 
-      const allEmbeddings: number[][] = [];
+      const allEmbeddings = batchResults.flat();
 
-      for (let batchNum = 0; batchNum < batches.length; batchNum++) {
-        const batch = batches[batchNum];
-        const batchStart = Date.now();
-
-        const batchEmbeddings = await Promise.all(
-          batch.map(text => limit(() => this.embedOne(text)))
-        );
-
-        allEmbeddings.push(...batchEmbeddings);
-        console.log(`[Embedding:Ollama] Batch ${batchNum + 1}/${batches.length}: ${batch.length} texts in ${Date.now() - batchStart}ms`);
+      // Only log summary if it took more than 2 seconds
+      const elapsed = Date.now() - startTime;
+      if (elapsed > 2000) {
+        console.log(`[Embedding:Ollama] ${allEmbeddings.length} embeddings in ${elapsed}ms (${Math.round(allEmbeddings.length / (elapsed / 1000))}/s)`);
       }
-
-      console.log(`[Embedding:Ollama] Total: ${allEmbeddings.length} embeddings in ${Date.now() - startTime}ms`);
       return allEmbeddings;
     } finally {
       this.model = originalModel;
@@ -120,16 +129,8 @@ export class OllamaEmbeddingProvider {
   }
 
   async embedSingle(text: string, overrides?: { model?: string }): Promise<number[]> {
-    const originalModel = this.model;
-    if (overrides?.model) {
-      this.model = overrides.model;
-    }
-
-    try {
-      return await this.embedOne(text);
-    } finally {
-      this.model = originalModel;
-    }
+    const embeddings = await this.embed([text], overrides);
+    return embeddings[0];
   }
 
   /**

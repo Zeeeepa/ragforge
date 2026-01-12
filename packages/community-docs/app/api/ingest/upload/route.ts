@@ -166,6 +166,7 @@ export async function POST(request: NextRequest) {
         update: {},
         create: {
           id: "debug-user",
+          discordId: "debug-discord-id",
           username: "debug",
           email: "debug@localhost",
           role: "ADMIN",

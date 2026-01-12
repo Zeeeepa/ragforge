@@ -43,6 +43,20 @@ export interface IncrementalStats {
   deleted: number;
 }
 
+/**
+ * Callback for reporting ingestion progress
+ * @param phase - Current phase (nodes, relationships, etc.)
+ * @param current - Current item number
+ * @param total - Total items in this phase
+ * @param message - Human-readable status message
+ */
+export type ProgressCallback = (
+  phase: string,
+  current: number,
+  total: number,
+  message?: string
+) => void;
+
 export interface IngestionOptions {
   /** Project ID to scope the ingestion */
   projectId?: string;
@@ -56,6 +70,8 @@ export interface IngestionOptions {
   cleanupRelationships?: boolean;
   /** Pre-queried UUID mapping for UUID preservation during re-ingestion */
   existingUUIDMapping?: Map<string, Array<{ uuid: string; file: string; type: string }>>;
+  /** Progress callback for streaming updates */
+  onProgress?: ProgressCallback;
 }
 
 // Singleton adapter instance (reused across calls)
@@ -585,7 +601,8 @@ export class IncrementalIngestionManager {
   private async ingestNodes(
     nodes: ParsedNode[],
     relationships: ParsedRelationship[],
-    markForEmbedding: boolean = false
+    markForEmbedding: boolean = false,
+    onProgress?: ProgressCallback
   ): Promise<void> {
     if (nodes.length === 0 && relationships.length === 0) {
       return;
@@ -654,6 +671,7 @@ export class IncrementalIngestionManager {
 
       processedNodes += nodeData.length;
       console.log(`   📦 Upserted ${nodeData.length} ${labels} nodes (${processedNodes}/${totalNodes})`);
+      onProgress?.('nodes', processedNodes, totalNodes, `Upserted ${nodeData.length} ${labels} nodes`);
     }
 
     // Create relationships using UNWIND batching (batches of 500)
@@ -721,10 +739,12 @@ export class IncrementalIngestionManager {
         const fromDisplay = fromLabel || 'Node';
         const toDisplay = toLabel || 'Node';
         console.log(`   🔗 ${rels.length} ${relType} (${fromDisplay}→${toDisplay}) [${processedRels}/${relationships.length}]`);
+        onProgress?.('relationships', processedRels, relationships.length, `Created ${rels.length} ${relType} relationships`);
       }
     }
 
     console.log(`   ✅ Upsert complete: ${totalNodes} nodes, ${relationships.length} relationships`);
+    onProgress?.('complete', totalNodes, totalNodes, `Upsert complete: ${totalNodes} nodes, ${relationships.length} relationships`);
   }
 
   /**
@@ -1434,11 +1454,11 @@ export class IncrementalIngestionManager {
       nodes: ParsedNode[];
       relationships: ParsedRelationship[];
     },
-    options: { projectId?: string; markDirty?: boolean } = {}
+    options: { projectId?: string; markDirty?: boolean; onProgress?: ProgressCallback } = {}
   ): Promise<{ nodesCreated: number; relationshipsCreated: number }> {
-    const { markDirty = true } = options;
+    const { markDirty = true, onProgress } = options;
 
-    await this.ingestNodes(graph.nodes, graph.relationships, markDirty);
+    await this.ingestNodes(graph.nodes, graph.relationships, markDirty, onProgress);
 
     return {
       nodesCreated: graph.nodes.length,
@@ -2065,9 +2085,11 @@ export class IncrementalIngestionManager {
     options: {
       /** Verbose logging */
       verbose?: boolean;
+      /** Pre-built map of path → uuid to skip Neo4j lookups (HUGE performance boost) */
+      pathToUuidMap?: Map<string, string>;
     } = {}
   ): Promise<{ processed: number; created: number; pending: number }> {
-    const { verbose = false } = options;
+    const { verbose = false, pathToUuidMap } = options;
 
     if (verbose) {
       console.log(`[References] Processing ${virtualFiles.length} virtual files for project ${projectId}`);
@@ -2159,30 +2181,67 @@ export class IncrementalIngestionManager {
           console.log(`[References] ${file.path}: extracted ${resolvedRefs.length} references`);
         }
 
-        // Find the source node in Neo4j by path
-        // For virtual files, we match by the file path property
-        const sourceResult = await this.client.run(`
-          MATCH (n)
-          WHERE n.projectId = $projectId
-            AND (n.file = $filePath OR n.path = $filePath OR n.absolutePath = $filePath)
-            AND (n:File OR n:MarkdownDocument OR n:MarkdownSection OR n:Scope)
-          RETURN n.uuid as uuid, labels(n) as labels
-          ORDER BY CASE
-            WHEN 'MarkdownDocument' IN labels(n) THEN 1
-            WHEN 'File' IN labels(n) THEN 2
-            ELSE 3
-          END
-          LIMIT 1
-        `, { projectId, filePath: file.path });
+        // Get the source UUID - use map if available (O(1)), otherwise query Neo4j (slow)
+        let sourceUuid: string | undefined;
 
-        if (sourceResult.records.length === 0) {
-          if (verbose) {
+        if (pathToUuidMap) {
+          // Fast path: use pre-built map
+          sourceUuid = pathToUuidMap.get(file.path);
+          if (!sourceUuid && verbose) {
+            console.warn(`[References] No uuid in map for: ${file.path}`);
+          }
+        } else {
+          // Slow path: query Neo4j (only used when map not provided)
+          // Using UNION to allow Neo4j to use indexes on each property separately
+          const sourceResult = await this.client.run(`
+            CALL {
+              MATCH (n:Scope)
+              WHERE n.projectId = $projectId AND n.file = $filePath
+              RETURN n, labels(n) as lbls
+              UNION
+              MATCH (n:Scope)
+              WHERE n.projectId = $projectId AND n.path = $filePath
+              RETURN n, labels(n) as lbls
+              UNION
+              MATCH (n:File)
+              WHERE n.projectId = $projectId AND n.path = $filePath
+              RETURN n, labels(n) as lbls
+              UNION
+              MATCH (n:File)
+              WHERE n.projectId = $projectId AND n.absolutePath = $filePath
+              RETURN n, labels(n) as lbls
+              UNION
+              MATCH (n:MarkdownDocument)
+              WHERE n.projectId = $projectId AND n.path = $filePath
+              RETURN n, labels(n) as lbls
+              UNION
+              MATCH (n:MarkdownSection)
+              WHERE n.projectId = $projectId AND n.file = $filePath
+              RETURN n, labels(n) as lbls
+              UNION
+              MATCH (n:MarkdownSection)
+              WHERE n.projectId = $projectId AND n.path = $filePath
+              RETURN n, labels(n) as lbls
+            }
+            RETURN n.uuid as uuid, lbls as labels
+            ORDER BY CASE
+              WHEN 'MarkdownDocument' IN lbls THEN 1
+              WHEN 'File' IN lbls THEN 2
+              ELSE 3
+            END
+            LIMIT 1
+          `, { projectId, filePath: file.path });
+
+          if (sourceResult.records.length > 0) {
+            sourceUuid = sourceResult.records[0].get('uuid');
+          } else if (verbose) {
             console.warn(`[References] No node found for virtual file: ${file.path}`);
           }
-          continue;
         }
 
-        const sourceUuid = sourceResult.records[0].get('uuid');
+        if (!sourceUuid) {
+          continue;
+        }
 
         // Create reference relations
         const result = await createReferenceRelations(

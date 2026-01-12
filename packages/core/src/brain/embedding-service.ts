@@ -573,7 +573,7 @@ export class EmbeddingService {
         this.embeddingProvider = new OllamaEmbeddingProvider({
           baseUrl: configOrApiKey.options?.baseUrl ?? configOrApiKey.options?.base_url,
           model: configOrApiKey.model,
-          batchSize: configOrApiKey.options?.batchSize ?? configOrApiKey.options?.batch_size ?? 10,
+          concurrency: configOrApiKey.options?.concurrency ?? configOrApiKey.options?.batchSize ?? 20,
           timeout: configOrApiKey.options?.timeout,
         });
       }
@@ -908,22 +908,24 @@ export class EmbeddingService {
     // ========================================
     // PHASE 3: Batch embed ALL tasks together
     // ========================================
-    if (verbose) {
-      console.log(`[EmbeddingService] Phase 3: Embedding ${allTasks.length} texts in batches of ${batchSize}...`);
-    }
+    const totalTasks = allTasks.length;
+    const totalBatches = Math.ceil(totalTasks / batchSize);
+    let processedCount = 0;
+
+    console.log(`[Embedding] Starting: ${totalTasks} embeddings to generate (${totalBatches} batches of ${batchSize})`);
 
     for (let i = 0; i < allTasks.length; i += batchSize) {
       const batch = allTasks.slice(i, i + batchSize);
       const batchNum = Math.floor(i / batchSize) + 1;
-      const totalBatches = Math.ceil(allTasks.length / batchSize);
+      const progressPct = Math.round((i / totalTasks) * 100);
 
-      if (verbose) {
-        console.log(`[EmbeddingService]   Batch ${batchNum}/${totalBatches}: ${batch.length} texts`);
-      }
+      console.log(`[Embedding] Batch ${batchNum}/${totalBatches} (${progressPct}% done, ${processedCount}/${totalTasks} embeddings)`);
 
       // Generate embeddings for this batch
       const texts = batch.map(t => t.text);
       const embeddings = await this.embeddingProvider!.embed(texts);
+
+      processedCount += batch.length;
 
       // Store embeddings on tasks
       for (let j = 0; j < batch.length; j++) {
@@ -1090,18 +1092,16 @@ export class EmbeddingService {
         }
       }
 
-      if (verbose) {
-        console.log(`[EmbeddingService]   ✓ Batch ${batchNum} complete, ${nodesInThisBatch.length} nodes marked done`);
-      }
+      const batchProgressPct = Math.round((processedCount / totalTasks) * 100);
+      console.log(`[Embedding] ✓ Batch ${batchNum}/${totalBatches} complete (${batchProgressPct}%, ${processedCount}/${totalTasks} done)`);
     }
 
     const durationMs = Date.now() - startTime;
     const totalEmbedded = embeddedByType.name + embeddedByType.content + embeddedByType.description;
+    const embedsPerSec = Math.round(totalEmbedded / (durationMs / 1000));
 
-    if (verbose) {
-      console.log(`[EmbeddingService] Complete: ${totalEmbedded} embeddings generated in ${durationMs}ms`);
-      console.log(`[EmbeddingService]   name: ${embeddedByType.name}, content: ${embeddedByType.content}, description: ${embeddedByType.description}`);
-    }
+    console.log(`[Embedding] ✓ Complete: ${totalEmbedded} embeddings in ${Math.round(durationMs / 1000)}s (${embedsPerSec}/s)`);
+    console.log(`[Embedding]   Breakdown: name=${embeddedByType.name}, content=${embeddedByType.content}, description=${embeddedByType.description}`);
 
     return {
       totalNodes,

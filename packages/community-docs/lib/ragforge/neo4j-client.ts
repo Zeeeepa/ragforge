@@ -215,11 +215,49 @@ export class Neo4jClient {
    */
   async ensureIndexes(): Promise<void> {
     const indexes = [
-      // Filtering indexes
-      "CREATE INDEX IF NOT EXISTS node_documentId FOR (n:Scope) ON (n.documentId)",
-      "CREATE INDEX IF NOT EXISTS node_userId FOR (n:Scope) ON (n.userId)",
-      "CREATE INDEX IF NOT EXISTS node_categoryId FOR (n:Scope) ON (n.categoryId)",
-      "CREATE INDEX IF NOT EXISTS node_categorySlug FOR (n:Scope) ON (n.categorySlug)",
+      // UUID indexes - CRITICAL for relationship creation performance
+      "CREATE INDEX scope_uuid IF NOT EXISTS FOR (n:Scope) ON (n.uuid)",
+      "CREATE INDEX file_uuid IF NOT EXISTS FOR (n:File) ON (n.uuid)",
+      "CREATE INDEX project_uuid IF NOT EXISTS FOR (n:Project) ON (n.uuid)",
+      "CREATE INDEX directory_uuid IF NOT EXISTS FOR (n:Directory) ON (n.uuid)",
+      "CREATE INDEX markdowndocument_uuid IF NOT EXISTS FOR (n:MarkdownDocument) ON (n.uuid)",
+      "CREATE INDEX markdownsection_uuid IF NOT EXISTS FOR (n:MarkdownSection) ON (n.uuid)",
+      "CREATE INDEX codeblock_uuid IF NOT EXISTS FOR (n:CodeBlock) ON (n.uuid)",
+      "CREATE INDEX externallibrary_uuid IF NOT EXISTS FOR (n:ExternalLibrary) ON (n.uuid)",
+      "CREATE INDEX datafile_uuid IF NOT EXISTS FOR (n:DataFile) ON (n.uuid)",
+      "CREATE INDEX documentfile_uuid IF NOT EXISTS FOR (n:DocumentFile) ON (n.uuid)",
+      "CREATE INDEX mediafile_uuid IF NOT EXISTS FOR (n:MediaFile) ON (n.uuid)",
+      "CREATE INDEX canonicalentity_uuid IF NOT EXISTS FOR (n:CanonicalEntity) ON (n.uuid)",
+      "CREATE INDEX tag_uuid IF NOT EXISTS FOR (n:Tag) ON (n.uuid)",
+      "CREATE INDEX datasection_uuid IF NOT EXISTS FOR (n:DataSection) ON (n.uuid)",
+      "CREATE INDEX embeddingchunk_uuid IF NOT EXISTS FOR (n:EmbeddingChunk) ON (n.uuid)",
+      "CREATE INDEX externalurl_uuid IF NOT EXISTS FOR (n:ExternalURL) ON (n.uuid)",
+      "CREATE INDEX packagejson_uuid IF NOT EXISTS FOR (n:PackageJson) ON (n.uuid)",
+      "CREATE INDEX threedfile_uuid IF NOT EXISTS FOR (n:ThreeDFile) ON (n.uuid)",
+      "CREATE INDEX webpage_uuid IF NOT EXISTS FOR (n:WebPage) ON (n.uuid)",
+      "CREATE INDEX webreference_uuid IF NOT EXISTS FOR (n:WebReference) ON (n.uuid)",
+
+      // Filtering indexes for community-docs specific queries
+      "CREATE INDEX node_documentId IF NOT EXISTS FOR (n:Scope) ON (n.documentId)",
+      "CREATE INDEX node_userId IF NOT EXISTS FOR (n:Scope) ON (n.userId)",
+      "CREATE INDEX node_categoryId IF NOT EXISTS FOR (n:Scope) ON (n.categoryId)",
+      "CREATE INDEX node_categorySlug IF NOT EXISTS FOR (n:Scope) ON (n.categorySlug)",
+
+      // File path indexes - CRITICAL for processVirtualFileReferences performance
+      // The reference linking queries search by file/path/absolutePath on multiple node types
+      "CREATE INDEX scope_file IF NOT EXISTS FOR (n:Scope) ON (n.file)",
+      "CREATE INDEX scope_path IF NOT EXISTS FOR (n:Scope) ON (n.path)",
+      "CREATE INDEX file_path IF NOT EXISTS FOR (n:File) ON (n.path)",
+      "CREATE INDEX file_absolutePath IF NOT EXISTS FOR (n:File) ON (n.absolutePath)",
+      "CREATE INDEX markdowndocument_path IF NOT EXISTS FOR (n:MarkdownDocument) ON (n.path)",
+      "CREATE INDEX markdownsection_file IF NOT EXISTS FOR (n:MarkdownSection) ON (n.file)",
+      "CREATE INDEX markdownsection_path IF NOT EXISTS FOR (n:MarkdownSection) ON (n.path)",
+
+      // projectId indexes for filtering by project
+      "CREATE INDEX scope_projectId IF NOT EXISTS FOR (n:Scope) ON (n.projectId)",
+      "CREATE INDEX file_projectId IF NOT EXISTS FOR (n:File) ON (n.projectId)",
+      "CREATE INDEX markdowndocument_projectId IF NOT EXISTS FOR (n:MarkdownDocument) ON (n.projectId)",
+      "CREATE INDEX markdownsection_projectId IF NOT EXISTS FOR (n:MarkdownSection) ON (n.projectId)",
     ];
 
     const constraints = [

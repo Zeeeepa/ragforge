@@ -23,6 +23,11 @@ import {
   ParserRegistry,
   TypeScriptLanguageParser,
   PythonLanguageParser,
+  RustLanguageParser,
+  GoLanguageParser,
+  CLanguageParser,
+  CppLanguageParser,
+  CSharpLanguageParser,
   HTMLDocumentParser,
   CSSParser,
   SCSSParser,
@@ -30,6 +35,11 @@ import {
   SvelteParser,
   MarkdownParser,
   GenericCodeParser,
+  // Relationship resolution from codeparsers
+  RelationshipResolver,
+  type RelationshipResolutionResult,
+  type ResolvedRelationship,
+  type ParsedFilesMap,
   // TODO: Migrate to UniversalScope/FileAnalysis from './base'
   // These internal types (ScopeInfo, ScopeFileAnalysis) are used throughout this file
   // and require a larger refactoring effort to replace with the universal types.
@@ -317,6 +327,11 @@ export class CodeSourceAdapter extends SourceAdapter {
     const registry = new ParserRegistry();
     registry.register(new TypeScriptLanguageParser());
     registry.register(new PythonLanguageParser());
+    registry.register(new RustLanguageParser());
+    registry.register(new GoLanguageParser());
+    registry.register(new CLanguageParser());
+    registry.register(new CppLanguageParser());
+    registry.register(new CSharpLanguageParser());
     return registry;
   }
 
@@ -626,8 +641,13 @@ export class CodeSourceAdapter extends SourceAdapter {
 
     // Pre-initialize all parsers BEFORE parallel processing to avoid race conditions
     // Detect which parsers we'll need based on file extensions
-    const needsTs = files.some(f => /\.(ts|tsx|js|jsx)$/i.test(f));
-    const needsPy = files.some(f => /\.py$/i.test(f));
+    const needsTs = files.some(f => /\.(ts|tsx|js|jsx|mjs|cjs)$/i.test(f));
+    const needsPy = files.some(f => /\.pyi?$/i.test(f));
+    const needsRust = files.some(f => /\.rs$/i.test(f));
+    const needsGo = files.some(f => /\.go$/i.test(f));
+    const needsC = files.some(f => /\.[ch]$/i.test(f));
+    const needsCpp = files.some(f => /\.(cpp|cc|cxx|hpp|hxx)$/i.test(f));
+    const needsCSharp = files.some(f => /\.cs$/i.test(f));
     const needsVue = files.some(f => /\.vue$/i.test(f));
     const needsSvelte = files.some(f => /\.svelte$/i.test(f));
     const needsHtml = files.some(f => /\.html?$/i.test(f));
@@ -636,10 +656,15 @@ export class CodeSourceAdapter extends SourceAdapter {
     const needsMd = files.some(f => /\.mdx?$/i.test(f));
 
     // Initialize parsers in parallel
-    console.log(`🔧 Initializing parsers: TS=${needsTs}, Py=${needsPy}, Vue=${needsVue}, Svelte=${needsSvelte}, HTML=${needsHtml}, CSS=${needsCss}, SCSS=${needsScss}, MD=${needsMd}`);
+    console.log(`🔧 Initializing parsers: TS=${needsTs}, Py=${needsPy}, Rust=${needsRust}, Go=${needsGo}, C=${needsC}, C++=${needsCpp}, C#=${needsCSharp}, Vue=${needsVue}, Svelte=${needsSvelte}, HTML=${needsHtml}, CSS=${needsCss}, SCSS=${needsScss}, MD=${needsMd}`);
     await Promise.all([
       needsTs && this.registry.initializeParser('typescript').catch(() => {}),
       needsPy && this.registry.initializeParser('python').catch(() => {}),
+      needsRust && this.registry.initializeParser('rust').catch(() => {}),
+      needsGo && this.registry.initializeParser('go').catch(() => {}),
+      needsC && this.registry.initializeParser('c').catch(() => {}),
+      needsCpp && this.registry.initializeParser('cpp').catch(() => {}),
+      needsCSharp && this.registry.initializeParser('csharp').catch(() => {}),
       needsVue && this.getVueParser().catch(() => {}),
       needsSvelte && this.getSvelteParser().catch(() => {}),
       needsHtml && this.getHtmlParser().catch(() => {}),
@@ -1285,190 +1310,15 @@ export class CodeSourceAdapter extends SourceAdapter {
       }
     }
 
-    // Second pass: Create scope relationships (CONSUMES, etc.)
-    console.log(`   🔗 Building scope relationships...`);
-    let relFilesProcessed = 0;
-    for (const [filePath, analysis] of codeFiles) {
-      for (const scope of analysis.scopes) {
-        const sourceUuid = this.generateUUID(scope, filePath);
-
-        // Build scope references (local_scope kind only)
-        const scopeRefs = this.buildScopeReferences(scope, filePath, globalUUIDMapping);
-        for (const targetUuid of scopeRefs) {
-          const targetScope = scopeMap.get(targetUuid);
-
-          // Detect inheritance: both source and target are classes
-          const isInheritance =
-            scope.type === 'class' &&
-            targetScope?.type === 'class' &&
-            this.isInheritanceReference(scope, targetScope);
-
-          relationships.push({
-            type: isInheritance ? 'INHERITS_FROM' : 'CONSUMES',
-            from: sourceUuid,
-            to: targetUuid
-          });
-        }
-
-        // Build import references (using ImportResolver)
-        const importRefs = await this.buildImportReferences(
-          scope,
-          filePath,
-          resolver,
-          globalUUIDMapping
-        );
-        for (const targetUuid of importRefs) {
-          const targetScope = scopeMap.get(targetUuid);
-
-          // Detect inheritance from imports (e.g., class extends BaseClass from './base')
-          const isInheritance =
-            scope.type === 'class' &&
-            targetScope?.type === 'class' &&
-            this.isInheritanceReference(scope, targetScope);
-
-          relationships.push({
-            type: isInheritance ? 'INHERITS_FROM' : 'CONSUMES',
-            from: sourceUuid,
-            to: targetUuid
-          });
-        }
-
-        // Build class member references if this is a class
-        if (scope.type === 'class') {
-          const memberRefs = this.buildClassMemberReferences(
-            scope,
-            filePath,
-            analysis.scopes,
-            globalUUIDMapping
-          );
-          for (const memberUuid of memberRefs) {
-            relationships.push({
-              type: 'CONSUMES',
-              from: sourceUuid,
-              to: memberUuid
-            });
-          }
-        }
-      }
-    }
-
-    // Phase 3: Create INHERITS_FROM and IMPLEMENTS relationships from heritage clauses
-    // This is more reliable than the heuristic-based detection above
-    console.log(`   🧬 Processing heritage clauses (extends/implements)...`);
-    for (const [filePath, analysis] of codeFiles) {
-      for (const scope of analysis.scopes) {
-        const tsMetadata = (scope as any).languageSpecific?.typescript;
-
-        if (tsMetadata?.heritageClauses && tsMetadata.heritageClauses.length > 0) {
-          const sourceUuid = this.generateUUID(scope, filePath);
-
-          for (const clause of tsMetadata.heritageClauses) {
-            for (const typeName of clause.types) {
-              // Try to find the target scope by name
-              // First check in same file
-              let targetUuid: string | undefined;
-
-              // Search in same file
-              const sameFileScope = analysis.scopes.find(s => s.name === typeName);
-              if (sameFileScope) {
-                targetUuid = this.generateUUID(sameFileScope, filePath);
-              } else {
-                // Search in all parsed files
-                for (const [mappedFilePath, mappedAnalysis] of codeFiles) {
-                  const foundScope = mappedAnalysis.scopes.find(s => s.name === typeName);
-                  if (foundScope) {
-                    targetUuid = this.generateUUID(foundScope, mappedFilePath);
-                    break;
-                  }
-                }
-              }
-
-              if (targetUuid) {
-                const relType = clause.clause === 'extends' ? 'INHERITS_FROM' : 'IMPLEMENTS';
-
-                // Avoid duplicates - check if relationship already exists
-                const isDuplicate = relationships.some(
-                  r => r.type === relType && r.from === sourceUuid && r.to === targetUuid
-                );
-
-                if (!isDuplicate) {
-                  relationships.push({
-                    type: relType,
-                    from: sourceUuid,
-                    to: targetUuid,
-                    properties: {
-                      explicit: true, // Mark as explicitly declared (not heuristic)
-                      clause: clause.clause
-                    }
-                  });
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-    // Phase 3: Create DECORATED_BY relationships from decoratorDetails
-    console.log(`   🎀 Processing decorators...`);
-    for (const [filePath, analysis] of codeFiles) {
-      for (const scope of analysis.scopes) {
-        const tsMetadata = (scope as any).languageSpecific?.typescript;
-
-        if (tsMetadata?.decoratorDetails && tsMetadata.decoratorDetails.length > 0) {
-          const sourceUuid = this.generateUUID(scope, filePath);
-
-          for (const decorator of tsMetadata.decoratorDetails) {
-            // Try to find the decorator as a local scope
-            let decoratorUuid: string | undefined;
-
-            // Check in same file first
-            for (const s of analysis.scopes) {
-              if (s.name === decorator.name && s.type === 'function') {
-                decoratorUuid = this.generateUUID(s, filePath);
-                break;
-              }
-            }
-
-            // Check in other files if not found locally
-            if (!decoratorUuid) {
-              for (const [otherPath, otherAnalysis] of codeFiles) {
-                if (otherPath === filePath) continue;
-                for (const s of otherAnalysis.scopes) {
-                  if (s.name === decorator.name && s.type === 'function') {
-                    decoratorUuid = this.generateUUID(s, otherPath);
-                    break;
-                  }
-                }
-                if (decoratorUuid) break;
-              }
-            }
-
-            if (decoratorUuid) {
-              // Avoid duplicates
-              const isDuplicate = relationships.some(
-                r => r.type === 'DECORATED_BY' && r.from === sourceUuid && r.to === decoratorUuid
-              );
-
-              if (!isDuplicate) {
-                relationships.push({
-                  type: 'DECORATED_BY',
-                  from: sourceUuid,
-                  to: decoratorUuid,
-                  properties: {
-                    decoratorName: decorator.name,
-                    arguments: decorator.arguments || undefined,
-                    line: decorator.line
-                  }
-                });
-              }
-            }
-            // Note: If decorator is from an external library, we don't create a relationship
-            // as we'd need to link to an ExternalLibrary node with a specific symbol
-          }
-        }
-      }
-    }
+    // Second pass: Create scope relationships using codeparsers' RelationshipResolver
+    // This handles CONSUMES, INHERITS_FROM, IMPLEMENTS, DECORATED_BY for all languages
+    console.log(`   🔗 Building scope relationships with RelationshipResolver...`);
+    const scopeRelationships = await this.buildScopeRelationshipsWithResolver(
+      codeFiles,
+      projectRoot,
+      scopeMap
+    );
+    relationships.push(...scopeRelationships);
 
     // Create ExternalLibrary nodes and USES_LIBRARY relationships
     console.log(`   📦 Processing external library references...`);
@@ -3076,9 +2926,136 @@ export class CodeSourceAdapter extends SourceAdapter {
   }
 
   /**
+   * Build scope relationships using codeparsers' RelationshipResolver
+   * Handles CONSUMES, INHERITS_FROM, IMPLEMENTS, DECORATED_BY for all languages
+   *
+   * Uses codeparsers' multi-language relationship resolution, then maps UUIDs
+   * using ragforge's generateUUID to maintain compatibility with existingUUIDMapping.
+   */
+  private async buildScopeRelationshipsWithResolver(
+    codeFiles: Map<string, ScopeFileAnalysis>,
+    projectRoot: string,
+    scopeMap: Map<string, ScopeInfo>
+  ): Promise<ParsedRelationship[]> {
+    const relationships: ParsedRelationship[] = [];
+
+    if (codeFiles.size === 0) {
+      return relationships;
+    }
+
+    // Create RelationshipResolver from codeparsers
+    const relationshipResolver = new RelationshipResolver({
+      projectRoot,
+      includeContains: false, // We already handle HAS_PARENT in node creation
+      includeInverse: false, // We don't need CONSUMED_BY in the graph
+      includeDecorators: true,
+      resolveCrossFile: true,
+      debug: false,
+    });
+
+    // Resolve relationships
+    const result = await relationshipResolver.resolveRelationships(codeFiles as ParsedFilesMap);
+
+    console.log(`   📊 RelationshipResolver stats: ${result.stats.totalRelationships} relationships, ${result.stats.unresolvedCount} unresolved`);
+    if (result.stats.byType) {
+      const types = Object.entries(result.stats.byType)
+        .map(([type, count]) => `${type}=${count}`)
+        .join(', ');
+      console.log(`      Types: ${types}`);
+    }
+
+    // Build scope lookup for efficient UUID mapping
+    // Key: "relativePath:scopeName:scopeType" -> scope
+    const scopeLookup = new Map<string, { scope: ScopeInfo; absolutePath: string }>();
+    for (const [absolutePath, analysis] of codeFiles) {
+      const relativePath = path.relative(projectRoot, absolutePath);
+      for (const scope of analysis.scopes) {
+        const key = `${relativePath}:${scope.name}:${scope.type}`;
+        scopeLookup.set(key, { scope, absolutePath });
+      }
+    }
+
+    // Convert ResolvedRelationship to ParsedRelationship
+    // Use ragforge's generateUUID for UUID compatibility
+    const seenRelationships = new Set<string>(); // Deduplicate
+
+    for (const rel of result.relationships) {
+      // Skip inverse relationships (CONSUMED_BY, HAS_PARENT, DECORATED_BY)
+      // We only want the forward direction
+      if (rel.type === 'CONSUMED_BY' || rel.type === 'HAS_PARENT' || rel.type === 'DECORATED_BY') {
+        continue;
+      }
+
+      // Look up source and target scopes to get ragforge UUIDs
+      const sourceKey = `${rel.fromFile}:${rel.fromName}:${rel.fromType}`;
+      const targetKey = `${rel.toFile}:${rel.toName}:${rel.toType}`;
+
+      const sourceInfo = scopeLookup.get(sourceKey);
+      const targetInfo = scopeLookup.get(targetKey);
+
+      if (!sourceInfo || !targetInfo) {
+        // Scope not found - might be from a different file set
+        continue;
+      }
+
+      // Generate UUIDs using ragforge's method (supports existingUUIDMapping)
+      const fromUuid = this.generateUUID(sourceInfo.scope, sourceInfo.absolutePath);
+      const toUuid = this.generateUUID(targetInfo.scope, targetInfo.absolutePath);
+
+      // Deduplicate
+      const relKey = `${rel.type}:${fromUuid}:${toUuid}`;
+      if (seenRelationships.has(relKey)) {
+        continue;
+      }
+      seenRelationships.add(relKey);
+
+      // Map relationship type
+      // Note: DECORATES from codeparsers maps to DECORATED_BY in ragforge (reversed direction)
+      let relType = rel.type as string;
+      let from = fromUuid;
+      let to = toUuid;
+
+      if (rel.type === 'DECORATES') {
+        // Codeparsers: decorator DECORATES target
+        // Ragforge: target DECORATED_BY decorator
+        relType = 'DECORATED_BY';
+        from = toUuid; // target
+        to = fromUuid; // decorator
+      }
+
+      const parsedRel: ParsedRelationship = {
+        type: relType,
+        from,
+        to,
+      };
+
+      // Add properties if available
+      if (rel.metadata) {
+        const properties: Record<string, unknown> = {};
+        if (rel.metadata.context) properties.context = rel.metadata.context;
+        if (rel.metadata.importPath) properties.importPath = rel.metadata.importPath;
+        if (rel.metadata.clause) properties.clause = rel.metadata.clause;
+        if (rel.metadata.decoratorArgs) properties.decoratorArgs = rel.metadata.decoratorArgs;
+        if (rel.type === 'INHERITS_FROM' || rel.type === 'IMPLEMENTS') {
+          properties.explicit = true;
+        }
+        if (Object.keys(properties).length > 0) {
+          parsedRel.properties = properties;
+        }
+      }
+
+      relationships.push(parsedRel);
+    }
+
+    return relationships;
+  }
+
+  /**
    * Build scope references from identifierReferences
    * Only processes local_scope kind (references in same file)
    * Ported from buildXmlScopes.ts:307-349
+   *
+   * @deprecated Use buildScopeRelationshipsWithResolver instead
    */
   private buildScopeReferences(
     scope: ScopeInfo,

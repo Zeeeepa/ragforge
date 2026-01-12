@@ -55,7 +55,8 @@ import { getPipelineLogger } from "./logger";
 import type { EntityEmbeddingService, EntitySearchResult } from "./entity-embedding-service";
 import { createEnrichmentService, type EnrichmentService, type DocumentContext } from "./enrichment-service";
 import { EntityResolutionService, type EntityResolutionOptions } from "./entity-resolution-service";
-import type { Entity, ExtractedTag, NodeToEnrich } from "./entity-types";
+import type { Entity, ExtractedTag } from "./entity-types";
+import type { NodeToEnrich } from "./enrichment-service";
 
 const logger = getPipelineLogger();
 
@@ -238,6 +239,15 @@ export interface CommunitySearchResultSet {
  * Virtual file ingestion options (in-memory, no disk I/O)
  * Use this for scalable deployments where files come from databases/S3
  */
+/**
+ * Progress callback for long-running operations
+ * @param phase - Current phase (parsing, nodes, relationships, etc.)
+ * @param current - Current progress count
+ * @param total - Total expected count
+ * @param message - Optional human-readable message
+ */
+export type ProgressCallback = (phase: string, current: number, total: number, message?: string) => void;
+
 export interface CommunityVirtualIngestionOptions {
   /** Virtual files with content in memory */
   virtualFiles: Array<{
@@ -262,6 +272,8 @@ export interface CommunityVirtualIngestionOptions {
   projectId?: string;
   /** Generate embeddings after ingestion */
   generateEmbeddings?: boolean;
+  /** Progress callback for SSE/real-time updates */
+  onProgress?: ProgressCallback;
 }
 
 /**
@@ -605,6 +617,7 @@ export class CommunityOrchestratorAdapter {
       metadata,
       sourceIdentifier = "upload",
       projectId = `doc-${metadata.documentId}`,
+      onProgress,
     } = options;
 
     // Build virtual root prefix: /virtual/{documentId}/{sourceIdentifier}
@@ -618,6 +631,9 @@ export class CommunityOrchestratorAdapter {
         `Ingesting ${virtualFiles.length} virtual files for document: ${metadata.documentId}`
       );
       logger.info(`Virtual root: ${virtualRoot}`);
+
+      // Report parsing start
+      onProgress?.("parsing", 0, virtualFiles.length, "Parsing files...");
 
       // Prefix all file paths with virtual root
       const prefixedFiles = virtualFiles.map((f) => {
@@ -637,6 +653,9 @@ export class CommunityOrchestratorAdapter {
         },
         projectId,
       });
+
+      // Report parsing complete
+      onProgress?.("parsing", virtualFiles.length, virtualFiles.length, `Parsed ${result.graph.nodes.length} nodes`);
 
       // Apply transformGraph hook to inject community metadata
       let graph = {
@@ -693,37 +712,21 @@ export class CommunityOrchestratorAdapter {
 
       logger.info(`Injected community metadata on ${graph.nodes.length} nodes`);
 
-      // Ingest graph into Neo4j
+      // Report nodes phase starting
+      onProgress?.("nodes", 0, graph.nodes.length, "Creating nodes in Neo4j...");
+
+      // Ingest graph into Neo4j with progress callback
       await this.ingestionManager!.ingestGraph(
         { nodes: graph.nodes, relationships: graph.relationships },
-        { projectId, markDirty: true }
+        { projectId, markDirty: true, onProgress }
       );
 
       logger.info(
         `Virtual ingestion complete: ${graph.nodes.length} nodes, ${graph.relationships.length} relationships`
       );
 
-      // Process cross-file references (links in markdown, imports in code, etc.)
-      // This creates REFERENCES_DOC, REFERENCES_ASSET, CONSUMES relationships
-      try {
-        // Filter to only files with string content (not Buffer) for reference processing
-        const stringContentFiles = prefixedFiles.filter(
-          (f): f is { path: string; content: string } => typeof f.content === 'string'
-        );
-        const refResult = await this.ingestionManager!.processVirtualFileReferences(
-          projectId,
-          stringContentFiles,
-          { verbose: this.verbose }
-        );
-        if (refResult.created > 0 || refResult.pending > 0) {
-          logger.info(
-            `Reference linking: ${refResult.created} created, ${refResult.pending} pending`
-          );
-        }
-      } catch (err) {
-        // Don't fail ingestion if reference linking fails
-        logger.warn(`Reference linking failed: ${err instanceof Error ? err.message : err}`);
-      }
+      // NOTE: Reference linking (REFERENCES, LINKS_TO, REFERENCES_IMAGE) is already done
+      // during parsing in code-source-adapter.ts. No post-processing needed!
 
       return {
         nodesCreated: graph.nodes.length,
@@ -914,7 +917,7 @@ export class CommunityOrchestratorAdapter {
             const parseResult = await mediaParser.parse({
               filePath: tempPath,
               projectId,
-              options: mediaParseOptions,
+              options: mediaParseOptions as unknown as Record<string, unknown>,
             });
 
             // Update file paths to use original path instead of temp
@@ -1570,9 +1573,14 @@ export class CommunityOrchestratorAdapter {
    * Generate embeddings for all nodes of a document
    * Uses ragforge core EmbeddingService with batching and multi-embedding support
    *
+   * @param documentId - The document ID to generate embeddings for
+   * @param onProgress - Optional callback for progress updates (current, total)
    * @returns Number of embeddings generated
    */
-  async generateEmbeddingsForDocument(documentId: string): Promise<number> {
+  async generateEmbeddingsForDocument(
+    documentId: string,
+    onProgress?: (current: number, total: number) => void
+  ): Promise<number> {
     if (!this.embeddingService) {
       logger.warn("No embedding service configured, skipping embeddings");
       return 0;
@@ -1582,6 +1590,19 @@ export class CommunityOrchestratorAdapter {
     logger.info(`Generating embeddings for document: ${documentId} (projectId: ${projectId})`);
 
     try {
+      // Count nodes that need embeddings (for progress reporting)
+      // Note: This is an estimate - actual count may differ due to incremental processing
+      if (onProgress) {
+        const countResult = await this.neo4j.run(
+          `MATCH (n {projectId: $projectId})
+           WHERE n.embeddingsDirty = true OR n.nameEmbedding IS NULL
+           RETURN count(n) as total`,
+          { projectId }
+        );
+        const estimatedTotal = countResult.records[0]?.get("total")?.toNumber() ?? 0;
+        onProgress(0, estimatedTotal);
+      }
+
       // Use ragforge core's multi-embedding generation with batching
       const result = await this.embeddingService.generateMultiEmbeddings({
         projectId,
@@ -1589,6 +1610,11 @@ export class CommunityOrchestratorAdapter {
         verbose: this.verbose,
         batchSize: 50,
       });
+
+      // Report completion
+      if (onProgress) {
+        onProgress(result.totalEmbedded, result.totalEmbedded);
+      }
 
       logger.info(
         `Generated embeddings for document ${documentId}: ` +

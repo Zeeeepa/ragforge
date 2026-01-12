@@ -228,7 +228,7 @@ export class CommunityIngestionService {
         logger.info(`[IngestionService] Processing media file: ${file.path}`);
         const mediaResult = await this.orchestrator.ingestMedia({
           filePath: file.path,
-          buffer: file.content,
+          binaryContent: file.content,
           metadata,
           projectId,
           enableVision,
@@ -306,11 +306,11 @@ export class CommunityIngestionService {
     if (generateEmbeddings && result.stats.nodesCreated > 0) {
       try {
         logger.info(`[IngestionService] Generating embeddings for ${result.stats.nodesCreated} nodes`);
-        const embeddingResult = await this.orchestrator.generateEmbeddingsForDocument(
-          metadata.documentId,
-          projectId
+        // generateEmbeddingsForDocument calculates projectId from documentId internally
+        const embeddingsGenerated = await this.orchestrator.generateEmbeddingsForDocument(
+          metadata.documentId
         );
-        result.stats.embeddingsGenerated = embeddingResult.total;
+        result.stats.embeddingsGenerated = embeddingsGenerated;
       } catch (err: any) {
         logger.warn(`[IngestionService] Failed to generate embeddings: ${err.message}`);
         result.warnings.push(`Embedding generation failed: ${err.message}`);

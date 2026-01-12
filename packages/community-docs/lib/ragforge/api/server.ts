@@ -55,14 +55,94 @@ import { registerVisionRoutes } from "./routes/vision";
 import {
   getOCRService,
   generateRender3DAssetHandler,
+  getLocalTimestamp,
   type ThreeDToolsContext,
 } from "@luciformresearch/ragforge";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
+import { exec } from "child_process";
+import { promisify } from "util";
+
+const execAsync = promisify(exec);
 
 // ============================================================================
-// GitHub API Helpers
+// GitHub Clone Helper
+// ============================================================================
+
+/**
+ * Clone a GitHub repository to a temporary directory
+ * Uses shallow clone (--depth 1) for speed
+ */
+async function cloneGitHubRepo(
+  githubUrl: string,
+  branch: string = "main"
+): Promise<{ tempDir: string; repoDir: string }> {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "github-ingest-"));
+
+  // Extract repo name from URL for the directory name
+  const urlMatch = githubUrl.match(/github\.com\/([^\/]+)\/([^\/\.]+)/);
+  if (!urlMatch) {
+    throw new Error("Invalid GitHub URL format");
+  }
+  const [, , repoName] = urlMatch;
+  const repoDir = path.join(tempDir, repoName);
+
+  logger.info(`Cloning ${githubUrl} (branch: ${branch}) to ${tempDir}...`);
+
+  try {
+    // Shallow clone for speed - only get the latest commit
+    await execAsync(`git clone --depth 1 --branch ${branch} ${githubUrl} ${repoDir}`, {
+      timeout: 120000, // 2 minutes timeout
+    });
+    logger.info(`Clone complete: ${repoDir}`);
+    return { tempDir, repoDir };
+  } catch (err: any) {
+    // Cleanup on failure
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    throw new Error(`Failed to clone repository: ${err.message}`);
+  }
+}
+
+/**
+ * Recursively get all files in a directory matching CODE_EXTENSIONS
+ */
+async function getCodeFilesFromDir(
+  dir: string,
+  baseDir: string,
+  extensions: Set<string>
+): Promise<Array<{ path: string; absolutePath: string }>> {
+  const files: Array<{ path: string; absolutePath: string }> = [];
+
+  async function walk(currentDir: string) {
+    const entries = await fs.readdir(currentDir, { withFileTypes: true });
+
+    for (const entry of entries) {
+      const fullPath = path.join(currentDir, entry.name);
+      const relativePath = path.relative(baseDir, fullPath);
+
+      // Skip hidden directories and node_modules
+      if (entry.name.startsWith(".") || entry.name === "node_modules") {
+        continue;
+      }
+
+      if (entry.isDirectory()) {
+        await walk(fullPath);
+      } else if (entry.isFile()) {
+        const ext = "." + entry.name.split(".").pop()?.toLowerCase();
+        if (extensions.has(ext)) {
+          files.push({ path: relativePath, absolutePath: fullPath });
+        }
+      }
+    }
+  }
+
+  await walk(dir);
+  return files;
+}
+
+// ============================================================================
+// GitHub API Helpers (kept for reference, not used for ingestion anymore)
 // ============================================================================
 
 interface GitHubTreeItem {
@@ -125,6 +205,11 @@ async function fetchGitHubFile(owner: string, repo: string, sha: string): Promis
 const CODE_EXTENSIONS = new Set([
   ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
   ".py", ".pyi",
+  ".rs",                                          // Rust
+  ".go",                                          // Go
+  ".c", ".h",                                     // C
+  ".cpp", ".cc", ".cxx", ".hpp", ".hxx",          // C++
+  ".cs",                                          // C#
   ".vue", ".svelte",
   ".html", ".css", ".scss", ".sass", ".less",
   ".json", ".yaml", ".yml",
@@ -136,6 +221,69 @@ const CODE_EXTENSIONS = new Set([
 // ============================================================================
 
 const DEFAULT_PORT = 6970;
+
+// ============================================================================
+// Console Interception (add local timestamps + SSE log streaming)
+// ============================================================================
+
+const originalConsoleLog = console.log.bind(console);
+const originalConsoleError = console.error.bind(console);
+const originalConsoleWarn = console.warn.bind(console);
+
+/**
+ * Log sink for SSE streaming
+ * When set, all console.log/error/warn are also sent to this callback
+ */
+type LogSink = (level: "log" | "error" | "warn", message: string, timestamp: string) => void;
+let currentLogSink: LogSink | null = null;
+
+/**
+ * Set a log sink to receive all console output
+ * Used during SSE streaming to forward logs to client
+ */
+export function setLogSink(sink: LogSink | null): void {
+  currentLogSink = sink;
+}
+
+function serializeArg(arg: any): string {
+  if (typeof arg === "string") return arg;
+  if (arg instanceof Error) return `${arg.message}\n${arg.stack}`;
+  try {
+    return JSON.stringify(arg);
+  } catch {
+    return String(arg);
+  }
+}
+
+console.log = (...args: any[]) => {
+  const message = args.map(serializeArg).join(" ");
+  const timestamp = getLocalTimestamp();
+  originalConsoleLog(`[${timestamp}] ${message}`);
+  // Send to SSE sink if active
+  if (currentLogSink) {
+    currentLogSink("log", message, timestamp);
+  }
+};
+
+console.error = (...args: any[]) => {
+  const message = args.map(serializeArg).join(" ");
+  const timestamp = getLocalTimestamp();
+  originalConsoleError(`[${timestamp}] [ERROR] ${message}`);
+  // Send to SSE sink if active
+  if (currentLogSink) {
+    currentLogSink("error", message, timestamp);
+  }
+};
+
+console.warn = (...args: any[]) => {
+  const message = args.map(serializeArg).join(" ");
+  const timestamp = getLocalTimestamp();
+  originalConsoleWarn(`[${timestamp}] [WARN] ${message}`);
+  // Send to SSE sink if active
+  if (currentLogSink) {
+    currentLogSink("warn", message, timestamp);
+  }
+};
 
 // ============================================================================
 // Logger
@@ -594,7 +742,7 @@ export class CommunityAPIServer {
           generateTitles,
           generateEmbeddings,
           extractEntities,
-          enrichmentService: extractEntities ? this.enrichment : undefined,
+          enrichmentService: extractEntities && this.enrichment ? this.enrichment : undefined,
         });
 
         return {
@@ -616,7 +764,8 @@ export class CommunityAPIServer {
       }
     });
 
-    // GitHub Repository Ingestion (virtual files - no disk I/O)
+    // GitHub Repository Ingestion with SSE (Server-Sent Events)
+    // Streams progress updates in real-time to avoid timeout issues with large repos
     this.server.post<{
       Body: {
         githubUrl: string;
@@ -626,8 +775,9 @@ export class CommunityAPIServer {
         generateEmbeddings?: boolean;
       };
     }>("/ingest/github", async (request, reply) => {
-      const { githubUrl, metadata, branch = "main", maxFiles = 100, generateEmbeddings = true } = request.body || {};
+      const { githubUrl, metadata, branch = "main", maxFiles = 1000, generateEmbeddings = true } = request.body || {};
 
+      // Validation (return JSON errors before switching to SSE)
       if (!githubUrl || !metadata) {
         reply.status(400);
         return { success: false, error: "Missing githubUrl or metadata" };
@@ -638,7 +788,6 @@ export class CommunityAPIServer {
         return { success: false, error: "Orchestrator not available" };
       }
 
-      // Parse GitHub URL
       const urlMatch = githubUrl.match(/github\.com\/([^\/]+)\/([^\/\.]+)/);
       if (!urlMatch) {
         reply.status(400);
@@ -648,65 +797,130 @@ export class CommunityAPIServer {
       const [, owner, repo] = urlMatch;
       const sourceIdentifier = `github.com/${owner}/${repo}`;
 
-      logger.info(`GitHub ingestion: ${sourceIdentifier} (branch: ${branch})`);
+      // Switch to SSE mode
+      reply.raw.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no", // Disable nginx buffering
+      });
+
+      // Track if client disconnected - use reply.raw (response stream), not request.raw
+      // request.raw 'close' fires when client finishes sending the request body
+      // reply.raw 'close' fires when the response stream is closed (client disconnect)
+      let clientDisconnected = false;
+
+      // SSE helper functions
+      const sendEvent = (event: string, data: any) => {
+        reply.raw.write(`event: ${event}\n`);
+        reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
+      };
+
+      const sendProgress = (phase: string, current?: number, total?: number, message?: string) => {
+        sendEvent("progress", { phase, current, total, message, timestamp: getLocalTimestamp() });
+      };
+
+      // Send log events from console.log/error/warn (captures core output)
+      const sendLog = (level: "log" | "error" | "warn", message: string, timestamp: string) => {
+        if (!clientDisconnected) {
+          sendEvent("log", { level, message, timestamp });
+        }
+      };
+
+      // Heartbeat to keep connection alive (every 30s)
+      const heartbeat = setInterval(() => {
+        reply.raw.write(": heartbeat\n\n");
+      }, 30000);
+
+      reply.raw.on("close", () => {
+        clientDisconnected = true;
+        setLogSink(null); // Stop forwarding logs when client disconnects
+        clearInterval(heartbeat);
+        logger.info(`[SSE] Client disconnected (reply.raw close event)`);
+      });
+
+      // Activate log sink to capture all console output during ingestion
+      setLogSink(sendLog);
+
+      logger.info(`GitHub ingestion (SSE): ${sourceIdentifier} (branch: ${branch})`);
+      const startTime = Date.now();
+      let tempDir: string | null = null;
 
       try {
-        // Fetch repository tree
-        const tree = await fetchGitHubTree(owner, repo, branch);
+        // Phase 1: Clone repository
+        sendProgress("cloning", 0, 1, `Cloning ${githubUrl}...`);
+        const cloneResult = await cloneGitHubRepo(githubUrl, branch);
+        tempDir = cloneResult.tempDir;
+        const repoDir = cloneResult.repoDir;
+        sendProgress("cloning", 1, 1, "Repository cloned");
 
-        // Filter to code files only
-        const codeFiles = tree.filter((item) => {
-          if (item.type !== "blob") return false;
-          const ext = "." + item.path.split(".").pop()?.toLowerCase();
-          return CODE_EXTENSIONS.has(ext);
-        });
+        // Note: We continue ingestion even if client disconnects - the work should complete
+
+        // Phase 2: Scan files
+        sendProgress("scanning", 0, 0, "Scanning for code files...");
+        const codeFiles = await getCodeFilesFromDir(repoDir, repoDir, CODE_EXTENSIONS);
 
         if (codeFiles.length === 0) {
-          return { success: false, error: "No supported code files found in repository" };
+          sendEvent("error", { success: false, error: "No supported code files found in repository", phase: "scanning" });
+          return;
         }
 
-        // Limit files if needed
-        const filesToFetch = codeFiles.slice(0, maxFiles);
-        logger.info(`Fetching ${filesToFetch.length}/${codeFiles.length} code files`);
+        const filesToIngest = codeFiles.slice(0, maxFiles);
+        sendProgress("scanning", filesToIngest.length, codeFiles.length, `Found ${codeFiles.length} files, will ingest ${filesToIngest.length}`);
 
-        // Fetch file contents in parallel (with concurrency limit)
+        // Phase 3: Read files
+        sendProgress("reading", 0, filesToIngest.length, "Reading file contents...");
         const virtualFiles: Array<{ path: string; content: string }> = [];
-        const concurrency = 5;
-
-        for (let i = 0; i < filesToFetch.length; i += concurrency) {
-          const batch = filesToFetch.slice(i, i + concurrency);
-          const results = await Promise.all(
-            batch.map(async (file) => {
-              try {
-                const content = await fetchGitHubFile(owner, repo, file.sha);
-                return { path: file.path, content };
-              } catch (err) {
-                logger.warn(`Failed to fetch ${file.path}: ${err}`);
-                return null;
-              }
-            })
-          );
-          virtualFiles.push(...results.filter((r): r is { path: string; content: string } => r !== null));
+        for (let i = 0; i < filesToIngest.length; i++) {
+          const file = filesToIngest[i];
+          try {
+            const content = await fs.readFile(file.absolutePath, "utf-8");
+            virtualFiles.push({ path: file.path, content });
+          } catch (err) {
+            logger.warn(`Failed to read ${file.path}: ${err}`);
+          }
+          // Send progress every 50 files
+          if ((i + 1) % 50 === 0 || i === filesToIngest.length - 1) {
+            sendProgress("reading", i + 1, filesToIngest.length, `Read ${i + 1}/${filesToIngest.length} files`);
+          }
         }
 
-        logger.info(`Fetched ${virtualFiles.length} files, starting ingestion...`);
+        // Phase 4: Ingest (parsing + nodes + relationships)
+        sendProgress("ingesting", 0, 0, "Starting ingestion pipeline...");
 
-        // Ingest using virtual files
         const result = await this.orchestrator.ingestVirtual({
           virtualFiles,
           sourceIdentifier,
           metadata,
+          onProgress: (phase: string, current: number, total: number, message?: string) => {
+            if (!clientDisconnected) {
+              sendProgress(phase, current, total, message);
+            }
+          },
         });
 
-        // Generate embeddings if requested and embedding service is available
+        logger.info(`[DEBUG] ingestVirtual completed: ${result.nodesCreated} nodes, ${result.relationshipsCreated} rels`);
+
+        // Phase 5: Generate embeddings
+        logger.info(`[DEBUG] Phase 5: generateEmbeddings=${generateEmbeddings}, hasEmbeddingService=${this.orchestrator.hasEmbeddingService()}`);
         let embeddingsGenerated = 0;
         if (generateEmbeddings && this.orchestrator.hasEmbeddingService()) {
-          logger.info(`Generating embeddings for document: ${metadata.documentId}`);
-          embeddingsGenerated = await this.orchestrator.generateEmbeddingsForDocument(metadata.documentId);
-          logger.info(`Generated ${embeddingsGenerated} embeddings`);
+          logger.info(`[DEBUG] Starting embedding generation for document: ${metadata.documentId}`);
+          sendProgress("embeddings", 0, 0, "Starting embedding generation...");
+          embeddingsGenerated = await this.orchestrator.generateEmbeddingsForDocument(
+            metadata.documentId,
+            (current: number, total: number) => {
+              if (!clientDisconnected) {
+                sendProgress("embeddings", current, total, `Generating embeddings: ${current}/${total}`);
+              }
+            }
+          );
+          sendProgress("embeddings", embeddingsGenerated, embeddingsGenerated, `Generated ${embeddingsGenerated} embeddings`);
         }
 
-        return {
+        // Success!
+        const duration = Date.now() - startTime;
+        sendEvent("complete", {
           success: true,
           documentId: metadata.documentId,
           sourceIdentifier,
@@ -714,11 +928,33 @@ export class CommunityAPIServer {
           nodesCreated: result.nodesCreated,
           relationshipsCreated: result.relationshipsCreated,
           embeddingsGenerated,
-        };
+          durationMs: duration,
+        });
+
+        logger.info(`GitHub ingestion complete: ${result.nodesCreated} nodes, ${result.relationshipsCreated} rels, ${embeddingsGenerated} embeddings in ${duration}ms`);
+
       } catch (err: any) {
-        logger.error(`GitHub ingestion failed: ${err.message}`);
-        reply.status(500);
-        return { success: false, error: err.message };
+        if (!clientDisconnected) {
+          logger.error(`GitHub ingestion failed: ${err.message}`);
+          sendEvent("error", { success: false, error: err.message });
+        }
+      } finally {
+        // Deactivate log sink (stop forwarding console output to SSE)
+        setLogSink(null);
+        clearInterval(heartbeat);
+
+        // Cleanup temp directory
+        if (tempDir) {
+          logger.info(`Cleaning up temp directory: ${tempDir}`);
+          await fs.rm(tempDir, { recursive: true, force: true }).catch((err) => {
+            logger.warn(`Failed to cleanup temp dir: ${err.message}`);
+          });
+        }
+
+        // End SSE stream
+        if (!clientDisconnected) {
+          reply.raw.end();
+        }
       }
     });
 
