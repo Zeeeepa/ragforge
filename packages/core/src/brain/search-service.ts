@@ -585,7 +585,8 @@ export class SearchService {
   // ============================================================================
 
   /**
-   * Full-text search using Neo4j Lucene indexes (BM25)
+   * Full-text search using Neo4j Lucene index (BM25)
+   * Uses unified_fulltext index on _name, _content, _description
    */
   private async fullTextSearch(
     query: string,
@@ -599,18 +600,6 @@ export class SearchService {
   ): Promise<ServiceSearchResult[]> {
     const { filterClause, params, limit, minScore, fuzzyDistance = 1 } = options;
 
-    // Full-text index names
-    const fullTextIndexes = [
-      'scope_fulltext',
-      'file_fulltext',
-      'datafile_fulltext',
-      'document_fulltext',
-      'markdown_fulltext',
-      'media_fulltext',
-      'webpage_fulltext',
-      'codeblock_fulltext',
-    ];
-
     // Escape Lucene special characters
     const escapedQuery = query.replace(/[+\-&|!(){}[\]^"~*?:\\/]/g, '\\$&');
 
@@ -620,16 +609,12 @@ export class SearchService {
       ? words.join(' ')
       : words.map(w => `${w}~${fuzzyDistance}`).join(' ');
 
-    // Build UNION ALL query
-    const unionClauses = fullTextIndexes.map(indexName => `
-      CALL db.index.fulltext.queryNodes('${indexName}', $luceneQuery)
+    // Single query on unified index
+    const cypher = `
+      CALL db.index.fulltext.queryNodes('unified_fulltext', $luceneQuery)
       YIELD node AS n, score
       WHERE true ${filterClause}
       RETURN n, score
-    `);
-
-    const cypher = `
-      ${unionClauses.join('\nUNION ALL\n')}
       ORDER BY score DESC
       LIMIT $limit
     `;
@@ -638,20 +623,15 @@ export class SearchService {
       const result = await this.neo4jClient.run(cypher, {
         luceneQuery,
         ...params,
-        limit: neo4j.int(limit * 2),
+        limit: neo4j.int(limit),
       });
 
       const allResults: ServiceSearchResult[] = [];
-      const seenUuids = new Set<string>();
 
       for (const record of result.records) {
         const node = record.get('n');
         const rawNode = { ...node.properties, labels: node.labels };
-        const uuid = rawNode.uuid;
         const score = record.get('score');
-
-        if (seenUuids.has(uuid)) continue;
-        seenUuids.add(uuid);
 
         if (minScore !== undefined && score < minScore) continue;
 
@@ -660,99 +640,17 @@ export class SearchService {
           score,
           filePath: rawNode.absolutePath || rawNode.file || rawNode.path,
         });
-
-        if (allResults.length >= limit) break;
       }
 
       return allResults;
     } catch (err: any) {
-      // Fallback to parallel individual queries
       if (this.verbose) {
-        console.debug(`[SearchService] UNION query failed, using fallback: ${err.message}`);
+        console.debug(`[SearchService] Full-text search failed: ${err.message}`);
       }
-      return this.fullTextSearchFallback(luceneQuery, options);
+      return [];
     }
   }
 
-  /**
-   * Fallback for full-text search when UNION fails
-   */
-  private async fullTextSearchFallback(
-    luceneQuery: string,
-    options: {
-      filterClause: string;
-      params: Record<string, any>;
-      limit: number;
-      minScore?: number;
-    }
-  ): Promise<ServiceSearchResult[]> {
-    const { filterClause, params, limit, minScore } = options;
-
-    const fullTextIndexes = [
-      'scope_fulltext',
-      'file_fulltext',
-      'datafile_fulltext',
-      'document_fulltext',
-      'markdown_fulltext',
-      'media_fulltext',
-      'webpage_fulltext',
-      'codeblock_fulltext',
-    ];
-
-    const cypher = `
-      CALL db.index.fulltext.queryNodes($indexName, $luceneQuery)
-      YIELD node AS n, score
-      WHERE true ${filterClause}
-      RETURN n, score
-      ORDER BY score DESC
-      LIMIT $limit
-    `;
-
-    const queryPromises = fullTextIndexes.map(async (indexName) => {
-      try {
-        const result = await this.neo4jClient.run(cypher, {
-          indexName,
-          luceneQuery,
-          ...params,
-          limit: neo4j.int(limit),
-        });
-        return { records: result.records };
-      } catch (err: any) {
-        if (this.verbose && !err.message?.includes('does not exist')) {
-          console.debug(`[SearchService] Full-text search failed for ${indexName}: ${err.message}`);
-        }
-        return { records: [] };
-      }
-    });
-
-    const queryResults = await Promise.all(queryPromises);
-
-    const allResults: ServiceSearchResult[] = [];
-    const seenUuids = new Set<string>();
-
-    for (const { records } of queryResults) {
-      for (const record of records) {
-        const node = record.get('n');
-        const rawNode = { ...node.properties, labels: node.labels };
-        const uuid = rawNode.uuid;
-        const score = record.get('score');
-
-        if (seenUuids.has(uuid)) continue;
-        seenUuids.add(uuid);
-
-        if (minScore !== undefined && score < minScore) continue;
-
-        allResults.push({
-          node: this.stripEmbeddingFields(rawNode),
-          score,
-          filePath: rawNode.absolutePath || rawNode.file || rawNode.path,
-        });
-      }
-    }
-
-    allResults.sort((a, b) => b.score - a.score);
-    return allResults.slice(0, limit);
-  }
 
   // ============================================================================
   // Hybrid Search
