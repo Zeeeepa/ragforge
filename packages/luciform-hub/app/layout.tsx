@@ -5,6 +5,7 @@ import { Navigation } from "./components/Navigation";
 import { Footer } from "./components/Footer";
 import { GraphBackground } from "./components/GraphBackground";
 import { OrganizationStructuredData, WebSiteStructuredData } from "./components/StructuredData";
+import { ChatWidget } from "./components/ChatWidget";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -108,6 +109,7 @@ export default function RootLayout({
           {children}
         </main>
         <Footer />
+        <ChatWidget />
       </body>
     </html>
   );

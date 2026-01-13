@@ -71,4 +71,4 @@ langchainjs/
 replicate/
 
 # LucieCode (separate repo)
-LucieCode/
+LucieCode/.env.local
