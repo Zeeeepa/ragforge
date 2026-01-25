@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@sparticuz/chromium": "^143.0.0",
+    "@supabase/supabase-js": "^2.91.1",
     "@types/dat.gui": "^0.7.13",
     "@types/react-syntax-highlighter": "^15.5.13",
     "@types/three": "^0.182.0",
