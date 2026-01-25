@@ -515,7 +515,7 @@ export function ChatWidget() {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [conversationId]);
+  }, [conversationId, user]); // Re-subscribe when auth state changes
 
   const scrollToBottom = useCallback(() => {
     const now = Date.now();
