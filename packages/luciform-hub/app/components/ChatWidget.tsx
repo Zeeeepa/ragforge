@@ -7,6 +7,9 @@ import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { supabase, API_URL } from "../../lib/supabase";
 
+// Lucie agent UUID (from migrations/005_seed_lucie_agent.sql)
+const LUCIE_AGENT_ID = "00000000-0000-0000-0000-000000000010";
+
 interface ToolCall {
   name: string;
   args?: Record<string, unknown>;
@@ -325,34 +328,58 @@ export function ChatWidget() {
     return () => subscription.unsubscribe();
   }, []);
 
-  // When user logs in, claim the conversation (update user_id)
+  // When user logs in, load their most recent conversation or claim current one
   useEffect(() => {
-    const claimConversation = async () => {
-      if (!user || !conversationId) return;
+    const handleUserLogin = async () => {
+      if (!user) return;
 
       try {
         const { data: { session } } = await supabase.auth.getSession();
         if (!session?.user?.id) return;
 
-        // Update conversation's user_id to the authenticated user
-        const { error } = await supabase
+        // First, try to load user's most recent Lucie conversation
+        const { data: existingConvs, error: convError } = await supabase
           .from("conversations")
-          .update({ user_id: session.user.id })
-          .eq("id", conversationId)
-          .eq("user_id", "00000000-0000-0000-0000-000000000001"); // Only claim public conversations
+          .select("id")
+          .eq("user_id", session.user.id)
+          .eq("agent_id", LUCIE_AGENT_ID)
+          .order("updated_at", { ascending: false })
+          .limit(1);
 
-        if (error) {
-          console.log("[Auth] Conversation already claimed or not public:", error.message);
-        } else {
-          console.log("[Auth] Conversation claimed by user:", session.user.email);
+        if (convError) {
+          console.error("[Auth] Error fetching user conversations:", convError);
+        }
+
+        const existingConv = existingConvs?.[0];
+        if (existingConv) {
+          // User has existing conversations - load the most recent one
+          console.log("[Auth] Loading user's existing conversation:", existingConv.id);
+          setConversationId(existingConv.id);
+          localStorage.setItem("lucie-conversation-id", existingConv.id);
+          return;
+        }
+
+        // No existing conversation - try to claim the current public one
+        if (conversationId) {
+          const { error } = await supabase
+            .from("conversations")
+            .update({ user_id: session.user.id })
+            .eq("id", conversationId)
+            .eq("user_id", "00000000-0000-0000-0000-000000000001");
+
+          if (error) {
+            console.log("[Auth] Conversation already claimed or not public:", error.message);
+          } else {
+            console.log("[Auth] Conversation claimed by user:", session.user.email);
+          }
         }
       } catch (err) {
-        console.error("[Auth] Error claiming conversation:", err);
+        console.error("[Auth] Error handling user login:", err);
       }
     };
 
-    claimConversation();
-  }, [user, conversationId]);
+    handleUserLogin();
+  }, [user]); // Only trigger on user change, not conversationId
 
   // Google OAuth login
   const handleGoogleLogin = async () => {
