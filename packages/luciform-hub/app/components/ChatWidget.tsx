@@ -373,10 +373,14 @@ export function ChatWidget() {
     }
   };
 
-  // Logout
+  // Logout - clear conversation to protect privacy
   const handleLogout = async () => {
     await supabase.auth.signOut();
     setUser(null);
+    // Clear conversation so logged-out user can't see claimed messages
+    setConversationId(null);
+    setMessages([]);
+    localStorage.removeItem("lucie-conversation-id");
   };
 
   // Cancel any ongoing polling
