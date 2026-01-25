@@ -738,7 +738,13 @@ export function ChatWidget() {
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
         if (response.status === 429) {
-          throw new Error(errorData.detail?.message || "Rate limit exceeded. Please wait.");
+          const detail = errorData.detail || {};
+          if (detail.limit_type === "global") {
+            throw new Error("Le service est temporairement indisponible. Réessayez demain.");
+          }
+          const limitType = detail.limit_type === "hour" ? "horaire" : "journalière";
+          const message = detail.message || "Limite de messages atteinte";
+          throw new Error(`${message}. Limite ${limitType} atteinte — réessayez plus tard.`);
         }
         throw new Error(errorData.detail || `Error: ${response.status}`);
       }
@@ -756,9 +762,20 @@ export function ChatWidget() {
       }
 
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to send message");
-      // Remove optimistic message on error
-      setMessages((prev) => prev.filter((m) => m.id !== optimisticUserMessage.id));
+      const errorMessage = err instanceof Error ? err.message : "Failed to send message";
+
+      // Keep user message and add error response (don't remove optimistic message)
+      const errorResponse: Message = {
+        id: `error-${Date.now()}`,
+        role: "assistant",
+        content: errorMessage,
+        status: "failed",
+        turn_index: optimisticUserMessage.turn_index,
+        content_position: null,
+        created_at: new Date().toISOString(),
+      };
+      setMessages((prev) => [...prev, errorResponse]);
+      setError(null); // Don't show banner, error is in the chat
       setIsLoading(false);
     }
   };
@@ -916,6 +933,7 @@ export function ChatWidget() {
               if (item.type === "assistant_chunk") {
                 const msg = item.fullMessage;
                 const isStreaming = msg.status === "streaming" && item.isLast;
+                const isFailed = msg.status === "failed";
 
                 if (!item.content && item.isLast) {
                   // Empty content on last chunk = show thinking only if debounced
@@ -930,6 +948,23 @@ export function ChatWidget() {
                             <div className="w-2 h-2 rounded-full bg-cyan-400 animate-bounce" style={{ animationDelay: "0.2s" }} />
                           </div>
                           <span className="text-slate-400 text-xs">Lucie réfléchit...</span>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                }
+
+                // Failed/error message styling
+                if (isFailed) {
+                  return (
+                    <div key={`${msg.id}-chunk-${index}`} className="flex justify-start">
+                      <div className="max-w-[85%] rounded-2xl px-4 py-2 bg-red-900/30 border border-red-500/50 text-red-200">
+                        <div className="flex items-start gap-2 text-sm">
+                          <span className="text-red-400 mt-0.5">⚠️</span>
+                          <div>
+                            <p className="font-medium text-red-300 mb-1">Oops, une erreur s'est produite</p>
+                            <p className="text-red-200/80">{item.content}</p>
+                          </div>
                         </div>
                       </div>
                     </div>
