@@ -325,6 +325,35 @@ export function ChatWidget() {
     return () => subscription.unsubscribe();
   }, []);
 
+  // When user logs in, claim the conversation (update user_id)
+  useEffect(() => {
+    const claimConversation = async () => {
+      if (!user || !conversationId) return;
+
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        if (!session?.user?.id) return;
+
+        // Update conversation's user_id to the authenticated user
+        const { error } = await supabase
+          .from("conversations")
+          .update({ user_id: session.user.id })
+          .eq("id", conversationId)
+          .eq("user_id", "00000000-0000-0000-0000-000000000001"); // Only claim public conversations
+
+        if (error) {
+          console.log("[Auth] Conversation already claimed or not public:", error.message);
+        } else {
+          console.log("[Auth] Conversation claimed by user:", session.user.email);
+        }
+      } catch (err) {
+        console.error("[Auth] Error claiming conversation:", err);
+      }
+    };
+
+    claimConversation();
+  }, [user, conversationId]);
+
   // Google OAuth login
   const handleGoogleLogin = async () => {
     setAuthLoading(true);
