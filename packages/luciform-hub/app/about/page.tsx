@@ -31,12 +31,12 @@ export default function AboutPage() {
         {/* Profile Section */}
         <div className="grid md:grid-cols-3 gap-12 mb-20">
           {/* Photo */}
-          <div className="md:col-span-1">
-            <div className="relative group">
+          <div className="md:col-span-1 flex justify-start">
+            <div className="relative group w-40 sm:w-52 md:w-full">
               <div className="absolute -inset-1 bg-gradient-to-b from-cyan-500/30 to-purple-500/30 rounded-2xl blur-xl opacity-50 group-hover:opacity-80 transition-opacity" />
               <div className="relative aspect-[3/4] rounded-2xl overflow-hidden border-2 border-cyan-400/30 group-hover:border-cyan-400/50 transition-colors">
                 <img
-                  src="/photos_lucie/1764621365401.png"
+                  src="/photos_lucie/1766757772036.png"
                   alt="Lucie Defraiteur"
                   className="w-full h-full object-cover"
                 />

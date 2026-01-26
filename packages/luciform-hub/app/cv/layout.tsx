@@ -23,7 +23,7 @@ export const metadata: Metadata = {
     url: "https://www.luciformresearch.com/cv",
     images: [
       {
-        url: "/photos_lucie/1764621365401.png",
+        url: "/photos_lucie/1766757772036.png",
         width: 400,
         height: 520,
         alt: "Lucie Defraiteur",

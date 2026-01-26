@@ -1,10 +1,67 @@
 'use client';
 
 import Link from 'next/link';
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
+
+// Lucie Agent demo videos
+const lucieAgentVideos = [
+  {
+    id: 'hybrid-search',
+    title: 'Hybrid Search in RagForge',
+    question: 'Hey Lucie, could you explain me how does the hybrid search works in your ragforge framework?',
+    description: 'Deep dive into RagForge\'s hybrid search: semantic-first with BM25 boost, RRF fusion, parallel execution.',
+    file: '/videos/hey-lucie-how-does-the-hybrid-search-works-in-your-ragforge-framework.mp4',
+    language: 'EN',
+    tech: ['Neo4j', 'Vector Search', 'BM25', 'RRF Fusion'],
+    tools: ['search_knowledge', 'get_code_sample', 'grep_code'],
+  },
+  {
+    id: 'code-languages',
+    title: 'Supported Languages in CodeParsers',
+    question: 'Hey Lucie, could you explain me what code languages are handled in code parsers?',
+    description: 'Lucie shows the 8 supported languages: TypeScript, JavaScript, Python, Rust, Go, C, C++, C# - all using tree-sitter WASM.',
+    file: '/videos/what-code-languages-are-handled-by-code-parsers.mp4',
+    language: 'EN',
+    tech: ['Tree-sitter WASM', 'Multi-language', 'AST Parsing'],
+    tools: ['search_knowledge', 'grep_code', 'get_code_sample'],
+  },
+  {
+    id: 'langchain-realization',
+    title: 'Lucie realizes she\'s a LangGraph agent',
+    question: 'Est-ce que tu utilises LangChain ou LangGraph dans tes projets?',
+    description: 'Lucie searches her own code, discovers StateGraph, ToolNode, intent classification... and realizes she IS a LangGraph agent! (French - auto-detected language)',
+    file: '/videos/est-ce-que-tu-utilise-langchain-langgraph-dans-tes-projets-lucie-realise-quelle-est-elle-meme-un-agent-langchain.mp4',
+    language: 'FR',
+    tech: ['LangChain', 'LangGraph', 'Claude', 'Language Detection'],
+    tools: ['grep_code', 'search_knowledge', 'get_code_sample'],
+  },
+  {
+    id: 'embedding-model',
+    title: 'Embedding Model in Community Docs',
+    question: 'What embedding model does community docs use?',
+    description: 'Lucie explains the mxbai-embed-large model running locally through Ollama with 1024 dimensions.',
+    file: '/videos/what-embedding-model-does-community-docs-use.mp4',
+    language: 'EN',
+    tech: ['mxbai-embed-large', 'Ollama', 'Embeddings'],
+    tools: ['search_knowledge', 'get_code_sample', 'grep_code'],
+  },
+  {
+    id: 'whatsapp-agent',
+    title: 'Lucie on WhatsApp (Twilio)',
+    question: 'Hey Lucie, how does the hybrid search work?',
+    description: 'Same question, but asked via WhatsApp! Lucie Agent integrated with Twilio for mobile messaging.',
+    file: '/videos/ask-lucie-about-hybrid-search-but-with-whatsapp-agent.mp4',
+    language: 'EN',
+    tech: ['Twilio', 'WhatsApp API', 'Webhooks', 'Mobile'],
+    tools: ['search_knowledge', 'get_code_sample', 'grep_code'],
+  },
+];
 
 export default function HomePage() {
   const [glitchText, setGlitchText] = useState('Luciform Research');
+  const [currentVideoIndex, setCurrentVideoIndex] = useState(0);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const currentVideo = lucieAgentVideos[currentVideoIndex];
 
   // Glitch effect on title
   useEffect(() => {
@@ -115,8 +172,117 @@ export default function HomePage() {
         </div>
       </section>
 
-      {/* Products Section */}
+      {/* Lucie Agent Section */}
       <section className="py-24 px-6">
+        <div className="max-w-6xl mx-auto">
+          {/* Section header */}
+          <div className="text-center mb-12">
+            <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full border border-pink-400/30
+              bg-pink-400/5 text-pink-400 text-sm mb-4">
+              <span className="w-2 h-2 bg-pink-400 rounded-full animate-pulse" />
+              LangGraph Agent
+            </div>
+            <h2 className="text-4xl md:text-5xl font-bold mb-4">
+              <span className="bg-gradient-to-r from-pink-400 to-purple-400 bg-clip-text text-transparent">
+                Meet Lucie
+              </span>
+            </h2>
+            <p className="text-slate-400 max-w-xl mx-auto">
+              AI assistant built with LangGraph that can search code, explain architectures,
+              and answer questions about Luciform Research projects.
+            </p>
+          </div>
+
+          {/* Video Player */}
+          <div className="max-w-4xl mx-auto">
+            <div className="bg-slate-900/80 backdrop-blur-sm border border-slate-700/50 rounded-2xl overflow-hidden">
+              {/* Video - portrait on mobile, landscape on desktop */}
+              <div className="relative bg-black aspect-[9/16] sm:aspect-video">
+                <video
+                  ref={videoRef}
+                  key={currentVideo.file}
+                  src={currentVideo.file}
+                  controls
+                  className="w-full h-full"
+                  poster=""
+                >
+                  Your browser does not support the video tag.
+                </video>
+                {/* Language badge */}
+                <div className="absolute top-4 right-4 px-2 py-1 rounded bg-black/60 text-xs font-medium text-white">
+                  {currentVideo.language}
+                </div>
+              </div>
+
+              {/* Video info */}
+              <div className="p-6">
+                <h3 className="text-xl font-bold text-white mb-2">{currentVideo.title}</h3>
+                <p className="text-pink-400 text-sm mb-3 font-mono">"{currentVideo.question}"</p>
+                <p className="text-slate-400 text-sm mb-4">{currentVideo.description}</p>
+
+                {/* Tech tags */}
+                <div className="flex flex-wrap gap-2 mb-4">
+                  {currentVideo.tech.map(t => (
+                    <span key={t} className="text-xs bg-slate-800 text-slate-300 px-2 py-1 rounded">
+                      {t}
+                    </span>
+                  ))}
+                </div>
+
+                {/* Tools used */}
+                <div className="flex items-center gap-2 text-xs text-slate-500">
+                  <span>Tools used:</span>
+                  {currentVideo.tools.map(tool => (
+                    <code key={tool} className="bg-slate-800/50 px-1.5 py-0.5 rounded text-purple-400">
+                      {tool}
+                    </code>
+                  ))}
+                </div>
+              </div>
+
+              {/* Navigation */}
+              <div className="px-6 pb-6 flex items-center justify-between">
+                <button
+                  onClick={() => setCurrentVideoIndex(Math.max(0, currentVideoIndex - 1))}
+                  disabled={currentVideoIndex === 0}
+                  className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                    currentVideoIndex === 0
+                      ? 'text-slate-600 cursor-not-allowed'
+                      : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                  }`}
+                >
+                  Previous
+                </button>
+                <div className="flex gap-2">
+                  {lucieAgentVideos.map((_, index) => (
+                    <button
+                      key={index}
+                      onClick={() => setCurrentVideoIndex(index)}
+                      className={`w-2 h-2 rounded-full transition-colors ${
+                        index === currentVideoIndex ? 'bg-pink-500' : 'bg-slate-700 hover:bg-slate-600'
+                      }`}
+                    />
+                  ))}
+                </div>
+                <button
+                  onClick={() => setCurrentVideoIndex(Math.min(lucieAgentVideos.length - 1, currentVideoIndex + 1))}
+                  disabled={currentVideoIndex === lucieAgentVideos.length - 1}
+                  className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                    currentVideoIndex === lucieAgentVideos.length - 1
+                      ? 'text-slate-600 cursor-not-allowed'
+                      : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                  }`}
+                >
+                  Next
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* Products Section */}
+      <section className="py-24 px-6 border-t border-slate-800/50">
         <div className="max-w-6xl mx-auto">
           {/* Section header */}
           <div className="text-center mb-16">
@@ -245,6 +411,109 @@ export default function HomePage() {
               </div>
             </Link>
 
+          </div>
+        </div>
+      </section>
+
+      {/* Artifacts Section */}
+      <section className="py-24 px-6 border-t border-slate-800/50">
+        <div className="max-w-6xl mx-auto">
+          {/* Section header */}
+          <div className="text-center mb-12">
+            <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full border border-emerald-400/30
+              bg-emerald-400/5 text-emerald-400 text-sm mb-4">
+              <span className="w-2 h-2 bg-emerald-400 rounded-full animate-pulse" />
+              Sample Outputs
+            </div>
+            <h2 className="text-4xl md:text-5xl font-bold mb-4">
+              <span className="bg-gradient-to-r from-emerald-400 to-cyan-400 bg-clip-text text-transparent">
+                Artifacts
+              </span>
+            </h2>
+            <p className="text-slate-400 max-w-xl mx-auto">
+              Real outputs from RagForge and Lucie Agent - brain search reports, ingestion logs, and conversation traces.
+            </p>
+          </div>
+
+          {/* Artifacts grid */}
+          <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
+            <a href="/artifacts/brain-search-incremental-ingestion.md" download
+              className="group p-4 rounded-xl bg-slate-900/50 border border-slate-700/50 hover:border-cyan-400/50 hover:bg-slate-900/80 transition-all">
+              <div className="flex items-start justify-between mb-2">
+                <h3 className="font-medium text-slate-200 group-hover:text-cyan-400 transition-colors">Brain Search: Incremental Ingestion</h3>
+                <span className="text-xs px-2 py-0.5 rounded bg-cyan-400/10 text-cyan-400 border border-cyan-400/20">Markdown</span>
+              </div>
+              <p className="text-slate-500 text-sm mb-3">Semantic search for IncrementalIngestionManager with dependency graph visualization</p>
+              <div className="flex items-center justify-between text-xs text-slate-600">
+                <span>33 KB</span>
+                <span className="group-hover:text-cyan-400 transition-colors">Download &darr;</span>
+              </div>
+            </a>
+
+            <a href="/artifacts/brain-search-search-service.md" download
+              className="group p-4 rounded-xl bg-slate-900/50 border border-slate-700/50 hover:border-purple-400/50 hover:bg-slate-900/80 transition-all">
+              <div className="flex items-start justify-between mb-2">
+                <h3 className="font-medium text-slate-200 group-hover:text-purple-400 transition-colors">Brain Search: Search Service</h3>
+                <span className="text-xs px-2 py-0.5 rounded bg-purple-400/10 text-purple-400 border border-purple-400/20">Markdown</span>
+              </div>
+              <p className="text-slate-500 text-sm mb-3">Exploring the SearchService class with RRF hybrid search implementation</p>
+              <div className="flex items-center justify-between text-xs text-slate-600">
+                <span>11 KB</span>
+                <span className="group-hover:text-purple-400 transition-colors">Download &darr;</span>
+              </div>
+            </a>
+
+            <a href="/artifacts/brain-search-detailed.md" download
+              className="group p-4 rounded-xl bg-slate-900/50 border border-slate-700/50 hover:border-pink-400/50 hover:bg-slate-900/80 transition-all">
+              <div className="flex items-start justify-between mb-2">
+                <h3 className="font-medium text-slate-200 group-hover:text-pink-400 transition-colors">Brain Search: Detailed</h3>
+                <span className="text-xs px-2 py-0.5 rounded bg-pink-400/10 text-pink-400 border border-pink-400/20">Markdown</span>
+              </div>
+              <p className="text-slate-500 text-sm mb-3">Comprehensive search with full dependency tree exploration</p>
+              <div className="flex items-center justify-between text-xs text-slate-600">
+                <span>15 KB</span>
+                <span className="group-hover:text-pink-400 transition-colors">Download &darr;</span>
+              </div>
+            </a>
+
+            <a href="/artifacts/ingestion-pipeline.log" download
+              className="group p-4 rounded-xl bg-slate-900/50 border border-slate-700/50 hover:border-green-400/50 hover:bg-slate-900/80 transition-all">
+              <div className="flex items-start justify-between mb-2">
+                <h3 className="font-medium text-slate-200 group-hover:text-green-400 transition-colors">Ingestion Pipeline Log</h3>
+                <span className="text-xs px-2 py-0.5 rounded bg-green-400/10 text-green-400 border border-green-400/20">Log</span>
+              </div>
+              <p className="text-slate-500 text-sm mb-3">Real-time logging of file parsing, entity extraction, and embedding generation</p>
+              <div className="flex items-center justify-between text-xs text-slate-600">
+                <span>17 KB</span>
+                <span className="group-hover:text-green-400 transition-colors">Download &darr;</span>
+              </div>
+            </a>
+
+            <a href="/artifacts/api-ingestion-log.txt" download
+              className="group p-4 rounded-xl bg-slate-900/50 border border-slate-700/50 hover:border-yellow-400/50 hover:bg-slate-900/80 transition-all">
+              <div className="flex items-start justify-between mb-2">
+                <h3 className="font-medium text-slate-200 group-hover:text-yellow-400 transition-colors">API Ingestion Log</h3>
+                <span className="text-xs px-2 py-0.5 rounded bg-yellow-400/10 text-yellow-400 border border-yellow-400/20">Log</span>
+              </div>
+              <p className="text-slate-500 text-sm mb-3">Full trace of GitHub repo cloning, tree-sitter parsing, and Neo4j ingestion</p>
+              <div className="flex items-center justify-between text-xs text-slate-600">
+                <span>23 KB</span>
+                <span className="group-hover:text-yellow-400 transition-colors">Download &darr;</span>
+              </div>
+            </a>
+
+            <a href="/artifacts/lucie-agent-conversation-excerpt.log" download
+              className="group p-4 rounded-xl bg-slate-900/50 border border-slate-700/50 hover:border-pink-400/50 hover:bg-slate-900/80 transition-all">
+              <div className="flex items-start justify-between mb-2">
+                <h3 className="font-medium text-slate-200 group-hover:text-pink-400 transition-colors">Lucie Agent Conversation</h3>
+                <span className="text-xs px-2 py-0.5 rounded bg-pink-400/10 text-pink-400 border border-pink-400/20">Log</span>
+              </div>
+              <p className="text-slate-500 text-sm mb-3">Excerpt from Lucie&apos;s conversation log showing tool calls and responses</p>
+              <div className="flex items-center justify-between text-xs text-slate-600">
+                <span>22 KB</span>
+                <span className="group-hover:text-pink-400 transition-colors">Download &darr;</span>
+              </div>
+            </a>
           </div>
         </div>
       </section>

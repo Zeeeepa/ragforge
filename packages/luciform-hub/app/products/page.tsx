@@ -38,17 +38,17 @@ export default function ProductsPage() {
               group-hover:border-cyan-400/40 transition-all duration-300">
 
               {/* Header */}
-              <div className="flex items-center gap-5 mb-6">
-                <div className="relative">
+              <div className="flex flex-wrap items-center gap-3 sm:gap-5 mb-6">
+                <div className="relative flex-shrink-0">
                   <img
                     src="/ragforge-logos/LR_LOGO_BLACK_BACKGROUND.png"
                     alt="RagForge Logo"
-                    className="w-16 h-16 rounded-xl object-cover"
+                    className="w-12 h-12 sm:w-16 sm:h-16 rounded-xl object-cover"
                   />
                   <div className="absolute inset-0 rounded-xl border-2 border-cyan-400/30 group-hover:border-cyan-400/60 transition-colors" />
                 </div>
-                <div>
-                  <h2 className="text-3xl font-bold">
+                <div className="min-w-0">
+                  <h2 className="text-xl sm:text-3xl font-bold">
                     <GlitchText
                       text="RagForge"
                       gradient="from-cyan-400 to-blue-400"
@@ -56,10 +56,10 @@ export default function ProductsPage() {
                       repeatInterval={15000}
                     />
                   </h2>
-                  <code className="text-sm text-cyan-400/80">@luciformresearch/ragforge</code>
+                  <code className="text-xs sm:text-sm text-cyan-400/80">@luciformresearch/ragforge</code>
                 </div>
-                <div className="ml-auto">
-                  <span className="px-3 py-1 rounded-full text-xs font-medium bg-cyan-400/10 text-cyan-400 border border-cyan-400/30">
+                <div className="sm:ml-auto">
+                  <span className="px-2 sm:px-3 py-1 rounded-full text-xs font-medium bg-cyan-400/10 text-cyan-400 border border-cyan-400/30">
                     CORE FRAMEWORK
                   </span>
                 </div>
@@ -124,7 +124,7 @@ export default function ProductsPage() {
                   npm →
                 </a>
                 <a
-                  href="https://github.com/LuciformResearch/ragforge"
+                  href="https://github.com/LuciformResearch/ragforge-core"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="px-6 py-3 border border-slate-600 rounded-lg font-medium text-slate-300
@@ -145,17 +145,17 @@ export default function ProductsPage() {
             <div className="relative bg-slate-900/80 backdrop-blur-sm border border-green-400/20 rounded-2xl p-8
               group-hover:border-green-400/40 transition-all duration-300">
 
-              <div className="flex items-center gap-5 mb-6">
-                <div className="relative">
+              <div className="flex flex-wrap items-center gap-3 sm:gap-5 mb-6">
+                <div className="relative flex-shrink-0">
                   <img
                     src="/product-logos/codeparsers-logo-transparent.png"
                     alt="CodeParsers Logo"
-                    className="w-16 h-16 rounded-xl object-cover"
+                    className="w-12 h-12 sm:w-16 sm:h-16 rounded-xl object-cover"
                   />
                   <div className="absolute inset-0 rounded-xl border-2 border-green-400/30 group-hover:border-green-400/60 transition-colors" />
                 </div>
-                <div>
-                  <h2 className="text-3xl font-bold">
+                <div className="min-w-0">
+                  <h2 className="text-xl sm:text-3xl font-bold">
                     <GlitchText
                       text="CodeParsers"
                       gradient="from-green-400 to-emerald-400"
@@ -163,10 +163,10 @@ export default function ProductsPage() {
                       repeatInterval={16000}
                     />
                   </h2>
-                  <code className="text-sm text-green-400/80">@luciformresearch/codeparsers</code>
+                  <code className="text-xs sm:text-sm text-green-400/80">@luciformresearch/codeparsers</code>
                 </div>
-                <div className="ml-auto">
-                  <span className="px-3 py-1 rounded-full text-xs font-medium bg-green-400/10 text-green-400 border border-green-400/30">
+                <div className="sm:ml-auto">
+                  <span className="px-2 sm:px-3 py-1 rounded-full text-xs font-medium bg-green-400/10 text-green-400 border border-green-400/30">
                     AST EXTRACTION
                   </span>
                 </div>
@@ -182,7 +182,7 @@ export default function ProductsPage() {
                 Supported Languages
               </h3>
               <div className="flex flex-wrap gap-2 mb-8">
-                {['TypeScript/TSX', 'Python', 'HTML', 'CSS', 'SCSS', 'Vue SFC', 'Svelte', 'Markdown'].map((lang) => (
+                {['TypeScript/TSX', 'Python', 'C', 'C++', 'C#', 'Go', 'Rust', 'HTML', 'CSS', 'SCSS', 'Vue SFC', 'Svelte', 'Markdown'].map((lang) => (
                   <span key={lang} className="px-3 py-1.5 rounded-lg bg-green-500/10 text-green-400 text-sm border border-green-400/20
                     hover:border-green-400/40 transition-colors">
                     {lang}
@@ -210,6 +210,10 @@ export default function ProductsPage() {
                 <li className="flex items-start gap-3">
                   <span className="text-green-400 mt-1">▹</span>
                   <span><strong className="text-slate-300">Browser Compatible</strong> — ESM-only modules with bundled WASM grammars</span>
+                </li>
+                <li className="flex items-start gap-3">
+                  <span className="text-green-400 mt-1">▹</span>
+                  <span><strong className="text-slate-300">Dependency Graph</strong> — Cross-file dependency extraction for codebase analysis</span>
                 </li>
               </ul>
 
@@ -245,13 +249,13 @@ export default function ProductsPage() {
             <div className="relative bg-slate-900/80 backdrop-blur-sm border border-purple-400/20 rounded-2xl p-8
               group-hover:border-purple-400/40 transition-all duration-300">
 
-              <div className="flex items-center gap-5 mb-6">
-                <div className="w-16 h-16 rounded-xl bg-purple-500/10 border-2 border-purple-400/30 flex items-center justify-center
+              <div className="flex flex-wrap items-center gap-3 sm:gap-5 mb-6">
+                <div className="w-12 h-12 sm:w-16 sm:h-16 rounded-xl bg-purple-500/10 border-2 border-purple-400/30 flex items-center justify-center flex-shrink-0
                   group-hover:border-purple-400/60 transition-colors">
-                  <span className="text-2xl text-purple-400 font-mono">&lt;/&gt;</span>
+                  <span className="text-xl sm:text-2xl text-purple-400 font-mono">&lt;/&gt;</span>
                 </div>
-                <div>
-                  <h2 className="text-3xl font-bold">
+                <div className="min-w-0">
+                  <h2 className="text-xl sm:text-3xl font-bold">
                     <GlitchText
                       text="XMLParser"
                       gradient="from-purple-400 to-pink-400"
@@ -259,10 +263,10 @@ export default function ProductsPage() {
                       repeatInterval={17000}
                     />
                   </h2>
-                  <code className="text-sm text-purple-400/80">@luciformresearch/xmlparser</code>
+                  <code className="text-xs sm:text-sm text-purple-400/80">@luciformresearch/xmlparser</code>
                 </div>
-                <div className="ml-auto">
-                  <span className="px-3 py-1 rounded-full text-xs font-medium bg-purple-400/10 text-purple-400 border border-purple-400/30">
+                <div className="sm:ml-auto">
+                  <span className="px-2 sm:px-3 py-1 rounded-full text-xs font-medium bg-purple-400/10 text-purple-400 border border-purple-400/30">
                     LLM OUTPUTS
                   </span>
                 </div>

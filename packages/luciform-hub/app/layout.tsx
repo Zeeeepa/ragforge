@@ -109,7 +109,7 @@ export default function RootLayout({
           {children}
         </main>
         <Footer />
-        <ChatWidget />
+        {process.env.NEXT_PUBLIC_CHAT_WIDGET_ENABLED === 'true' && <ChatWidget />}
       </body>
     </html>
   );

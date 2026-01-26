@@ -1,11 +1,11 @@
 "use client";
 
-import React, { useState, useRef, useEffect, useCallback, memo } from "react";
+import React, { useState, useRef, useEffect, useCallback, memo, useMemo } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
-import { supabase, API_URL } from "../../lib/supabase";
+import { supabase, API_URL, getVisitorToken } from "../../lib/supabase";
 
 // Lucie agent UUID (from migrations/005_seed_lucie_agent.sql)
 const LUCIE_AGENT_ID = "00000000-0000-0000-0000-000000000010";
@@ -45,16 +45,15 @@ function getVisitorId(): string {
   return visitorId;
 }
 
-// Get/set conversation ID from localStorage
-function getStoredConversationId(): string | null {
+// Get/set conversation IDs from localStorage (separate for visitor and user)
+function getStoredVisitorConversationId(): string | null {
   if (typeof window === "undefined") return null;
-  return localStorage.getItem("lucie-conversation-id");
+  return localStorage.getItem("lucie-visitor-conversation-id");
 }
 
-function setStoredConversationId(id: string) {
-  if (typeof window !== "undefined") {
-    localStorage.setItem("lucie-conversation-id", id);
-  }
+function getStoredUserConversationId(): string | null {
+  if (typeof window === "undefined") return null;
+  return localStorage.getItem("lucie-user-conversation-id");
 }
 
 // Simple cyan cursor
@@ -279,35 +278,92 @@ interface UserSession {
 }
 
 export function ChatWidget() {
+  // Start closed, then open on desktop after mount (avoids SSR hydration mismatch)
   const [isOpen, setIsOpen] = useState(false);
+  const [hasInitialized, setHasInitialized] = useState(false);
+
+  // Open chat on desktop after mount
+  useEffect(() => {
+    if (!hasInitialized) {
+      setHasInitialized(true);
+      if (window.innerWidth >= 768) {
+        setIsOpen(true);
+      }
+    }
+  }, [hasInitialized]);
   const [isExpanded, setIsExpanded] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [visitorId, setVisitorId] = useState<string>("");
-  const [conversationId, setConversationId] = useState<string | null>(null);
+  const [visitorConversationId, setVisitorConversationId] = useState<string | null>(null);
+  const [userConversationId, setUserConversationId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [user, setUser] = useState<UserSession | null>(null);
+
+  // Active conversation based on auth state
+  const conversationId = user ? userConversationId : visitorConversationId;
+  const setConversationId = user ? setUserConversationId : setVisitorConversationId;
   const [authLoading, setAuthLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const lastScrollRef = useRef(0);
   const pollingRef = useRef<NodeJS.Timeout | null>(null);
-  const lastUpdateRef = useRef<number>(Date.now());
-  const [showThinking, setShowThinking] = useState(false);
-  const thinkingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const responseTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const pendingMessageRef = useRef<{ messageId: string; conversationId: string; sentAt: number } | null>(null);
+
+  // Compute showThinking directly from state - no useEffect needed
+  const showThinking = useMemo(() => {
+    if (!isLoading) {
+      // console.log("[Thinking] isLoading=false, hiding");
+      return false;
+    }
+
+    // Find the current turn (max turn_index)
+    const currentTurn = Math.max(...messages.map((m) => m.turn_index ?? 0), 0);
+
+    // Check if we have an assistant message with content for the CURRENT turn
+    const assistantMsgsThisTurn = messages.filter(
+      (m) => m.role === "assistant" && m.turn_index === currentTurn
+    );
+    const hasAssistantContentThisTurn = assistantMsgsThisTurn.some(
+      (m) => m.content && m.content.length > 0
+    );
+
+    // console.log("[Thinking]", {
+    //   isLoading,
+    //   currentTurn,
+    //   assistantMsgsThisTurn: assistantMsgsThisTurn.map(m => ({ id: m.id, content: m.content?.slice(0, 50), status: m.status })),
+    //   hasAssistantContentThisTurn,
+    //   result: !hasAssistantContentThisTurn,
+    // });
+
+    // Show thinking if loading and no assistant content yet
+    return !hasAssistantContentThisTurn;
+  }, [isLoading, messages]);
 
   // Check for existing Supabase session on mount
   useEffect(() => {
     const checkSession = async () => {
-      const { data: { session } } = await supabase.auth.getSession();
-      if (session?.user) {
-        setUser({
-          email: session.user.email || "",
-          name: session.user.user_metadata?.full_name || session.user.email?.split("@")[0],
-          avatar: session.user.user_metadata?.avatar_url,
-        });
+      try {
+        const { data: { session }, error } = await supabase.auth.getSession();
+        if (error) {
+          // Invalid refresh token - sign out to clear it
+          console.warn("[Auth] Session error, signing out:", error.message);
+          await supabase.auth.signOut();
+          return;
+        }
+        if (session?.user) {
+          setUser({
+            email: session.user.email || "",
+            name: session.user.user_metadata?.full_name || session.user.email?.split("@")[0],
+            avatar: session.user.user_metadata?.avatar_url,
+          });
+        }
+      } catch (err) {
+        console.warn("[Auth] Failed to get session, clearing auth state:", err);
+        await supabase.auth.signOut();
       }
     };
     checkSession();
@@ -328,13 +384,30 @@ export function ChatWidget() {
     return () => subscription.unsubscribe();
   }, []);
 
+  // Track if we've already handled this user's login
+  const handledUserRef = useRef<string | null>(null);
+
   // When user logs in, load their most recent conversation or claim current one
   useEffect(() => {
     const handleUserLogin = async () => {
-      if (!user) return;
+      if (!user) {
+        handledUserRef.current = null; // Reset when logged out
+        return;
+      }
+
+      // Prevent running multiple times for same user
+      if (handledUserRef.current === user.email) {
+        return;
+      }
+      handledUserRef.current = user.email;
 
       try {
-        const { data: { session } } = await supabase.auth.getSession();
+        const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+        if (sessionError) {
+          console.warn("[Auth] Session error in handleUserLogin:", sessionError.message);
+          await supabase.auth.signOut();
+          return;
+        }
         if (!session?.user?.id) return;
 
         // First, try to load user's most recent Lucie conversation
@@ -346,6 +419,8 @@ export function ChatWidget() {
           .order("updated_at", { ascending: false })
           .limit(1);
 
+        console.log("[Auth] Query result:", { existingConvs, convError });
+
         if (convError) {
           console.error("[Auth] Error fetching user conversations:", convError);
         }
@@ -354,8 +429,8 @@ export function ChatWidget() {
         if (existingConv) {
           // User has existing conversations - load the most recent one
           console.log("[Auth] Loading user's existing conversation:", existingConv.id);
-          setConversationId(existingConv.id);
-          localStorage.setItem("lucie-conversation-id", existingConv.id);
+          setUserConversationId(existingConv.id);
+          localStorage.setItem("lucie-user-conversation-id", existingConv.id);
           return;
         }
 
@@ -400,14 +475,12 @@ export function ChatWidget() {
     }
   };
 
-  // Logout - clear conversation to protect privacy
+  // Logout - switch to visitor mode (visitor conversation already loaded)
   const handleLogout = async () => {
     await supabase.auth.signOut();
     setUser(null);
-    // Clear conversation so logged-out user can't see claimed messages
-    setConversationId(null);
+    // Clear messages - visitor conversation will auto-load via computed conversationId
     setMessages([]);
-    localStorage.removeItem("lucie-conversation-id");
   };
 
   // Cancel any ongoing polling
@@ -423,130 +496,158 @@ export function ChatWidget() {
     return () => cancelPolling();
   }, [cancelPolling]);
 
-  // Debounced "thinking" indicator - shows after 1s of no updates while loading
-  useEffect(() => {
-    // Clear any existing timeout
-    if (thinkingTimeoutRef.current) {
-      clearTimeout(thinkingTimeoutRef.current);
-      thinkingTimeoutRef.current = null;
-    }
-
-    // If not loading, hide thinking immediately
-    if (!isLoading) {
-      setShowThinking(false);
-      return;
-    }
-
-    // If loading, show thinking after 1 second of no message updates
-    thinkingTimeoutRef.current = setTimeout(() => {
-      setShowThinking(true);
-    }, 1000);
-
-    return () => {
-      if (thinkingTimeoutRef.current) {
-        clearTimeout(thinkingTimeoutRef.current);
+  // Load visitor's most recent conversation
+  const loadVisitorConversation = useCallback(async (vid: string) => {
+    try {
+      const response = await fetch(
+        `${API_URL}/api/public/visitor-conversations?visitor_id=${encodeURIComponent(vid)}&limit=1`,
+        { headers: { "X-Visitor-ID": vid } }
+      );
+      if (response.ok) {
+        const convs = await response.json();
+        if (convs.length > 0) {
+          setVisitorConversationId(convs[0].id);
+          localStorage.setItem("lucie-visitor-conversation-id", convs[0].id);
+          console.log("[Init] Loaded visitor conversation:", convs[0].id);
+        }
       }
-    };
-  }, [isLoading]);
-
-  // On any message change, reset the thinking timer
-  useEffect(() => {
-    lastUpdateRef.current = Date.now();
-    setShowThinking(false);
-
-    // If still loading, restart the 1s timer
-    if (isLoading) {
-      if (thinkingTimeoutRef.current) {
-        clearTimeout(thinkingTimeoutRef.current);
-      }
-      thinkingTimeoutRef.current = setTimeout(() => {
-        setShowThinking(true);
-      }, 1000);
-    }
-  }, [messages]);
-
-  // Initialize visitor ID and conversation on mount
-  useEffect(() => {
-    setVisitorId(getVisitorId());
-    const storedConvId = getStoredConversationId();
-    if (storedConvId) {
-      setConversationId(storedConvId);
+    } catch (err) {
+      console.warn("[Init] Could not load visitor conversations:", err);
     }
   }, []);
 
-  // Load existing messages when conversation ID is set
+  // Initialize visitor ID and conversation on mount
   useEffect(() => {
-    if (conversationId && isOpen) {
+    const vid = getVisitorId();
+    setVisitorId(vid);
+
+    // Load visitor conversation from localStorage or fetch
+    const storedVisitorConvId = getStoredVisitorConversationId();
+    if (storedVisitorConvId) {
+      setVisitorConversationId(storedVisitorConvId);
+    } else if (vid) {
+      loadVisitorConversation(vid);
+    }
+
+    // Load user conversation from localStorage (will be updated when user logs in)
+    const storedUserConvId = getStoredUserConversationId();
+    if (storedUserConvId) {
+      setUserConversationId(storedUserConvId);
+    }
+  }, [loadVisitorConversation]);
+
+  // Load existing messages when conversation ID is set
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (conversationId) {
       loadMessages(conversationId);
     }
-  }, [conversationId, isOpen]);
+  }, [conversationId]);
 
   // Subscribe to Supabase Realtime when conversation exists
+  // We use a single supabase client and set auth token for visitors
   useEffect(() => {
-    if (!conversationId) return;
+    if (!conversationId || !visitorId) return;
 
-    const channel = supabase
-      .channel(`conversation:${conversationId}`)
-      .on(
-        "postgres_changes",
-        {
-          event: "INSERT",
-          schema: "public",
-          table: "messages",
-          filter: `conversation_id=eq.${conversationId}`,
-        },
-        (payload) => {
-          const newMessage = payload.new as Message;
+    let channel: ReturnType<typeof supabase.channel> | null = null;
+    let mounted = true;
 
-          setMessages((prev) => {
-            // Avoid duplicates
-            if (prev.some((m) => m.id === newMessage.id)) {
-              return prev;
-            }
-            // Remove any temporary optimistic message if this is the real user message
-            const filtered = newMessage.role === "user"
-              ? prev.filter((m) => !m.id.startsWith("temp-"))
-              : prev;
-            return sortMessages([...filtered, newMessage]);
-          });
+    const setupSubscription = async () => {
+      // For visitors, set the visitor token on realtime
+      // For logged-in users, the supabase client already has the session
+      if (!user) {
+        const token = await getVisitorToken(visitorId);
+        if (token) {
+          supabase.realtime.setAuth(token);
+          console.log("[Realtime] Set visitor auth token");
+        } else {
+          console.warn("[Realtime] No visitor token, using anon");
         }
-      )
-      .on(
-        "postgres_changes",
-        {
-          event: "UPDATE",
-          schema: "public",
-          table: "messages",
-          filter: `conversation_id=eq.${conversationId}`,
-        },
-        (payload) => {
-          const updatedMessage = payload.new as Message;
-          setMessages((prev) =>
-            sortMessages(prev.map((m) => (m.id === updatedMessage.id ? updatedMessage : m)))
-          );
+      } else {
+        console.log("[Realtime] Using user session");
+      }
 
-          // Clear loading when message is completed
-          if (updatedMessage.status === "completed" || updatedMessage.status === "failed") {
-            setIsLoading(false);
+      // Don't setup if unmounted during async
+      if (!mounted) return;
+
+      channel = supabase
+        .channel(`conversation:${conversationId}`)
+        .on(
+          "postgres_changes",
+          {
+            event: "INSERT",
+            schema: "public",
+            table: "messages",
+            filter: `conversation_id=eq.${conversationId}`,
+          },
+          (payload) => {
+            const newMessage = payload.new as Message;
+
+            setMessages((prev) => {
+              // Avoid duplicates
+              if (prev.some((m) => m.id === newMessage.id)) {
+                return prev;
+              }
+              // Remove any temporary optimistic message if this is the real user message
+              const filtered = newMessage.role === "user"
+                ? prev.filter((m) => !m.id.startsWith("temp-"))
+                : prev;
+              return sortMessages([...filtered, newMessage]);
+            });
           }
-        }
-      )
-      .subscribe((status, err) => {
-        if (status === "SUBSCRIBED") {
-          console.log(`[Realtime] Subscribed to conversation:${conversationId}`);
-        } else if (status === "CHANNEL_ERROR") {
-          console.error(`[Realtime] Channel error:`, err);
-        } else if (status === "TIMED_OUT") {
-          console.warn(`[Realtime] Subscription timed out, will retry...`);
-        } else if (status === "CLOSED") {
-          console.log(`[Realtime] Channel closed`);
-        }
-      });
+        )
+        .on(
+          "postgres_changes",
+          {
+            event: "UPDATE",
+            schema: "public",
+            table: "messages",
+            filter: `conversation_id=eq.${conversationId}`,
+          },
+          (payload) => {
+            const updatedMessage = payload.new as Message;
+            setMessages((prev) =>
+              sortMessages(prev.map((m) => (m.id === updatedMessage.id ? updatedMessage : m)))
+            );
+
+            // Clear loading when ASSISTANT message is completed WITH CONTENT
+            if (
+              updatedMessage.role === "assistant" &&
+              (updatedMessage.status === "completed" || updatedMessage.status === "failed") &&
+              updatedMessage.content &&
+              updatedMessage.content.length > 0
+            ) {
+              // console.log("[setIsLoading] false from Realtime UPDATE (assistant with content)");
+              clearResponseTimeout();
+              setIsLoading(false);
+            }
+          }
+        )
+        .subscribe((status, err) => {
+          if (status === "SUBSCRIBED") {
+            console.log(`[Realtime] Subscribed to conversation:${conversationId}`);
+          } else if (status === "CHANNEL_ERROR") {
+            console.error(`[Realtime] Channel error:`, err);
+          } else if (status === "TIMED_OUT") {
+            console.warn(`[Realtime] Subscription timed out, will retry...`);
+          } else if (status === "CLOSED") {
+            console.log(`[Realtime] Channel closed`);
+          }
+        });
+    };
+
+    setupSubscription();
 
     return () => {
-      supabase.removeChannel(channel);
+      mounted = false;
+      if (channel) {
+        supabase.removeChannel(channel);
+      }
     };
-  }, [conversationId, user]); // Re-subscribe when auth state changes
+  // Only re-subscribe when conversation changes, NOT on auth state changes
+  // The client handles auth internally
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conversationId, visitorId]);
 
   const scrollToBottom = useCallback(() => {
     const now = Date.now();
@@ -749,19 +850,38 @@ export function ChatWidget() {
   // Load existing messages for a conversation
   async function loadMessages(convId: string) {
     try {
+      const headers: Record<string, string> = {
+        "X-Visitor-ID": visitorId,
+      };
+
+      // Add auth token for logged-in users
+      if (user) {
+        try {
+          const { data: { session } } = await supabase.auth.getSession();
+          if (session?.access_token) {
+            headers["Authorization"] = `Bearer ${session.access_token}`;
+          }
+        } catch {
+          // Ignore auth errors
+        }
+      }
+
       const response = await fetch(
         `${API_URL}/api/public/conversations/${convId}/messages`,
-        {
-          headers: { "X-Visitor-ID": visitorId },
-        }
+        { headers }
       );
       if (response.ok) {
         const data = await response.json();
         setMessages(sortMessages(data));
       } else if (response.status === 404) {
-        // Conversation not found, clear it
-        setConversationId(null);
-        localStorage.removeItem("lucie-conversation-id");
+        // Conversation not found, clear the active one
+        if (user) {
+          setUserConversationId(null);
+          localStorage.removeItem("lucie-user-conversation-id");
+        } else {
+          setVisitorConversationId(null);
+          localStorage.removeItem("lucie-visitor-conversation-id");
+        }
       }
     } catch (err) {
       console.error("Failed to load messages:", err);
@@ -788,17 +908,44 @@ export function ChatWidget() {
         );
         if (response.ok && !cancelled) {
           const data = await response.json();
+          // Only look for assistant messages with completed status (messageId is the user message ID)
           const assistantMessage = data.find(
-            (m: Message) => m.id === messageId || (m.role === "assistant" && m.status === "completed")
+            (m: Message) => m.role === "assistant" && ["completed", "failed"].includes(m.status)
           );
 
-          if (assistantMessage && ["completed", "failed"].includes(assistantMessage.status)) {
-            // Message is done, update state
+          // Debug logs (uncomment for debugging)
+          // console.log("[pollForCompletion] All messages received:", data.map((m: Message) => ({
+          //   id: m.id,
+          //   role: m.role,
+          //   status: m.status,
+          //   content: m.content?.slice(0, 100),
+          //   contentLength: m.content?.length,
+          // })));
+          // if (assistantMessage) {
+          //   console.log("[pollForCompletion] Found completed assistant message:", {
+          //     id: assistantMessage.id,
+          //     status: assistantMessage.status,
+          //     content: assistantMessage.content?.slice(0, 100),
+          //     contentLength: assistantMessage.content?.length,
+          //   });
+          // }
+
+          // Check if assistant message has actual content
+          if (
+            assistantMessage &&
+            assistantMessage.content &&
+            assistantMessage.content.length > 0
+          ) {
+            // Message is done WITH CONTENT, update state
             setMessages(sortMessages(data));
+            // console.log("[setIsLoading] false from pollForCompletion (assistant with content found)");
+            clearResponseTimeout();
             setIsLoading(false);
             pollingRef.current = null;
             return; // Stop polling
           }
+          // Update messages even if not complete (to show tool calls, etc)
+          setMessages(sortMessages(data));
         }
       } catch (err) {
         console.error("Poll error:", err);
@@ -808,6 +955,7 @@ export function ChatWidget() {
       if (!cancelled && attempts < maxAttempts) {
         pollingRef.current = setTimeout(poll, 1000);
       } else if (!cancelled) {
+        // console.log("[setIsLoading] false from pollForCompletion (timeout)");
         setIsLoading(false);
         setError("Response timeout. Please try again.");
         pollingRef.current = null;
@@ -824,11 +972,47 @@ export function ChatWidget() {
     };
   }, [visitorId, cancelPolling]);
 
+  // Report streaming issues to server for debugging
+  const reportStreamingIssue = useCallback(async (reason: string) => {
+    const pending = pendingMessageRef.current;
+    if (!pending) return;
+
+    try {
+      await fetch(`${API_URL}/api/public/report-issue`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          reason,
+          visitor_id: visitorId,
+          user_email: user?.email || null,
+          conversation_id: pending.conversationId,
+          message_id: pending.messageId,
+          waited_seconds: Math.round((Date.now() - pending.sentAt) / 1000),
+        }),
+      });
+      console.log("[Report] Streaming issue reported:", reason);
+    } catch (e) {
+      console.warn("[Report] Failed to report issue:", e);
+    }
+  }, [visitorId, user?.email]);
+
+  // Clear response timeout when response arrives
+  const clearResponseTimeout = useCallback(() => {
+    if (responseTimeoutRef.current) {
+      clearTimeout(responseTimeoutRef.current);
+      responseTimeoutRef.current = null;
+    }
+    pendingMessageRef.current = null;
+  }, []);
+
   const sendMessage = async () => {
     if (!input.trim() || isLoading) return;
 
     const messageContent = input.trim();
     setInput("");
+    // Refocus input after sending
+    setTimeout(() => inputRef.current?.focus(), 0);
+    // console.log("[setIsLoading] true from sendMessage");
     setIsLoading(true);
     setError(null);
 
@@ -846,11 +1030,24 @@ export function ChatWidget() {
     setMessages((prev) => [...prev, optimisticUserMessage]);
 
     try {
-      // Build headers - include user email if authenticated
+      // Build headers - include auth token if authenticated
       const headers: Record<string, string> = {
         "Content-Type": "application/json",
         "X-Visitor-ID": visitorId,
       };
+
+      // Add Supabase auth token if user is logged in
+      try {
+        const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+        if (!sessionError && session?.access_token) {
+          headers["Authorization"] = `Bearer ${session.access_token}`;
+        } else if (sessionError) {
+          console.warn("[Auth] Session error, continuing as visitor:", sessionError.message);
+          supabase.auth.signOut(); // Clear invalid token
+        }
+      } catch {
+        // Ignore auth errors - continue as visitor
+      }
       if (user?.email) {
         headers["X-User-Email"] = user.email;
       }
@@ -883,13 +1080,42 @@ export function ChatWidget() {
 
       // Store conversation ID for future messages
       if (data.conversation_id && data.conversation_id !== conversationId) {
-        setConversationId(data.conversation_id);
-        setStoredConversationId(data.conversation_id);
+        if (user) {
+          setUserConversationId(data.conversation_id);
+          localStorage.setItem("lucie-user-conversation-id", data.conversation_id);
+        } else {
+          setVisitorConversationId(data.conversation_id);
+          localStorage.setItem("lucie-visitor-conversation-id", data.conversation_id);
+        }
 
         // For first message: poll for completion since Realtime subscription
         // won't be ready yet (race condition)
         pollForCompletion(data.conversation_id, data.message_id);
       }
+
+      // Set up response timeout (60 seconds)
+      pendingMessageRef.current = {
+        messageId: data.message_id,
+        conversationId: data.conversation_id,
+        sentAt: Date.now(),
+      };
+      responseTimeoutRef.current = setTimeout(() => {
+        reportStreamingIssue("timeout_60s");
+        // Show error to user
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `timeout-${Date.now()}`,
+            role: "assistant",
+            content: "La réponse met plus de temps que prévu. L'équipe a été notifiée.",
+            status: "failed",
+            turn_index: optimisticUserMessage.turn_index,
+            content_position: null,
+            created_at: new Date().toISOString(),
+          },
+        ]);
+        setIsLoading(false);
+      }, 60000);
 
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : "Failed to send message";
@@ -906,6 +1132,7 @@ export function ChatWidget() {
       };
       setMessages((prev) => [...prev, errorResponse]);
       setError(null); // Don't show banner, error is in the chat
+      // console.log("[setIsLoading] false from sendMessage (error)");
       setIsLoading(false);
     }
   };
@@ -918,9 +1145,14 @@ export function ChatWidget() {
   };
 
   const startNewConversation = () => {
-    setConversationId(null);
+    if (user) {
+      setUserConversationId(null);
+      localStorage.removeItem("lucie-user-conversation-id");
+    } else {
+      setVisitorConversationId(null);
+      localStorage.removeItem("lucie-visitor-conversation-id");
+    }
     setMessages([]);
-    localStorage.removeItem("lucie-conversation-id");
   };
 
 
@@ -948,9 +1180,8 @@ export function ChatWidget() {
         )}
       </button>
 
-      {/* Chat Panel */}
-      {isOpen && (
-        <div className={`${panelClasses} bg-slate-900/95 backdrop-blur-lg rounded-2xl shadow-2xl shadow-black/50 border border-slate-700/50 flex flex-col overflow-hidden transition-all duration-300`}>
+      {/* Chat Panel - always mounted, hidden with CSS to avoid re-render flash */}
+      <div className={`${panelClasses} bg-slate-900/95 backdrop-blur-lg rounded-2xl shadow-2xl shadow-black/50 border border-slate-700/50 flex flex-col overflow-hidden transition-all duration-300 ${isOpen ? 'opacity-100 scale-100' : 'opacity-0 scale-95 pointer-events-none'}`}>
           {/* Header */}
           <div className="px-4 py-3 border-b border-slate-700/50 flex items-center gap-3">
             <div className="w-10 h-10 rounded-full bg-gradient-to-br from-cyan-400 to-purple-500 flex items-center justify-center text-white font-bold">
@@ -1192,6 +1423,7 @@ export function ChatWidget() {
                 disabled={isLoading}
               />
               <button
+                type="button"
                 onClick={sendMessage}
                 disabled={!input.trim() || isLoading}
                 className="px-4 py-2 bg-cyan-500 hover:bg-cyan-400 disabled:bg-slate-700 disabled:cursor-not-allowed text-slate-900 disabled:text-slate-500 rounded-xl transition-colors"
@@ -1203,7 +1435,6 @@ export function ChatWidget() {
             </div>
           </div>
         </div>
-      )}
     </>
   );
 }

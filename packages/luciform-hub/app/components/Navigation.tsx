@@ -19,8 +19,9 @@ export function Navigation() {
       {/* Animated top border */}
       <div className="absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-cyan-400/50 to-transparent" />
 
-      <div className="max-w-6xl mx-auto px-6 py-4 flex items-center justify-between">
-        <Link href="/" className="flex items-center gap-3 group">
+      <div className="max-w-6xl mx-auto px-3 sm:px-6 py-3 sm:py-4 flex items-center gap-4 sm:justify-between">
+        {/* Logo - fixed size, never shrinks */}
+        <Link href="/" className="flex items-center gap-3 group flex-shrink-0">
           <div className="relative">
             <img
               src="/ragforge-logos/LR_LOGO_BLACK_BACKGROUND.png"
@@ -31,18 +32,27 @@ export function Navigation() {
             {/* Glow effect on hover */}
             <div className="absolute inset-0 rounded-lg border border-cyan-400/0 group-hover:border-cyan-400/50 transition-all duration-300" />
           </div>
-          <span className="text-xl font-bold bg-gradient-to-r from-cyan-400 to-purple-400 bg-clip-text text-transparent
+          {/* Hide text on mobile */}
+          <span className="hidden sm:block text-xl font-bold bg-gradient-to-r from-cyan-400 to-purple-400 bg-clip-text text-transparent
             group-hover:from-cyan-300 group-hover:to-purple-300 transition-all duration-300">
             Luciform Research
           </span>
         </Link>
 
-        <div className="flex gap-8">
+        {/* Nav links - scrollable on mobile */}
+        <div
+          className="flex gap-4 sm:gap-8 overflow-x-auto scrollbar-hide"
+          style={{
+            WebkitOverflowScrolling: 'touch',
+            scrollbarWidth: 'none',
+            msOverflowStyle: 'none'
+          }}
+        >
           {navLinks.map((link) => (
             <Link
               key={link.href}
               href={link.href}
-              className={`relative px-2 py-1 transition-all duration-300 ${
+              className={`relative px-2 py-1 text-sm sm:text-base whitespace-nowrap transition-all duration-300 flex-shrink-0 ${
                 pathname === link.href
                   ? 'text-cyan-400'
                   : 'text-slate-400 hover:text-cyan-300'

@@ -1,0 +1,200 @@
+[2026-01-19 16:45:21.339] [INFO ] [API] GitHub ingestion complete: 4 nodes, 0 rels, 365 embeddings in 22119ms
+[2026-01-19 16:45:21.339] [INFO ] [API] Cleaning up temp directory: /tmp/github-ingest-KW0oOv
+[2026-01-19 16:45:21.339] [INFO ] [API] [DEBUG] ingestVirtualSimplified completed: 4 files, 0 scopes
+[2026-01-19 16:45:21.357] [INFO ] [2026-01-19T16:45:21.357+01:00] [2026-01-19 16:45:21.357] [INFO ] [API] [SSE] Client disconnected (reply.raw close event)
+[2026-01-19 16:45:21.357] [INFO ] [API] [SSE] Client disconnected (reply.raw close event)
+[2026-01-19 16:45:52.957] [INFO ] [2026-01-19T16:45:52.957+01:00] [2026-01-19 16:45:52.957] [INFO ] [API] Cypher: MATCH (f:File {projectId: "community-docs-github"}) WITH f.absolutePath as path, count(*) as cnt WHE...
+[2026-01-19 16:45:52.957] [INFO ] [API] Cypher: MATCH (f:File {projectId: "community-docs-github"}) WITH f.absolutePath as path, count(*) as cnt WHE...
+[2026-01-19 16:47:26.784] [INFO ] [2026-01-19T16:47:26.784+01:00] [2026-01-19 16:47:26.784] [INFO ] [API] Cypher: MATCH (f:File) WHERE f.projectId IS NOT NULL RETURN f.absolutePath as path, f.projectId as projectId...
+[2026-01-19 16:47:26.784] [INFO ] [API] Cypher: MATCH (f:File) WHERE f.projectId IS NOT NULL RETURN f.absolutePath as path, f.projectId as projectId...
+[2026-01-19 16:47:47.827] [INFO ] [2026-01-19T16:47:47.827+01:00] [2026-01-19 16:47:47.827] [INFO ] [API] Cypher: SHOW CONSTRAINTS...
+[2026-01-19 16:47:47.827] [INFO ] [API] Cypher: SHOW CONSTRAINTS...
+[2026-01-19 16:48:05.443] [INFO ] [2026-01-19T16:48:05.443+01:00] [2026-01-19 16:48:05.443] [INFO ] [API] Cypher: MATCH (f:File) WHERE f.uuid STARTS WITH "file:" DETACH DELETE f RETURN count(f) as deleted...
+[2026-01-19 16:48:05.443] [INFO ] [API] Cypher: MATCH (f:File) WHERE f.uuid STARTS WITH "file:" DETACH DELETE f RETURN count(f) as deleted...
+[2026-01-19 16:53:07.972] [INFO ] [2026-01-19T16:53:07.972+01:00] [2026-01-19 16:53:07.972] [INFO ] [API] Cypher: CREATE CONSTRAINT file_path_project_unique IF NOT EXISTS FOR (f:File) REQUIRE (f.absolutePath, f.pro...
+[2026-01-19 16:53:07.972] [INFO ] [API] Cypher: CREATE CONSTRAINT file_path_project_unique IF NOT EXISTS FOR (f:File) REQUIRE (f.absolutePath, f.pro...
+[2026-01-19 16:55:20.151] [INFO ] [2026-01-19T16:55:20.151+01:00] [2026-01-19 16:55:20.151] [INFO ] [API] Cypher: SHOW CONSTRAINTS...
+[2026-01-19 16:55:20.151] [INFO ] [API] Cypher: SHOW CONSTRAINTS...
+[2026-01-19 16:55:23.480] [INFO ] [2026-01-19T16:55:23.480+01:00] [2026-01-19 16:55:23.480] [INFO ] [API] Cypher: MATCH (f:File) RETURN f.absolutePath as path, count(*) as cnt ORDER BY cnt DESC LIMIT 5...
+[2026-01-19 16:55:23.480] [INFO ] [API] Cypher: MATCH (f:File) RETURN f.absolutePath as path, count(*) as cnt ORDER BY cnt DESC LIMIT 5...
+[2026-01-19 16:57:08.968] [INFO ] [2026-01-19T16:57:08.967+01:00] [2026-01-19 16:57:08.967] [INFO ] [API] Initializing Community API...
+[2026-01-19 16:57:08.967] [INFO ] [API] Initializing Community API...
+[2026-01-19 16:57:09.012] [INFO ] [2026-01-19T16:57:09.012+01:00] [2026-01-19 16:57:09.012] [INFO ] [API] Connected to Neo4j (port 7688)
+[2026-01-19 16:57:09.012] [INFO ] [API] Connected to Neo4j (port 7688)
+[2026-01-19 16:57:09.192] [INFO ] [2026-01-19T16:57:09.192+01:00] [2026-01-19 16:57:09.192] [INFO ] [API] TEI connected (http://localhost:8081)
+[2026-01-19 16:57:09.192] [INFO ] [2026-01-19T16:57:09.192+01:00] [Indexes] Ensuring vector indexes (dimension: 768)...
+[2026-01-19 16:57:09.192] [INFO ] [API] TEI connected (http://localhost:8081)
+[2026-01-19 16:57:09.436] [INFO ] [2026-01-19T16:57:09.436+01:00] [Indexes] Vector indexes: 0 created, 0 recreated, 52 skipped, 0 errors
+[2026-01-19 16:57:09.436] [INFO ] [2026-01-19T16:57:09.436+01:00] [2026-01-19 16:57:09.436] [INFO ] [API] Vector indexes ensured (dimension: 768)
+[2026-01-19 16:57:09.437] [INFO ] [2026-01-19T16:57:09.437+01:00] [2026-01-19 16:57:09.437] [INFO ] [Pipeline] [CommunityOrchestrator] Entity extraction enabled: http://localhost:6971
+[2026-01-19 16:57:09.439] [INFO ] [2026-01-19T16:57:09.439+01:00] [2026-01-19 16:57:09.439] [INFO ] [Pipeline] [CommunityOrchestrator] EmbeddingService initialized (unknown)
+[2026-01-19 16:57:09.439] [INFO ] [2026-01-19T16:57:09.439+01:00] [2026-01-19 16:57:09.439] [INFO ] [Pipeline] [CommunityOrchestrator] SearchService initialized
+[2026-01-19 16:57:09.440] [INFO ] [2026-01-19T16:57:09.440+01:00] [EmbeddingService] Ensuring vector indexes (dimension: 1024)...
+[2026-01-19 16:57:09.436] [INFO ] [API] Vector indexes ensured (dimension: 768)
+[2026-01-19 16:57:09.656] [INFO ] [2026-01-19T16:57:09.656+01:00] [EmbeddingService] Vector indexes: 0 created, 52 already existed, 0 errors
+[2026-01-19 16:57:09.656] [INFO ] [2026-01-19T16:57:09.656+01:00] [2026-01-19 16:57:09.656] [INFO ] [Pipeline] [CommunityOrchestrator] Vector indexes: 0 created, 52 existed
+[2026-01-19 16:57:09.657] [WARN ] [2026-01-19T16:57:09.657+01:00] [WARN] Node type 'File' is already defined. Overwriting with definition from parser 'document'.
+[2026-01-19 16:57:09.657] [WARN ] [2026-01-19T16:57:09.657+01:00] [WARN] Node type 'MarkdownDocument' is already defined. Overwriting with definition from parser 'document'.
+[2026-01-19 16:57:09.657] [WARN ] [2026-01-19T16:57:09.657+01:00] [WARN] Node type 'MarkdownSection' is already defined. Overwriting with definition from parser 'document'.
+[2026-01-19 16:57:09.657] [WARN ] [2026-01-19T16:57:09.657+01:00] [WARN] Extension '.html' is already handled by parser 'code'. Overwriting with parser 'web'.
+[2026-01-19 16:57:09.657] [WARN ] [2026-01-19T16:57:09.657+01:00] [WARN] Extension '.htm' is already handled by parser 'code'. Overwriting with parser 'web'.
+[2026-01-19 16:57:09.670] [INFO ] [2026-01-19T16:57:09.670+01:00] [Orchestrator] Initialized
+[2026-01-19 16:57:09.670] [INFO ] [2026-01-19T16:57:09.670+01:00] [2026-01-19 16:57:09.670] [INFO ] [Pipeline] [CommunityOrchestrator] Initialized with transformGraph hook
+[2026-01-19 16:57:09.671] [INFO ] [2026-01-19T16:57:09.671+01:00] [2026-01-19 16:57:09.671] [INFO ] [API] Orchestrator initialized (verbose: true)
+[2026-01-19 16:57:09.671] [INFO ] [API] Orchestrator initialized (verbose: true)
+[2026-01-19 16:57:09.682] [INFO ] [2026-01-19T16:57:09.682+01:00] [2026-01-19 16:57:09.682] [INFO ] [API] EntityEmbeddingService initialized (vector: 0 created, fulltext: 0 created)
+[2026-01-19 16:57:09.682] [INFO ] [2026-01-19T16:57:09.682+01:00] [2026-01-19 16:57:09.682] [INFO ] [Pipeline] [CommunityOrchestrator] EntityEmbeddingService set for entity boost
+[2026-01-19 16:57:09.689] [INFO ] [2026-01-19T16:57:09.689+01:00] [ChatRoute] Chat routes registered: /chat, /chat/conversations
+[2026-01-19 16:57:09.690] [INFO ] [2026-01-19T16:57:09.690+01:00] [VisionRoutes] Vision routes registered: /vision/analyze, /vision/render-3d, /vision/describe-3d
+[2026-01-19 16:57:09.692] [INFO ] [2026-01-19T16:57:09.692+01:00] [Lucie] Conversation routes registered
+[2026-01-19 16:57:09.692] [INFO ] [2026-01-19T16:57:09.692+01:00] [2026-01-19 16:57:09.692] [INFO ] [API] Community API initialized
+[2026-01-19 16:57:09.699] [INFO ] [2026-01-19T16:57:09.699+01:00] [2026-01-19 16:57:09.699] [INFO ] [API] Community API listening on http://127.0.0.1:6970
+[2026-01-19 16:57:09.699] [INFO ] [2026-01-19T16:57:09.699+01:00] [2026-01-19 16:57:09.699] [INFO ] [API] Logs: /home/luciedefraiteur/.ragforge/logs/community-docs
+[2026-01-19 16:57:09.699] [INFO ] [2026-01-19T16:57:09.699+01:00] 📚 Community Docs API running on http://127.0.0.1:6970
+[2026-01-19 16:57:09.699] [INFO ] [2026-01-19T16:57:09.699+01:00] 📝 Logs: /home/luciedefraiteur/.ragforge/logs/community-docs
+[2026-01-19 16:57:09.682] [INFO ] [API] EntityEmbeddingService initialized (vector: 0 created, fulltext: 0 created)
+[2026-01-19 16:57:09.692] [INFO ] [API] Community API initialized
+[2026-01-19 16:57:09.699] [INFO ] [API] Community API listening on http://127.0.0.1:6970
+[2026-01-19 16:57:09.699] [INFO ] [API] Logs: /home/luciedefraiteur/.ragforge/logs/community-docs
+[2026-01-19 16:57:30.243] [INFO ] [2026-01-19T16:57:30.243+01:00] [2026-01-19 16:57:30.243] [INFO ] [API] GitHub ingestion (SSE): github.com/LuciformResearch/community-docs (branch: main)
+[2026-01-19 16:57:30.245] [INFO ] [2026-01-19T16:57:30.245+01:00] [2026-01-19 16:57:30.245] [INFO ] [API] Cloning https://github.com/LuciformResearch/community-docs (branch: main, submodules: true) to /tmp/github-ingest-3qIwo9...
+[2026-01-19 16:57:30.243] [INFO ] [API] GitHub ingestion (SSE): github.com/LuciformResearch/community-docs (branch: main)
+[2026-01-19 16:57:30.245] [INFO ] [API] Cloning https://github.com/LuciformResearch/community-docs (branch: main, submodules: true) to /tmp/github-ingest-3qIwo9...
+[2026-01-19 16:57:37.028] [INFO ] [2026-01-19T16:57:37.028+01:00] [2026-01-19 16:57:37.028] [INFO ] [API] Clone complete: /tmp/github-ingest-3qIwo9/community-docs
+[2026-01-19 16:57:37.028] [INFO ] [API] Clone complete: /tmp/github-ingest-3qIwo9/community-docs
+[2026-01-19 16:57:37.166] [INFO ] [2026-01-19T16:57:37.166+01:00] [2026-01-19 16:57:37.166] [INFO ] [Pipeline] [CommunityOrchestrator] Ingesting 502 virtual files (simplified) into project: community-docs-github
+[2026-01-19 16:57:37.168] [INFO ] [2026-01-19T16:57:37.168+01:00] [UnifiedProcessor] Using provided EmbeddingService (canGenerate=true)
+[2026-01-19 16:57:37.168] [INFO ] [2026-01-19T16:57:37.168+01:00] [UnifiedProcessor] Entity extraction client initialized: http://localhost:6971
+[2026-01-19 16:57:37.168] [INFO ] [2026-01-19T16:57:37.168+01:00] [UnifiedProcessor] Ingesting 502 virtual files for project community-docs-github
+[2026-01-19 16:57:37.612] [INFO ] [2026-01-19T16:57:37.612+01:00] [UnifiedProcessor] Created/updated 502 virtual File nodes
+[2026-01-19 16:57:37.613] [INFO ] [2026-01-19T16:57:37.613+01:00] [UnifiedProcessor] Getting files in 'discovered' state for project community-docs-github...
+[2026-01-19 16:57:37.654] [INFO ] [2026-01-19T16:57:37.654+01:00] [UnifiedProcessor] Found 1 files in 'discovered' state
+[2026-01-19 16:57:37.655] [INFO ] [2026-01-19T16:57:37.655+01:00] [UnifiedProcessor] 🚀 Processing ALL 1 discovered files
+[2026-01-19 16:57:37.656] [INFO ] [2026-01-19T16:57:37.656+01:00] [FileProcessor] 🚀 Starting batch processing of 1 files (concurrency=10)
+[2026-01-19 16:57:37.689] [INFO ] [2026-01-19T16:57:37.689+01:00] [FileProcessor] Processing 1 changed files (0 skipped, 0 deleted)
+[2026-01-19 16:57:37.745] [INFO ] [2026-01-19T16:57:37.745+01:00] [FileProcessor] 🔄 Calling adapter.parse() with 1 virtual files
+[2026-01-19 16:57:37.754] [INFO ] [2026-01-19T16:57:37.754+01:00]   ✓ Project: community-docs (git@github.com:LuciformResearch/community-docs.git)
+[2026-01-19 16:57:37.755] [INFO ] [2026-01-19T16:57:37.755+01:00] 📦 Virtual files mode: 1 files in memory
+[2026-01-19 16:57:37.756] [INFO ] [2026-01-19T16:57:37.756+01:00] 📊 Files breakdown: 1 code files, 0 other files
+[2026-01-19 16:57:37.756] [INFO ] [2026-01-19T16:57:37.756+01:00] 🚀 Starting parallel code parsing of 1 files with worker threads...
+[2026-01-19 16:57:37.757] [INFO ] [2026-01-19T16:57:37.757+01:00] [CodeSourceAdapter] ProjectParser initialized with 11 workers
+[2026-01-19 16:57:38.246] [INFO ] [2026-01-19T16:57:38.245+01:00] ✅ Code parsing complete: 1/1 files, 16 scopes in 483ms
+[2026-01-19 16:57:38.246] [INFO ] [2026-01-19T16:57:38.246+01:00] ✅ Parsing complete. Starting buildGraph...
+[2026-01-19 16:57:38.246] [INFO ] [2026-01-19T16:57:38.246+01:00]    Code: 1, HTML: 0, CSS: 0, SCSS: 0
+[2026-01-19 16:57:38.246] [INFO ] [2026-01-19T16:57:38.246+01:00]    Vue: 0, Svelte: 0, Markdown: 0, Generic: 0
+[2026-01-19 16:57:38.249] [INFO ] [2026-01-19T16:57:38.249+01:00] 🔨 Building graph for 1 files...
+[2026-01-19 16:57:38.250] [INFO ] [2026-01-19T16:57:38.250+01:00]    📝 Processing 1 code files (16 scopes)...
+[2026-01-19 16:57:38.252] [INFO ] [2026-01-19T16:57:38.252+01:00]    🔗 Building scope relationships with RelationshipResolver...
+[2026-01-19 16:57:38.263] [INFO ] [2026-01-19T16:57:38.263+01:00]    📊 RelationshipResolver stats: 23 relationships, 15 unresolved
+[2026-01-19 16:57:38.264] [INFO ] [2026-01-19T16:57:38.263+01:00]       Types: CONSUMES=14, IMPLEMENTS=9
+[2026-01-19 16:57:38.264] [INFO ] [2026-01-19T16:57:38.264+01:00]    📦 Processing external library references...
+[2026-01-19 16:57:38.265] [INFO ] [2026-01-19T16:57:38.265+01:00]    ✅ Graph built: 29 nodes, 66 relationships
+[2026-01-19 16:57:38.272] [INFO ] [2026-01-19T16:57:38.271+01:00] [FileProcessor] 📦 Collecting nodes/relationships from 1 files...
+[2026-01-19 16:57:38.272] [INFO ] [2026-01-19T16:57:38.272+01:00] [FileProcessor] 📂 Adding 12 global nodes (Directory, ExternalLibrary, Project)
+[2026-01-19 16:57:38.272] [INFO ] [2026-01-19T16:57:38.272+01:00] [FileProcessor] 📊 Total: 28 nodes, 64 relationships
+[2026-01-19 16:57:38.273] [INFO ] [2026-01-19T16:57:38.273+01:00] [FileProcessor] 🔨 Creating nodes (global batch)...
+[2026-01-19 16:57:38.541] [INFO ] [2026-01-19T16:57:38.541+01:00] [FileProcessor] ✅ Nodes created: 0 (27 unchanged)
+[2026-01-19 16:57:38.542] [INFO ] [2026-01-19T16:57:38.542+01:00] [FileProcessor] 🔗 Creating relationships (global batch)...
+[2026-01-19 16:57:38.544] [INFO ] [2026-01-19T16:57:38.544+01:00] [2026-01-19 16:57:38.544] [INFO ] [API] [SSE] Client disconnected (reply.raw close event)
+[2026-01-19 16:57:38.544] [INFO ] [API] [SSE] Client disconnected (reply.raw close event)
+[2026-01-19 16:57:38.582] [ERROR] [2026-01-19T16:57:38.582+01:00] [ERROR] [FileProcessor] ❌ Relationship creation failed: Node(7219) already exists with label `File` and properties `absolutePath` = '/github.com/LuciformResearch/community-docs/packages/ragforge-core/src/brain/ensure-indexes.ts', `projectId` = 'community-docs-github'
+[2026-01-19 16:57:38.583] [INFO ] [2026-01-19T16:57:38.582+01:00] [FileProcessor] 🧹 Per-file cleanup (1 files)...
+[2026-01-19 16:57:38.693] [INFO ] [2026-01-19T16:57:38.692+01:00] [FileProcessor] ✅ Batch complete: 1 processed, 0 skipped, 0 errors (1036ms)
+[2026-01-19 16:57:38.886] [INFO ] [2026-01-19T16:57:38.886+01:00] [UnifiedProcessor] ✅ Discovered processing: 1 parsed, 0 scopes (1273ms)
+[2026-01-19 16:57:38.891] [INFO ] [2026-01-19T16:57:38.891+01:00] [UnifiedProcessor] 🚀 Processing ALL 1 linked files (concurrency=10)
+[2026-01-19 16:57:38.891] [INFO ] [2026-01-19T16:57:38.891+01:00] [UnifiedProcessor] 🔍 Checking GLiNER availability at http://localhost:6971...
+[2026-01-19 16:57:38.903] [INFO ] [2026-01-19T16:57:38.903+01:00] [UnifiedProcessor] ✅ GLiNER available: model=fastino/gliner2-large-v1, device=cuda
+[2026-01-19 16:57:38.904] [INFO ] [2026-01-19T16:57:38.904+01:00] [UnifiedProcessor] 🔄 Loading GLiNER model to GPU...
+[2026-01-19 16:57:46.593] [INFO ] [2026-01-19T16:57:46.593+01:00] [UnifiedProcessor] ✅ GLiNER model loaded
+[2026-01-19 16:57:46.627] [INFO ] [2026-01-19T16:57:46.627+01:00] [UnifiedProcessor] 📊 Fetched 0 nodes for entity extraction (0 files with content)
+[2026-01-19 16:57:46.632] [INFO ] [2026-01-19T16:57:46.632+01:00] [UnifiedProcessor] 🔄 Unloading GLiNER model from GPU...
+[2026-01-19 16:57:47.346] [INFO ] [2026-01-19T16:57:47.346+01:00] [UnifiedProcessor] ✅ GLiNER model unloaded, GPU memory freed for embeddings
+[2026-01-19 16:57:47.351] [INFO ] [2026-01-19T16:57:47.351+01:00] [UnifiedProcessor] Generating embeddings for project community-docs-github...
+[2026-01-19 16:57:47.352] [INFO ] [2026-01-19T16:57:47.352+01:00] [EmbeddingService] Generating multi-embeddings for project: community-docs-github
+[2026-01-19 16:57:47.352] [INFO ] [2026-01-19T16:57:47.352+01:00] [EmbeddingService]   Using unknown
+[2026-01-19 16:57:47.352] [INFO ] [2026-01-19T16:57:47.352+01:00] [EmbeddingService]   Embedding types: name, content, description
+[2026-01-19 16:57:47.352] [INFO ] [2026-01-19T16:57:47.352+01:00] [EmbeddingService] Phase 1: Collecting tasks from 22 node types...
+[2026-01-19 16:57:47.353] [INFO ] [2026-01-19T16:57:47.353+01:00] [EmbeddingService] collectEmbeddingTasks(Scope) query:
+MATCH (s:Scope {projectId: $projectId})
+            WHERE s._state = 'linked'
+            RETURN s.uuid AS uuid, s._name AS _name, s._content AS _content, s._description AS _description,
+                   s.startLine AS startLine, s.endLine AS endLine,
+                   s.embedding_name_hash AS embedding_name_hash,
+                   s.embedding_content_hash AS embedding_content_hash,
+                   s.embedding_description_hash AS embedding_description_hash,
+                   s.embedding_provider AS embedding_provider,
+                   s.embedding_model AS embedding_model,
+                   s.usesChunks AS usesChunks,
+                   s._state AS _state
+            ORDER BY s.file, s.startLine
+[2026-01-19 16:57:47.353] [INFO ] [2026-01-19T16:57:47.353+01:00] [EmbeddingService] collectEmbeddingTasks(Scope) params: {"projectId":"community-docs-github"}
+[2026-01-19 16:57:47.384] [INFO ] [2026-01-19T16:57:47.384+01:00] [EmbeddingService] collectEmbeddingTasks(Scope): 2 nodes to embed
+[2026-01-19 16:57:47.384] [INFO ] [2026-01-19T16:57:47.384+01:00] [EmbeddingService] Need embed: Scope.name "async function ensureBaseIndexes(neo4jClient: Neo4jClient, o..." (no_hash)
+[2026-01-19 16:57:47.385] [INFO ] [2026-01-19T16:57:47.385+01:00] [EmbeddingService] Need embed (chunked): Scope.content "async function ensureBaseIndexes(   neo4jClient: Neo4jClient..." (no_hash)
+[2026-01-19 16:57:47.385] [INFO ] [2026-01-19T16:57:47.385+01:00] [EmbeddingService] Need embed: Scope.description "Ensure base property indexes exist (UUID, projectId, absolut..." (no_hash)
+[2026-01-19 16:57:47.385] [INFO ] [2026-01-19T16:57:47.385+01:00] [EmbeddingService]   Scope: 4 tasks (2 nodes, 3 cached)
+[2026-01-19 16:57:47.386] [INFO ] [2026-01-19T16:57:47.386+01:00] [EmbeddingService] collectEmbeddingTasks(File) query:
+MATCH (f:File {projectId: $projectId})
+            WHERE f._state = 'linked' AND f._rawContent IS NOT NULL
+            RETURN f.usesChunks AS usesChunks, f.uuid AS uuid, f._name AS _name, f._rawContent AS _content,
+                   f.embedding_name_hash AS embedding_name_hash,
+                   f.embedding_content_hash AS embedding_content_hash,
+                   f.embedding_provider AS embedding_provider,
+                   f.embedding_model AS embedding_model,
+                   f._state AS _state
+[2026-01-19 16:57:47.386] [INFO ] [2026-01-19T16:57:47.386+01:00] [EmbeddingService] collectEmbeddingTasks(File) params: {"projectId":"community-docs-github"}
+[2026-01-19 16:57:47.404] [INFO ] [2026-01-19T16:57:47.403+01:00] [EmbeddingService] collectEmbeddingTasks(MarkdownDocument) query:
+MATCH (m:MarkdownDocument {projectId: $projectId})
+            WHERE m._state = 'linked'
+            RETURN m.usesChunks AS usesChunks, m.uuid AS uuid, m._name AS _name, m._content AS _content, m._description AS _description,
+                   m.embedding_name_hash AS embedding_name_hash,
+                   m.embedding_content_hash AS embedding_content_hash,
+                   m.embedding_description_hash AS embedding_description_hash,
+                   m.embedding_provider AS embedding_provider,
+                   m.embedding_model AS embedding_model,
+                   m._state AS _state
+[2026-01-19 16:57:47.404] [INFO ] [2026-01-19T16:57:47.404+01:00] [EmbeddingService] collectEmbeddingTasks(MarkdownDocument) params: {"projectId":"community-docs-github"}
+[2026-01-19 16:57:47.423] [INFO ] [2026-01-19T16:57:47.423+01:00] [EmbeddingService] collectEmbeddingTasks(MarkdownDocument): 63 nodes to embed
+[2026-01-19 16:57:47.425] [INFO ] [2026-01-19T16:57:47.425+01:00] [EmbeddingService] collectEmbeddingTasks(MarkdownSection) query:
+MATCH (s:MarkdownSection {projectId: $projectId})
+            WHERE s._state = 'linked'
+            RETURN s.uuid AS uuid, s._name AS _name, s._content AS _content,
+                   s.startLine AS startLine, s.endLine AS endLine, s.pageNum AS pageNum,
+                   s.embedding_name_hash AS embedding_name_hash,
+                   s.embedding_content_hash AS embedding_content_hash,
+                   s.embedding_provider AS embedding_provider,
+                   s.embedding_model AS embedding_model,
+                   s.usesChunks AS usesChunks,
+                   s._state AS _state
+[2026-01-19 16:57:47.426] [INFO ] [2026-01-19T16:57:47.426+01:00] [EmbeddingService] collectEmbeddingTasks(MarkdownSection) params: {"projectId":"community-docs-github"}
+[2026-01-19 16:57:47.447] [INFO ] [2026-01-19T16:57:47.446+01:00] [EmbeddingService] collectEmbeddingTasks(MarkdownSection): 2 nodes to embed
+[2026-01-19 16:57:47.447] [INFO ] [2026-01-19T16:57:47.447+01:00] [EmbeddingService] collectEmbeddingTasks(CodeBlock) query:
+MATCH (c:CodeBlock {projectId: $projectId})
+            WHERE c._state = 'linked' AND c._content IS NOT NULL AND size(c._content) > 10
+            RETURN c.usesChunks AS usesChunks, c.uuid AS uuid, c._name AS _name, c._content AS _content,
+                   c.startLine AS startLine, c.endLine AS endLine,
+                   c.embedding_name_hash AS embedding_name_hash,
+                   c.embedding_content_hash AS embedding_content_hash,
+                   c.embedding_provider AS embedding_provider,
+                   c.embedding_model AS embedding_model,
+                   c._state AS _state
+[2026-01-19 16:57:47.447] [INFO ] [2026-01-19T16:57:47.447+01:00] [EmbeddingService] collectEmbeddingTasks(CodeBlock) params: {"projectId":"community-docs-github"}
+[2026-01-19 16:57:47.469] [INFO ] [2026-01-19T16:57:47.468+01:00] [EmbeddingService] collectEmbeddingTasks(DataFile) query:
+MATCH (d:DataFile {projectId: $projectId})
+            WHERE d._state = 'linked'
+            RETURN d.usesChunks AS usesChunks, d.uuid AS uuid, d._name AS _name, d._content AS _content,
+                   d.embedding_name_hash AS embedding_name_hash,
+                   d.embedding_content_hash AS embedding_content_hash,
+                   d.embedding_provider AS embedding_provider,
+                   d.embedding_model AS embedding_model,
+                   d._state AS _state
+[2026-01-19 16:57:47.469] [INFO ] [2026-01-19T16:57:47.469+01:00] [EmbeddingService] collectEmbeddingTasks(DataFile) params: {"projectId":"community-docs-github"}
+[2026-01-19 16:57:47.485] [INFO ] [2026-01-19T16:57:47.485+01:00] [EmbeddingService] collectEmbeddingTasks(DataFile): 24 nodes to embed
+[2026-01-19 16:57:47.486] [INFO ] [2026-01-19T16:57:47.486+01:00] [EmbeddingService] collectEmbeddingTasks(WebPage) query:
+MATCH (w:WebPage {projectId: $projectId})
+            WHERE w._state = 'linked'
+            RETURN w.usesChunks AS usesChunks, w.uuid AS uuid, w._name AS _name, w._content AS _content, w._description AS _description,
+                   w.embedding_name_hash AS embedding_name_hash,
+                   w.embedding_content_hash AS embedding_content_hash,
+                   w.embedding_description_hash AS embedding_description_hash,
+                   w.embedding_provider AS embedding_provider,

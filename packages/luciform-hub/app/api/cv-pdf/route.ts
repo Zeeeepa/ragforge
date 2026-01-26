@@ -59,16 +59,42 @@ export async function GET(request: Request) {
           text-decoration-color: currentColor !important;
         }
 
+        /* Reduce overall scale to fit page 1 content better */
+        .print-content {
+          padding: 25px 35px !important;
+          font-size: 0.92em !important;
+        }
+
+        /* Tighter spacing for skills section on page 1 */
+        .print-content > section {
+          margin-bottom: 12px !important;
+        }
+
+        .print-content .space-y-6 {
+          gap: 12px !important;
+        }
+
+        .print-content .mb-8 {
+          margin-bottom: 16px !important;
+        }
+
+        .print-content .mb-6 {
+          margin-bottom: 12px !important;
+        }
+
+        .print-content .p-4 {
+          padding: 10px !important;
+        }
+
+        .print-content .gap-4 {
+          gap: 8px !important;
+        }
+
         /* Force page break before Professional Experience */
         .cv-page-break {
           break-before: page !important;
           page-break-before: always !important;
-          padding-top: 20px !important;
-        }
-
-        /* Reduce margins and spacing for better fit */
-        .print-content {
-          padding: 30px 40px !important;
+          padding-top: 15px !important;
         }
 
         /* Tighter spacing for page 2 content */

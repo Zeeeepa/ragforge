@@ -147,7 +147,7 @@ export default function CVPage() {
             <div className="absolute -inset-1 bg-gradient-to-b from-cyan-500/30 to-purple-500/30 rounded-2xl blur-xl opacity-50 group-hover:opacity-80 transition-opacity" />
             <div className="relative">
               <img
-                src="/photos_lucie/1764621365401.png"
+                src="/photos_lucie/1766757772036.png"
                 alt="Lucie Defraiteur"
                 className="w-40 h-52 rounded-xl object-cover border-2 border-cyan-400/30 group-hover:border-cyan-400/50 transition-colors"
               />
@@ -171,8 +171,14 @@ export default function CVPage() {
                     repeatInterval={15000}
                   />
                 </h1>
-                <p className="text-cyan-400 text-xl mb-4">RAG Systems Engineer & 3D Graphics Developer</p>
+                <p className="text-cyan-400 text-xl mb-4">AI Agent Engineer & 3D Graphics Developer</p>
                 <div className="text-slate-400 space-y-1">
+                  <p className="flex items-center gap-2">
+                    <span className="text-pink-400/60">▹</span>
+                    <a href="https://www.luciformresearch.com" target="_blank" rel="noopener noreferrer" className="hover:text-pink-400 transition-colors">
+                      luciformresearch.com
+                    </a>
+                  </p>
                   <p className="flex items-center gap-2">
                     <span className="text-cyan-400/60">▹</span>
                     <a href="mailto:luciedefraiteur@luciformresearch.com" className="hover:text-cyan-400 transition-colors">
@@ -183,6 +189,12 @@ export default function CVPage() {
                     <span className="text-purple-400/60">▹</span>
                     <a href="https://github.com/LuciformResearch" target="_blank" rel="noopener noreferrer" className="hover:text-purple-400 transition-colors">
                       github.com/LuciformResearch
+                    </a>
+                  </p>
+                  <p className="flex items-center gap-2">
+                    <span className="text-blue-400/60">▹</span>
+                    <a href="https://www.linkedin.com/in/lucie-defraiteur-8b3ab6b2/" target="_blank" rel="noopener noreferrer" className="hover:text-blue-400 transition-colors">
+                      linkedin.com/in/lucie-defraiteur
                     </a>
                   </p>
                 </div>
@@ -216,10 +228,10 @@ export default function CVPage() {
               />
             </h2>
             <p className="text-slate-300 leading-relaxed">
-              Backend engineer specialized in data pipelines, knowledge graph indexation, and RAG architectures.
-              I build incremental ingestion systems with hash-based change detection, hybrid search combining
-              vector embeddings and BM25 full-text indexing, and multi-level summarization for infinite context.
-              Also experienced in 3D graphics with WebGPU/WebGL engines and procedural generation.
+              AI engineer specialized in agentic systems, multi-provider LLM orchestration, and RAG architectures.
+              I build autonomous agents with tool calling, intent classification, and persistent knowledge graph memory (Neo4j).
+              Expertise in hybrid search (vector + BM25), incremental ingestion, and multi-level summarization for infinite context.
+              Also 10 years of experience in real-time 3D with WebGPU/WebGL engines.
             </p>
           </div>
         </section>
@@ -251,7 +263,7 @@ export default function CVPage() {
                 <h3 className="font-semibold text-purple-400 mb-2 flex items-center gap-2">
                   <span className="text-lg">*</span> AI & Data
                 </h3>
-                <p className="text-slate-400">Google Gemini, Neo4j, PostgreSQL, pgVector, RAG, Embeddings</p>
+                <p className="text-slate-400">LangChain, LangGraph, GLiNER, TEI, Google Gemini, Neo4j, PostgreSQL, pgVector, RAG, Embeddings, Twilio</p>
               </div>
             </div>
             <div className="group relative">
@@ -290,65 +302,129 @@ export default function CVPage() {
               repeatInterval={22000}
             />
           </h2>
-          <div className="space-y-6">
+          <div className="space-y-4">
 
+            {/* Luciform Research */}
             <div className="group relative">
               <div className="absolute -inset-1 bg-gradient-to-r from-cyan-500/10 to-transparent rounded-xl blur-xl opacity-0 group-hover:opacity-100 transition-opacity" />
               <div className="relative border-l-2 border-cyan-400 pl-4 py-2">
                 <div className="flex justify-between items-start mb-1">
                   <h3 className="font-semibold text-slate-200">Founder & Lead Developer</h3>
-                  <span className="text-cyan-400/60 text-sm px-2 py-0.5 rounded bg-cyan-400/10 border border-cyan-400/20">2024 - Present</span>
+                  <span className="text-cyan-400/60 text-sm px-2 py-0.5 rounded bg-cyan-400/10 border border-cyan-400/20">Jul 2024 - Present</span>
                 </div>
-                <p className="text-cyan-400 text-sm mb-2">Luciform Research</p>
+                <p className="text-cyan-400 text-sm mb-2">Luciform Research · Lille</p>
                 <p className="text-slate-400 text-sm">
-                  Independent software research initiative. Created RagForge (RAG agent framework),
-                  CodeParsers (multi-language code parser), and XMLParser (fault-tolerant XML parser).
-                  All published on npm under @luciformresearch scope.
+                  Independent software research initiative. Created RagForge (RAG agent framework with Neo4j knowledge graphs),
+                  CodeParsers (multi-language tree-sitter parser), XMLParser (fault-tolerant XML parser), and Lucie Agent
+                  (LangGraph-based conversational AI with intent classification, tool calling, and Twilio WhatsApp integration).
+                  All packages published on npm under @luciformresearch scope.
                 </p>
               </div>
             </div>
 
+            {/* Entre Potes - Freelance */}
+            <div className="group relative">
+              <div className="absolute -inset-1 bg-gradient-to-r from-pink-500/10 to-transparent rounded-xl blur-xl opacity-0 group-hover:opacity-100 transition-opacity" />
+              <div className="relative border-l-2 border-pink-400 pl-4 py-2">
+                <div className="flex justify-between items-start mb-1">
+                  <h3 className="font-semibold text-slate-200">Fullstack Developer (Freelance)</h3>
+                  <span className="text-pink-400/60 text-sm px-2 py-0.5 rounded bg-pink-400/10 border border-pink-400/20">Oct - Nov 2025</span>
+                </div>
+                <p className="text-pink-400 text-sm mb-2">Entre Potes · Remote</p>
+                <p className="text-slate-400 text-sm">
+                  Feature development for social platform. Header visual fixes, custom react-joyride vendor fork
+                  for CSS transform handling, badge components with tooltips, premium subscription modal.
+                  <span className="text-pink-400/80"> React.js, TypeScript</span>
+                </p>
+              </div>
+            </div>
+
+            {/* Designhubz */}
             <div className="group relative">
               <div className="absolute -inset-1 bg-gradient-to-r from-green-500/10 to-transparent rounded-xl blur-xl opacity-0 group-hover:opacity-100 transition-opacity" />
               <div className="relative border-l-2 border-green-400 pl-4 py-2">
                 <div className="flex justify-between items-start mb-1">
-                  <h3 className="font-semibold text-slate-200">3D/Tools Developer</h3>
-                  <span className="text-green-400/60 text-sm px-2 py-0.5 rounded bg-green-400/10 border border-green-400/20">2021 - 2024</span>
+                  <h3 className="font-semibold text-slate-200">3D/Tools Developer (Freelance)</h3>
+                  <span className="text-green-400/60 text-sm px-2 py-0.5 rounded bg-green-400/10 border border-green-400/20">Feb 2023 - Jan 2024</span>
                 </div>
-                <p className="text-green-400 text-sm mb-2">DesignHubz, Verizon/Smartcom/Altersis</p>
+                <p className="text-green-400 text-sm mb-2">Designhubz · Remote</p>
                 <p className="text-slate-400 text-sm">
-                  Developed interactive 3D tools and front-end optimization.
-                  Expertise in WebGL, Three.js, and real-time 3D applications.
+                  3D tools and mobile development for AR/VR e-commerce platform.
+                  <span className="text-green-400/80"> React Native, TypeScript</span>
                 </p>
               </div>
             </div>
 
+            {/* Verizon */}
             <div className="group relative">
               <div className="absolute -inset-1 bg-gradient-to-r from-purple-500/10 to-transparent rounded-xl blur-xl opacity-0 group-hover:opacity-100 transition-opacity" />
               <div className="relative border-l-2 border-purple-400 pl-4 py-2">
                 <div className="flex justify-between items-start mb-1">
-                  <h3 className="font-semibold text-slate-200">Game Developer</h3>
-                  <span className="text-purple-400/60 text-sm px-2 py-0.5 rounded bg-purple-400/10 border border-purple-400/20">2015 - 2019</span>
+                  <h3 className="font-semibold text-slate-200">Babylon.js / WebGL / 3D Expert</h3>
+                  <span className="text-purple-400/60 text-sm px-2 py-0.5 rounded bg-purple-400/10 border border-purple-400/20">Feb 2021 - Feb 2023</span>
                 </div>
-                <p className="text-purple-400 text-sm mb-2">Flashbreak, GameBuilt, Eden Games, AddSome</p>
+                <p className="text-purple-400 text-sm mb-2">Verizon / Smartcom / Altersis · Remote</p>
                 <p className="text-slate-400 text-sm">
-                  Developed real-time multiplayer games with Three.js/WebGL.
-                  Specialization in streaming games and professional 3D applications.
+                  Real-time 3D visualization and WebGL development for enterprise clients.
+                  <span className="text-purple-400/80"> TypeScript, React, Babylon.js, Three.js, GLSL, C++, OpenGL</span>
                 </p>
               </div>
             </div>
 
+            {/* A2Mac1 */}
+            <div className="group relative">
+              <div className="absolute -inset-1 bg-gradient-to-r from-orange-500/10 to-transparent rounded-xl blur-xl opacity-0 group-hover:opacity-100 transition-opacity" />
+              <div className="relative border-l-2 border-orange-400 pl-4 py-2">
+                <div className="flex justify-between items-start mb-1">
+                  <h3 className="font-semibold text-slate-200">3D/Tools Developer</h3>
+                  <span className="text-orange-400/60 text-sm px-2 py-0.5 rounded bg-orange-400/10 border border-orange-400/20">Oct 2019 - Nov 2020</span>
+                </div>
+                <p className="text-orange-400 text-sm mb-2">A2Mac1 - Automotive Benchmarking</p>
+                <p className="text-slate-400 text-sm">
+                  3D visualization tools for automotive industry benchmarking platform.
+                  <span className="text-orange-400/80"> TypeScript, Unreal Engine 4, Angular, Three.js, WebGL, C++, GLSL</span>
+                </p>
+              </div>
+            </div>
+
+            {/* Game Dev Era */}
+            <div className="group relative">
+              <div className="absolute -inset-1 bg-gradient-to-r from-blue-500/10 to-transparent rounded-xl blur-xl opacity-0 group-hover:opacity-100 transition-opacity" />
+              <div className="relative border-l-2 border-blue-400 pl-4 py-2">
+                <div className="flex justify-between items-start mb-1">
+                  <h3 className="font-semibold text-slate-200">Game Developer</h3>
+                  <span className="text-blue-400/60 text-sm px-2 py-0.5 rounded bg-blue-400/10 border border-blue-400/20">2015 - 2019</span>
+                </div>
+                <p className="text-blue-400 text-sm mb-2">Multiple Studios</p>
+                <p className="text-slate-400 text-sm">
+                  <strong className="text-slate-300">Flashbreak</strong> (2019) - Real-time multiplayer WebGL games for streaming platform with cash prizes.
+                  <strong className="text-slate-300"> GameBuilt</strong> (2018) - Three.js/TypeScript game development.
+                  <strong className="text-slate-300"> Eden Games</strong> (2018) - Unity developer on Gear Club 2 racing game.
+                  <strong className="text-slate-300"> AddSome</strong> (2017-18) - Lead Unity developer for professional 3D/2D applications.
+                  <strong className="text-slate-300"> Nectar de Code</strong> (2015-16) - Lead developer of tower defense game.
+                  <span className="text-blue-400/80"> Unity, Three.js, TypeScript, GLSL, WebGL</span>
+                </p>
+              </div>
+            </div>
+
+            {/* Education */}
             <div className="group relative">
               <div className="absolute -inset-1 bg-gradient-to-r from-yellow-500/10 to-transparent rounded-xl blur-xl opacity-0 group-hover:opacity-100 transition-opacity" />
               <div className="relative border-l-2 border-yellow-400 pl-4 py-2">
                 <div className="flex justify-between items-start mb-1">
-                  <h3 className="font-semibold text-slate-200">Education</h3>
+                  <h3 className="font-semibold text-slate-200">42 Paris</h3>
                   <span className="text-yellow-400/60 text-sm px-2 py-0.5 rounded bg-yellow-400/10 border border-yellow-400/20">2013 - 2015</span>
                 </div>
-                <p className="text-yellow-400 text-sm mb-2">42 Paris</p>
+                <p className="text-yellow-400 text-sm mb-2">Computer Science</p>
                 <p className="text-slate-400 text-sm">
-                  Engineer's Degree - Games and Software Development.
-                  Continuous self-taught learning in AI and 3D applications.
+                  Peer-to-peer coding school founded by Xavier Niel. Notable projects:
+                  <strong className="text-slate-300"> wolf3D</strong> (raycasting engine),
+                  <strong className="text-slate-300"> RT</strong> (raytracer),
+                  <strong className="text-slate-300"> Corewar</strong> (VM + assembler),
+                  <strong className="text-slate-300"> Lem-in</strong> (pathfinding with Dijkstra/A*),
+                  <strong className="text-slate-300"> 42sh</strong> (shell),
+                  <strong className="text-slate-300"> Zappy</strong>.
+                  <span className="text-yellow-400/80"> C, Algorithms, System Programming</span>
                 </p>
               </div>
             </div>
@@ -406,7 +482,7 @@ export default function CVPage() {
                   <code className="text-xs text-green-400/80 bg-green-400/10 px-2 py-0.5 rounded border border-green-400/20">@luciformresearch/codeparsers</code>
                 </div>
                 <p className="text-slate-400 text-sm">
-                  Multi-language code parser using tree-sitter WASM. Unified API for TypeScript, Python, Vue, Svelte.
+                  Multi-language code parser (13 languages: TS, Python, C, C++, C#, Go, Rust, etc.) with cross-file dependency graph extraction.
                 </p>
               </div>
             </a>

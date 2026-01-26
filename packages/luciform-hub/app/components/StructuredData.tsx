@@ -37,7 +37,7 @@ export function PersonStructuredData() {
     "@type": "Person",
     "name": "Lucie Defraiteur",
     "url": "https://www.luciformresearch.com/cv",
-    "image": "https://www.luciformresearch.com/photos_lucie/1764621365401.png",
+    "image": "https://www.luciformresearch.com/photos_lucie/1766757772036.png",
     "jobTitle": "RAG Systems Engineer & 3D Graphics Developer",
     "description": "Backend engineer specialized in data pipelines, knowledge graph indexation, and RAG architectures. Also experienced in 3D graphics with WebGPU/WebGL engines.",
     "email": "luciedefraiteur@luciformresearch.com",
@@ -52,6 +52,8 @@ export function PersonStructuredData() {
     },
     "knowsAbout": [
       "RAG (Retrieval Augmented Generation)",
+      "LangChain",
+      "LangGraph",
       "Neo4j",
       "Knowledge Graphs",
       "TypeScript",
